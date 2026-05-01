@@ -1,0 +1,15 @@
+[package]
+name = "classicube-plugin-updater-plugin"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "=1.0.102"
+classicube-helpers = { git = "https://github.com/SpiralP/rust-classicube-helpers.git" }
+classicube-sys = "=4.3.0"
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
