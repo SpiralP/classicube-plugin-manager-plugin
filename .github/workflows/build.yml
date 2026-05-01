@@ -1,0 +1,173 @@
+name: build
+
+on:
+  pull_request:
+    branches: [ main, master ]
+  push:
+    branches-ignore: [ main, master ]
+  workflow_call:
+    inputs:
+      release:
+        default: false
+        description: Build in release mode.
+        required: false
+        type: boolean
+      skip-artifact-upload:
+        default: false
+        description: Skip uploading build artifacts. Used for validation-only builds
+          where the artifacts aren't needed downstream.
+        required: false
+        type: boolean
+      skip-nix-build:
+        default: false
+        description: Skip the linux_nix validation job. Used for the tag-triggered
+          release-artifacts build, since the main-push validate-build already
+          covered the nix build and its artifact isn't uploaded to the release.
+        required: false
+        type: boolean
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read # for checkout
+
+jobs:
+  linux_nix:
+    if: ${{ !inputs.skip-nix-build }}
+    uses: SpiralP/github-reusable-workflows/.github/workflows/build.yml@4c45b82d0802754ff04dadb453d3b49fe1c8f406 # main
+    with:
+      flake-attribute: ${{ inputs.release && 'default' || 'debug' }}
+      upload-build-result: ${{ !inputs.skip-artifact-upload }}
+
+  windows_x86:
+    name: Build Windows ${{ matrix.config.arch }}
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - arch: x86_64
+            target: x86_64-pc-windows-msvc
+          # - arch: i686
+          #   target: i686-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Add rust target
+        run: rustup target add ${{ matrix.config.target }}
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.config.target }}
+
+      - name: Build
+        run: |
+          cargo build --target ${{ matrix.config.target }} ${{ inputs.release && '--release' || '' }}
+
+      - name: Test
+        run: |
+          cargo test --target ${{ matrix.config.target }} ${{ inputs.release && '--release' || '' }} -- --nocapture --test-threads 1
+          Move-Item `
+            -Path 'target\${{ matrix.config.target }}\${{ inputs.release && 'release' || 'debug' }}\classicube_plugin_updater_plugin.dll' `
+            -Destination '.\classicube_plugin_updater_windows_${{ matrix.config.arch }}.dll'
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !inputs.skip-artifact-upload }}
+        with:
+          name: classicube_plugin_updater_windows_${{ matrix.config.arch }}
+          path: classicube_plugin_updater_windows_${{ matrix.config.arch }}.dll
+
+  linux_x86:
+    name: Build Linux ${{ matrix.config.arch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+          # - arch: i686
+          #   target: i686-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install i686 deps
+        if: ${{ matrix.config.arch == 'i686' }}
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get -y update
+          sudo apt-get -y install pkg-config:i386 \
+            gcc-multilib g++-multilib \
+            libssl-dev:i386 \
+            libssl3:i386
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> "$GITHUB_ENV"
+
+      - name: Add rust target
+        run: rustup target add ${{ matrix.config.target }}
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.config.target }}
+
+      - name: Build
+        run: |
+          cargo build --target ${{ matrix.config.target }} ${{ inputs.release && '--release' || '' }}
+          file 'target/${{ matrix.config.target }}/${{ inputs.release && 'release' || 'debug' }}/libclassicube_plugin_updater_plugin.so'
+
+      - name: Test
+        run: |
+          cargo test --target ${{ matrix.config.target }} ${{ inputs.release && '--release' || '' }} -- --nocapture --test-threads 1
+          mv 'target/${{ matrix.config.target }}/${{ inputs.release && 'release' || 'debug' }}/libclassicube_plugin_updater_plugin.so' \
+            './classicube_plugin_updater_linux_${{ matrix.config.arch }}.so'
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !inputs.skip-artifact-upload }}
+        with:
+          name: classicube_plugin_updater_linux_${{ matrix.config.arch }}
+          path: classicube_plugin_updater_linux_${{ matrix.config.arch }}.so
+
+  mac:
+    # !!! disabled!
+    if: false
+    name: Build MacOS ${{ matrix.config.arch }}
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - arch: aarch64
+            target: aarch64-apple-darwin
+          - arch: x86_64
+            target: x86_64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Add rust target
+        run: rustup target add ${{ matrix.config.target }}
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.config.target }}
+
+      - name: Build
+        run: |
+          cargo build --target ${{ matrix.config.target }} ${{ inputs.release && '--release' || '' }}
+          file 'target/${{ matrix.config.target }}/${{ inputs.release && 'release' || 'debug' }}/libclassicube_plugin_updater_plugin.dylib'
+
+      - name: Test
+        run: |
+          cargo test --target ${{ matrix.config.target }} ${{ inputs.release && '--release' || '' }} -- --nocapture --test-threads 1
+          mv 'target/${{ matrix.config.target }}/${{ inputs.release && 'release' || 'debug' }}/libclassicube_plugin_updater_plugin.dylib' \
+            'classicube_plugin_updater_macos_${{ matrix.config.arch }}.dylib'
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !inputs.skip-artifact-upload }}
+        with:
+          name: classicube_plugin_updater_macos_${{ matrix.config.arch }}
+          path: classicube_plugin_updater_macos_${{ matrix.config.arch }}.dylib
