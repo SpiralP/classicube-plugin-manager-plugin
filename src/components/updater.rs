@@ -1,5 +1,6 @@
 use std::cell::Cell;
 
+use anyhow::Result;
 use classicube_helpers::{async_manager, color};
 use tracing::{error, info, warn};
 
@@ -42,14 +43,14 @@ impl Component for Updater {
     }
 }
 
-async fn check_subscriptions() -> anyhow::Result<()> {
-    let config = Config::load()?;
-    if config.subscriptions.is_empty() {
+async fn check_subscriptions() -> Result<()> {
+    let subs = Config::load()?.subscriptions;
+    if subs.is_empty() {
         info!("no subscriptions; skipping update check");
         return Ok(());
     }
 
-    for sub in &config.subscriptions {
+    for sub in &subs {
         if let Err(e) = check_one(sub).await {
             warn!("checking {}/{}: {e:#}", sub.owner, sub.repo);
             print_async(format!(
@@ -68,7 +69,7 @@ async fn check_subscriptions() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn check_one(sub: &Subscription) -> anyhow::Result<()> {
+async fn check_one(sub: &Subscription) -> Result<()> {
     let release = github_release::get_latest_release(&sub.owner, &sub.repo).await?;
     let latest = &release.tag_name;
 

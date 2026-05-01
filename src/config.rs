@@ -11,7 +11,7 @@ pub struct Config {
     pub subscriptions: Vec<Subscription>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subscription {
     pub owner: String,
     pub repo: String,
@@ -28,5 +28,12 @@ impl Config {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {CONFIG_PATH}")),
         }
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let toml_str = toml::to_string_pretty(self).context("serializing config")?;
+        fs::write(Path::new(CONFIG_PATH), toml_str)
+            .with_context(|| format!("writing {CONFIG_PATH}"))?;
+        Ok(())
     }
 }
