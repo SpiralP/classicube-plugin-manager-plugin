@@ -1,8 +1,11 @@
-use std::cell::Cell;
+use std::{
+    cell::Cell,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::Result;
 use classicube_helpers::{async_manager, color};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     chat::print_async,
@@ -10,6 +13,8 @@ use crate::{
     config::{Config, Subscription},
     github_release,
 };
+
+const TTL_SECS: u64 = 60 * 60;
 
 thread_local!(
     static CHECKED: Cell<bool> = const { Cell::new(false) };
@@ -50,29 +55,73 @@ async fn check_subscriptions() -> Result<()> {
         return Ok(());
     }
 
+    let now = unix_now();
+    let mut new_tags: Vec<(String, String, String)> = Vec::new();
+
     for sub in &subs {
-        if let Err(e) = check_one(sub).await {
-            warn!("checking {}/{}: {e:#}", sub.owner, sub.repo);
-            print_async(format!(
-                "{}Failed to check {}{}/{}{}: {}{e}",
-                color::RED,
-                color::LIME,
-                sub.owner,
-                sub.repo,
-                color::RED,
-                color::WHITE,
-            ))
-            .await;
-        }
+        let cached = sub.fresh_cached_tag(now, TTL_SECS).map(str::to_owned);
+
+        let tag = match cached {
+            Some(t) => {
+                debug!("{}/{} served from cache ({t})", sub.owner, sub.repo);
+                t
+            }
+            None => match github_release::get_latest_release(&sub.owner, &sub.repo).await {
+                Ok(release) => {
+                    new_tags.push((
+                        sub.owner.clone(),
+                        sub.repo.clone(),
+                        release.tag_name.clone(),
+                    ));
+                    release.tag_name
+                }
+                Err(e) => {
+                    warn!("checking {}/{}: {e:#}", sub.owner, sub.repo);
+                    print_async(format!(
+                        "{}Failed to check {}{}/{}{}: {}{e}",
+                        color::RED,
+                        color::LIME,
+                        sub.owner,
+                        sub.repo,
+                        color::RED,
+                        color::WHITE,
+                    ))
+                    .await;
+                    continue;
+                }
+            },
+        };
+
+        notify(sub, &tag).await;
+    }
+
+    if !new_tags.is_empty()
+        && let Err(e) = persist_cache_updates(now, new_tags)
+    {
+        warn!("saving config (cache update): {e:#}");
     }
 
     Ok(())
 }
 
-async fn check_one(sub: &Subscription) -> Result<()> {
-    let release = github_release::get_latest_release(&sub.owner, &sub.repo).await?;
-    let latest = &release.tag_name;
+fn persist_cache_updates(now: u64, updates: Vec<(String, String, String)>) -> Result<()> {
+    // Re-read so we don't clobber concurrent /subscribe edits made on the
+    // game thread while HTTP was in flight.
+    let mut fresh = Config::load()?;
+    for (owner, repo, tag) in updates {
+        if let Some(sub) = fresh
+            .subscriptions
+            .iter_mut()
+            .find(|s| s.owner == owner && s.repo == repo)
+        {
+            sub.cached_tag = Some(tag);
+            sub.cached_at = Some(now);
+        }
+    }
+    fresh.save()
+}
 
+async fn notify(sub: &Subscription, latest: &str) {
     match &sub.installed_version {
         Some(installed) if installed == latest => {
             info!("{}/{} up to date ({latest})", sub.owner, sub.repo);
@@ -109,5 +158,11 @@ async fn check_one(sub: &Subscription) -> Result<()> {
             .await;
         }
     }
-    Ok(())
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }

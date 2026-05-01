@@ -90,6 +90,8 @@ fn handle_subscribe(spec: &str) {
         owner: owner.clone(),
         repo: repo.clone(),
         installed_version: None,
+        cached_tag: None,
+        cached_at: None,
     });
     if let Err(e) = config.save() {
         print_save_error(&e);
