@@ -17,6 +17,19 @@ pub struct Subscription {
     pub repo: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installed_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_at: Option<u64>,
+}
+
+impl Subscription {
+    pub fn fresh_cached_tag(&self, now: u64, ttl_secs: u64) -> Option<&str> {
+        match (&self.cached_tag, self.cached_at) {
+            (Some(tag), Some(at)) if now.saturating_sub(at) < ttl_secs => Some(tag),
+            _ => None,
+        }
+    }
 }
 
 impl Config {
