@@ -12,7 +12,7 @@ use tracing::{debug, warn};
 use crate::github_release::{GitHubReleaseAsset, make_client};
 
 pub const PLUGINS_DIR: &str = "plugins";
-pub const MANAGED_DIR: &str = "plugins-managed";
+pub const MANAGED_DIR: &str = "plugins/managed";
 
 pub async fn download_to_managed_dir(asset: &GitHubReleaseAsset) -> Result<PathBuf> {
     debug!(
