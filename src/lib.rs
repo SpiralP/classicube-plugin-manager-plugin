@@ -6,3 +6,4 @@ mod config;
 mod github_release;
 mod installer;
 mod loader;
+mod reconcile;
