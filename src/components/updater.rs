@@ -130,6 +130,32 @@ fn persist_cache_updates_to(
     fresh.save_to(path)
 }
 
+pub fn persist_installed_versions(now: u64, updates: Vec<(String, String, String)>) -> Result<()> {
+    persist_installed_versions_to(config::config_path(), now, updates)
+}
+
+pub fn persist_installed_versions_to(
+    path: &Path,
+    now: u64,
+    updates: Vec<(String, String, String)>,
+) -> Result<()> {
+    let mut fresh = Config::load_from(path)?;
+    for (owner, repo, version) in updates {
+        if let Some(sub) = fresh
+            .subscriptions
+            .iter_mut()
+            .find(|s| s.owner == owner && s.repo == repo)
+        {
+            sub.installed_version = Some(version.clone());
+            // Installing the version means whatever we just stored *is* the
+            // up-to-date cached tag from the user's perspective.
+            sub.cached_tag = Some(version);
+            sub.cached_at = Some(now);
+        }
+    }
+    fresh.save_to(path)
+}
+
 async fn notify(sub: &Subscription, latest: &str) {
     match &sub.installed_version {
         Some(installed) if installed == latest => {
@@ -245,6 +271,65 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nope.toml");
         persist_cache_updates_to(
+            &path,
+            7,
+            vec![("alice".into(), "one".into(), "v1.0.0".into())],
+        )
+        .unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded, Config::default());
+    }
+
+    #[test]
+    fn installed_version_writes_targeted_subscription() {
+        let cfg = Config {
+            subscriptions: vec![sub("alice", "one"), sub("bob", "two")],
+        };
+        let f = NamedTempFile::new().unwrap();
+        cfg.save_to(f.path()).unwrap();
+
+        persist_installed_versions_to(
+            f.path(),
+            999,
+            vec![("alice".into(), "one".into(), "v1.0.0".into())],
+        )
+        .unwrap();
+
+        let loaded = Config::load_from(f.path()).unwrap();
+        let alice = &loaded.subscriptions[0];
+        let bob = &loaded.subscriptions[1];
+        assert_eq!(alice.installed_version.as_deref(), Some("v1.0.0"));
+        assert_eq!(alice.cached_tag.as_deref(), Some("v1.0.0"));
+        assert_eq!(alice.cached_at, Some(999));
+        assert!(bob.installed_version.is_none());
+        assert!(bob.cached_tag.is_none());
+    }
+
+    #[test]
+    fn installed_version_unknown_owner_repo_skipped() {
+        let cfg = Config {
+            subscriptions: vec![sub("alice", "one")],
+        };
+        let f = NamedTempFile::new().unwrap();
+        cfg.save_to(f.path()).unwrap();
+
+        persist_installed_versions_to(
+            f.path(),
+            42,
+            vec![("ghost".into(), "missing".into(), "v9.9.9".into())],
+        )
+        .unwrap();
+
+        let loaded = Config::load_from(f.path()).unwrap();
+        assert_eq!(loaded.subscriptions.len(), 1);
+        assert!(loaded.subscriptions[0].installed_version.is_none());
+    }
+
+    #[test]
+    fn installed_version_missing_config_file_writes_empty_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.toml");
+        persist_installed_versions_to(
             &path,
             7,
             vec![("alice".into(), "one".into(), "v1.0.0".into())],

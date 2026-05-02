@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
-fn make_client() -> reqwest::Client {
+pub fn make_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(APP_USER_AGENT)
         .connect_timeout(Duration::from_secs(5))
@@ -23,6 +23,14 @@ struct GitHubError {
 #[derive(Debug, Deserialize)]
 pub struct GitHubRelease {
     pub tag_name: String,
+    #[serde(default)]
+    pub assets: Vec<GitHubReleaseAsset>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubReleaseAsset {
+    pub name: String,
+    pub browser_download_url: String,
 }
 
 pub async fn get_latest_release(owner: &str, repo: &str) -> Result<GitHubRelease> {
@@ -52,6 +60,16 @@ mod tests {
         let json = br#"{"tag_name":"v1.0.0"}"#;
         let r: GitHubRelease = serde_json::from_slice(json).unwrap();
         assert_eq!(r.tag_name, "v1.0.0");
+        assert!(r.assets.is_empty());
+    }
+
+    #[test]
+    fn parses_release_with_no_assets_field() {
+        // Releases without an `assets` key (rare, but `#[serde(default)]` should
+        // make it lenient) should deserialize to an empty vec, not fail.
+        let json = br#"{"tag_name":"v0.0.1"}"#;
+        let r: GitHubRelease = serde_json::from_slice(json).unwrap();
+        assert!(r.assets.is_empty());
     }
 
     #[test]
@@ -75,6 +93,13 @@ mod tests {
         }"#;
         let r: GitHubRelease = serde_json::from_slice(json).unwrap();
         assert_eq!(r.tag_name, "v2.3.4");
+        assert_eq!(r.assets.len(), 2);
+        assert_eq!(r.assets[0].name, "plugin.so");
+        assert_eq!(
+            r.assets[0].browser_download_url,
+            "https://example/plugin.so"
+        );
+        assert_eq!(r.assets[1].name, "plugin.dll");
     }
 
     #[test]
