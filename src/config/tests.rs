@@ -9,8 +9,10 @@ fn sub(owner: &str, repo: &str) -> Subscription {
         disabled: false,
         installed_version: None,
         installed_asset: None,
+        installed_at: None,
         cached_tag: None,
         cached_at: None,
+        cached_published_at: None,
     }
 }
 
@@ -19,9 +21,10 @@ fn fresh_within_ttl() {
     let s = Subscription {
         cached_tag: Some("v1.0.0".into()),
         cached_at: Some(100),
+        cached_published_at: Some(50),
         ..sub("a", "b")
     };
-    assert_eq!(s.fresh_cached_tag(150, 100), Some("v1.0.0"));
+    assert_eq!(s.fresh_cached_release(150, 100), Some(("v1.0.0", 50)));
 }
 
 #[test]
@@ -30,9 +33,10 @@ fn fresh_at_ttl_boundary_is_stale() {
     let s = Subscription {
         cached_tag: Some("v1.0.0".into()),
         cached_at: Some(100),
+        cached_published_at: Some(50),
         ..sub("a", "b")
     };
-    assert_eq!(s.fresh_cached_tag(200, 100), None);
+    assert_eq!(s.fresh_cached_release(200, 100), None);
 }
 
 #[test]
@@ -41,9 +45,10 @@ fn fresh_with_clock_skew() {
     let s = Subscription {
         cached_tag: Some("v1.0.0".into()),
         cached_at: Some(500),
+        cached_published_at: Some(50),
         ..sub("a", "b")
     };
-    assert_eq!(s.fresh_cached_tag(100, 60), Some("v1.0.0"));
+    assert_eq!(s.fresh_cached_release(100, 60), Some(("v1.0.0", 50)));
 }
 
 #[test]
@@ -51,9 +56,10 @@ fn missing_cached_tag_is_stale() {
     let s = Subscription {
         cached_tag: None,
         cached_at: Some(100),
+        cached_published_at: Some(50),
         ..sub("a", "b")
     };
-    assert_eq!(s.fresh_cached_tag(150, 100), None);
+    assert_eq!(s.fresh_cached_release(150, 100), None);
 }
 
 #[test]
@@ -61,9 +67,23 @@ fn missing_cached_at_is_stale() {
     let s = Subscription {
         cached_tag: Some("v1.0.0".into()),
         cached_at: None,
+        cached_published_at: Some(50),
         ..sub("a", "b")
     };
-    assert_eq!(s.fresh_cached_tag(150, 100), None);
+    assert_eq!(s.fresh_cached_release(150, 100), None);
+}
+
+#[test]
+fn missing_cached_published_at_is_stale() {
+    // Without the timestamp the cached tag is useless for the install
+    // decision, so treat it as stale and force a refetch.
+    let s = Subscription {
+        cached_tag: Some("v1.0.0".into()),
+        cached_at: Some(100),
+        cached_published_at: None,
+        ..sub("a", "b")
+    };
+    assert_eq!(s.fresh_cached_release(150, 100), None);
 }
 
 #[test]
@@ -100,8 +120,10 @@ fn round_trip_populated_subscription() {
             disabled: false,
             installed_version: Some("v1.2.3".into()),
             installed_asset: Some("hello-world.so".into()),
+            installed_at: Some(1_700_000_000),
             cached_tag: Some("v1.2.4".into()),
-            cached_at: Some(1_700_000_000),
+            cached_at: Some(1_700_000_500),
+            cached_published_at: Some(1_700_000_400),
         }],
     };
     let f = NamedTempFile::new().unwrap();
@@ -121,8 +143,10 @@ fn bare_subscription_skips_optional_fields_in_toml() {
     assert!(!on_disk.contains("disabled"));
     assert!(!on_disk.contains("installed_version"));
     assert!(!on_disk.contains("installed_asset"));
+    assert!(!on_disk.contains("installed_at"));
     assert!(!on_disk.contains("cached_tag"));
     assert!(!on_disk.contains("cached_at"));
+    assert!(!on_disk.contains("cached_published_at"));
     // Round-trip still works.
     let loaded = Config::load_from(f.path()).unwrap();
     assert_eq!(loaded, cfg);
@@ -159,4 +183,29 @@ fn disabled_default_when_missing_from_toml() {
     let loaded = Config::load_from(f.path()).unwrap();
     assert_eq!(loaded.subscriptions.len(), 1);
     assert!(!loaded.subscriptions[0].disabled);
+}
+
+#[test]
+fn legacy_config_without_timestamps_loads() {
+    // A config written by an older version of the plugin lacks
+    // installed_at / cached_published_at. Loading must still succeed; the
+    // missing fields default to None and trigger a reinstall on next check.
+    let mut f = NamedTempFile::new().unwrap();
+    std::io::Write::write_all(
+        &mut f,
+        b"[[subscriptions]]
+owner = \"octocat\"
+repo = \"hello-world\"
+installed_version = \"v1.2.3\"
+installed_asset = \"hello-world.so\"
+cached_tag = \"v1.2.3\"
+cached_at = 1700000000
+",
+    )
+    .unwrap();
+    let loaded = Config::load_from(f.path()).unwrap();
+    let sub = &loaded.subscriptions[0];
+    assert_eq!(sub.installed_version.as_deref(), Some("v1.2.3"));
+    assert!(sub.installed_at.is_none());
+    assert!(sub.cached_published_at.is_none());
 }

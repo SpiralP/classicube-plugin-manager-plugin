@@ -53,6 +53,7 @@ pub fn reconcile(config_path: &Path, managed_dir: &Path) -> Result<ReconcileRepo
             sub.disabled = true;
             sub.installed_version = None;
             sub.installed_asset = None;
+            sub.installed_at = None;
         }
     }
 
