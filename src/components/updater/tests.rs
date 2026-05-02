@@ -2,6 +2,36 @@ use tempfile::NamedTempFile;
 
 use super::*;
 
+#[test]
+fn needs_install_no_prior_state() {
+    assert!(needs_install(None, None, "v1.0.0"));
+}
+
+#[test]
+fn needs_install_matching_version_and_asset() {
+    assert!(!needs_install(Some("v1.0.0"), Some("p.so"), "v1.0.0"));
+}
+
+#[test]
+fn needs_install_older_version() {
+    assert!(needs_install(Some("v0.9.0"), Some("p.so"), "v1.0.0"));
+}
+
+#[test]
+fn needs_install_matching_version_but_asset_missing() {
+    // Pre-asset-tracking installs end up here: version matches the latest
+    // upstream tag, but `installed_asset` was never populated, so we don't
+    // know what file to dlopen. Re-download to fill in the field.
+    assert!(needs_install(Some("v1.0.0"), None, "v1.0.0"));
+}
+
+#[test]
+fn needs_install_asset_known_but_no_version() {
+    // Defensive: a hand-edited config could pair an asset with no version.
+    // Treat that as install-needed so we re-resolve cleanly.
+    assert!(needs_install(None, Some("p.so"), "v1.0.0"));
+}
+
 fn sub(owner: &str, repo: &str) -> Subscription {
     Subscription {
         owner: owner.into(),

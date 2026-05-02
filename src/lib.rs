@@ -5,3 +5,4 @@ mod components;
 mod config;
 mod github_release;
 mod installer;
+mod loader;

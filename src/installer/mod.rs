@@ -1,28 +1,23 @@
-use std::{fs, io, path::PathBuf};
+#[cfg(test)]
+mod tests;
+
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use tracing::{debug, warn};
 
 use crate::github_release::{GitHubReleaseAsset, make_client};
 
-const PLUGINS_DIR: &str = "plugins";
+pub const PLUGINS_DIR: &str = "plugins";
+pub const MANAGED_DIR: &str = "plugins-managed";
 
-pub async fn download_to_plugins_dir(asset: &GitHubReleaseAsset) -> Result<PathBuf> {
-    let final_path = PathBuf::from(PLUGINS_DIR).join(&asset.name);
-    let new_path = PathBuf::from(PLUGINS_DIR).join(format!("{}.new", asset.name));
-    let old_path = PathBuf::from(PLUGINS_DIR).join(format!("{}.old", asset.name));
-
-    if let Some(parent) = final_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating directory {}", parent.display()))?;
-    }
-
+pub async fn download_to_managed_dir(asset: &GitHubReleaseAsset) -> Result<PathBuf> {
     debug!(
-        "downloading {} -> {}",
-        asset.browser_download_url,
-        new_path.display()
+        "downloading {} -> {}/{}",
+        asset.browser_download_url, MANAGED_DIR, asset.name
     );
     let bytes = make_client()
         .get(&asset.browser_download_url)
@@ -35,7 +30,25 @@ pub async fn download_to_plugins_dir(asset: &GitHubReleaseAsset) -> Result<PathB
         .await
         .with_context(|| format!("reading body of {}", asset.browser_download_url))?;
 
-    fs::write(&new_path, &bytes).with_context(|| format!("writing {}", new_path.display()))?;
+    install_bytes_to(Path::new(MANAGED_DIR), &asset.name, &bytes)
+}
+
+/// Atomically write `bytes` to `dir/asset_name`. The existing file (if any)
+/// is moved to `dir/asset_name.old` first; the new file lands via `.new` →
+/// rename. Leftover `.old` is best-effort cleaned at the end.
+pub fn install_bytes_to(dir: &Path, asset_name: &str, bytes: &[u8]) -> Result<PathBuf> {
+    let final_path = dir.join(asset_name);
+    let new_path = dir.join(format!("{asset_name}.new"));
+    let old_path = dir.join(format!("{asset_name}.old"));
+
+    if let Some(parent) = final_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating directory {}", parent.display()))?;
+    }
+
+    fs::write(&new_path, bytes).with_context(|| format!("writing {}", new_path.display()))?;
 
     if final_path.exists()
         && let Err(e) = fs::rename(&final_path, &old_path)

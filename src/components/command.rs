@@ -407,7 +407,7 @@ async fn run_update(owner: &str, repo: &str) -> anyhow::Result<()> {
     ))
     .await;
 
-    let path = installer::download_to_plugins_dir(asset).await?;
+    let path = installer::download_to_managed_dir(asset).await?;
 
     let now = unix_now();
     persist_installed_versions(
@@ -421,7 +421,7 @@ async fn run_update(owner: &str, repo: &str) -> anyhow::Result<()> {
     )?;
 
     print_async(format!(
-        "{}Installed {}{} {}for {}{}/{} {}-> {}{}",
+        "{}Installed {}{} {}for {}{}/{} {}-> {}{}{} (restart to load)",
         color::PINK,
         color::GREEN,
         release.tag_name,
@@ -432,6 +432,7 @@ async fn run_update(owner: &str, repo: &str) -> anyhow::Result<()> {
         color::PINK,
         color::YELLOW,
         path.display(),
+        color::PINK,
     ))
     .await;
 

@@ -12,10 +12,12 @@ use classicube_helpers::{async_manager, color};
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    asset_match,
     chat::print_async,
     component::Component,
     config::{self, Config, Subscription},
-    github_release,
+    github_release::{self, GitHubRelease},
+    installer, loader,
 };
 
 const TTL_SECS: u64 = 60 * 60;
@@ -39,20 +41,31 @@ impl Component for Updater {
         CHECKED.set(true);
 
         async_manager::spawn(async move {
-            if let Err(e) = check_subscriptions().await {
-                error!("update check failed: {e:#}");
+            if let Err(e) = run_initial_pass().await {
+                error!("initial update pass failed: {e:#}");
                 print_async(format!(
-                    "{}Plugin update check failed: {}{e}",
+                    "{}Plugin updater pass failed: {}{e}",
                     color::RED,
                     color::WHITE,
                 ))
                 .await;
             }
+
+            // Hand off to the loader on the main thread regardless of update
+            // outcome — load whatever's on disk even if a network fetch failed.
+            async_manager::spawn_on_main_thread(async move {
+                match Config::load() {
+                    Ok(cfg) => loader::init_managed(&cfg.subscriptions),
+                    Err(e) => {
+                        error!("loading config for managed-load: {e:#}");
+                    }
+                }
+            });
         });
     }
 }
 
-async fn check_subscriptions() -> Result<()> {
+async fn run_initial_pass() -> Result<()> {
     let subs = Config::load()?.subscriptions;
     if subs.is_empty() {
         info!("no subscriptions; skipping update check");
@@ -61,33 +74,52 @@ async fn check_subscriptions() -> Result<()> {
 
     let now = unix_now();
     let mut new_tags: Vec<(String, String, String)> = Vec::new();
+    let mut installed: Vec<(String, String, String, String)> = Vec::new();
 
     for sub in &subs {
         if sub.disabled {
-            debug!("{}/{} disabled; skipping check", sub.owner, sub.repo);
+            debug!("{}/{} disabled; skipping", sub.owner, sub.repo);
             continue;
         }
 
-        let cached = sub.fresh_cached_tag(now, TTL_SECS).map(str::to_owned);
-
-        let tag = match cached {
-            Some(t) => {
-                debug!("{}/{} served from cache ({t})", sub.owner, sub.repo);
-                t
+        let (tag, mut release_in_hand) = match resolve_latest_tag(sub, now).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!("checking {}/{}: {e:#}", sub.owner, sub.repo);
+                print_async(format!(
+                    "{}Failed to check {}{}/{}{}: {}{e}",
+                    color::RED,
+                    color::LIME,
+                    sub.owner,
+                    sub.repo,
+                    color::RED,
+                    color::WHITE,
+                ))
+                .await;
+                continue;
             }
+        };
+        if let Some(ref r) = release_in_hand {
+            new_tags.push((sub.owner.clone(), sub.repo.clone(), r.tag_name.clone()));
+        }
+
+        if !needs_install(
+            sub.installed_version.as_deref(),
+            sub.installed_asset.as_deref(),
+            &tag,
+        ) {
+            debug!("{}/{} up to date ({tag})", sub.owner, sub.repo);
+            continue;
+        }
+
+        let release = match release_in_hand.take() {
+            Some(r) => r,
             None => match github_release::get_latest_release(&sub.owner, &sub.repo).await {
-                Ok(release) => {
-                    new_tags.push((
-                        sub.owner.clone(),
-                        sub.repo.clone(),
-                        release.tag_name.clone(),
-                    ));
-                    release.tag_name
-                }
+                Ok(r) => r,
                 Err(e) => {
-                    warn!("checking {}/{}: {e:#}", sub.owner, sub.repo);
+                    warn!("fetching release for {}/{}: {e:#}", sub.owner, sub.repo);
                     print_async(format!(
-                        "{}Failed to check {}{}/{}{}: {}{e}",
+                        "{}Failed to fetch release for {}{}/{}{}: {}{e}",
                         color::RED,
                         color::LIME,
                         sub.owner,
@@ -101,7 +133,77 @@ async fn check_subscriptions() -> Result<()> {
             },
         };
 
-        notify(sub, &tag).await;
+        let asset = match asset_match::pick_asset(
+            &release.assets,
+            std::env::consts::ARCH,
+            std::env::consts::DLL_SUFFIX,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!("asset match {}/{}: {e:#}", sub.owner, sub.repo);
+                print_async(format!(
+                    "{}No suitable asset for {}{}/{}{}: {}{e}",
+                    color::RED,
+                    color::LIME,
+                    sub.owner,
+                    sub.repo,
+                    color::RED,
+                    color::WHITE,
+                ))
+                .await;
+                continue;
+            }
+        };
+
+        print_async(format!(
+            "{}Installing {}{} {}for {}{}/{} {}({}{}{})",
+            color::PINK,
+            color::GREEN,
+            release.tag_name,
+            color::PINK,
+            color::LIME,
+            sub.owner,
+            sub.repo,
+            color::PINK,
+            color::LIME,
+            asset.name,
+            color::PINK,
+        ))
+        .await;
+
+        match installer::download_to_managed_dir(asset).await {
+            Ok(path) => {
+                installed.push((
+                    sub.owner.clone(),
+                    sub.repo.clone(),
+                    release.tag_name.clone(),
+                    asset.name.clone(),
+                ));
+                print_async(format!(
+                    "{}Installed {}{} {}-> {}{}",
+                    color::PINK,
+                    color::GREEN,
+                    release.tag_name,
+                    color::PINK,
+                    color::YELLOW,
+                    path.display(),
+                ))
+                .await;
+            }
+            Err(e) => {
+                error!("installing {}/{}: {e:#}", sub.owner, sub.repo);
+                print_async(format!(
+                    "{}Install failed for {}{}/{}{}: {}{e}",
+                    color::RED,
+                    color::LIME,
+                    sub.owner,
+                    sub.repo,
+                    color::RED,
+                    color::WHITE,
+                ))
+                .await;
+            }
+        }
     }
 
     if !new_tags.is_empty()
@@ -109,8 +211,39 @@ async fn check_subscriptions() -> Result<()> {
     {
         warn!("saving config (cache update): {e:#}");
     }
+    if !installed.is_empty()
+        && let Err(e) = persist_installed_versions(now, installed)
+    {
+        warn!("saving config (installed versions): {e:#}");
+    }
 
     Ok(())
+}
+
+/// Whether a subscription's on-disk install needs to be (re)written.
+///
+/// `installed_asset.is_none()` covers two cases: never-installed, and
+/// installed-via-an-older-version-of-this-plugin (before the field existed).
+/// Either way, we want to lay down the asset so the loader has a path to
+/// `dlopen`.
+fn needs_install(
+    installed_version: Option<&str>,
+    installed_asset: Option<&str>,
+    latest_tag: &str,
+) -> bool {
+    installed_version != Some(latest_tag) || installed_asset.is_none()
+}
+
+async fn resolve_latest_tag(
+    sub: &Subscription,
+    now: u64,
+) -> Result<(String, Option<GitHubRelease>)> {
+    if let Some(t) = sub.fresh_cached_tag(now, TTL_SECS) {
+        debug!("{}/{} served from cache ({t})", sub.owner, sub.repo);
+        return Ok((t.to_owned(), None));
+    }
+    let release = github_release::get_latest_release(&sub.owner, &sub.repo).await?;
+    Ok((release.tag_name.clone(), Some(release)))
 }
 
 fn persist_cache_updates(now: u64, updates: Vec<(String, String, String)>) -> Result<()> {
@@ -167,45 +300,6 @@ pub fn persist_installed_versions_to(
         }
     }
     fresh.save_to(path)
-}
-
-async fn notify(sub: &Subscription, latest: &str) {
-    match &sub.installed_version {
-        Some(installed) if installed == latest => {
-            info!("{}/{} up to date ({latest})", sub.owner, sub.repo);
-        }
-        Some(installed) => {
-            print_async(format!(
-                "{}New release {}{} {}for {}{}/{} {}(installed: {}{}{})",
-                color::PINK,
-                color::GREEN,
-                latest,
-                color::PINK,
-                color::LIME,
-                sub.owner,
-                sub.repo,
-                color::PINK,
-                color::YELLOW,
-                installed,
-                color::PINK,
-            ))
-            .await;
-        }
-        None => {
-            print_async(format!(
-                "{}Latest release {}{} {}for {}{}/{} {}(not installed via updater)",
-                color::PINK,
-                color::GREEN,
-                latest,
-                color::PINK,
-                color::LIME,
-                sub.owner,
-                sub.repo,
-                color::PINK,
-            ))
-            .await;
-        }
-    }
 }
 
 fn unix_now() -> u64 {
