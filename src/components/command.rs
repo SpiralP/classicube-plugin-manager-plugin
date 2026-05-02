@@ -100,6 +100,7 @@ fn handle_subscribe(spec: &str) {
         owner: owner.clone(),
         repo: repo.clone(),
         installed_version: None,
+        installed_asset: None,
         cached_tag: None,
         cached_at: None,
     });
@@ -322,7 +323,12 @@ async fn run_update(owner: &str, repo: &str) -> anyhow::Result<()> {
     let now = unix_now();
     persist_installed_versions(
         now,
-        vec![(owner.to_owned(), repo.to_owned(), release.tag_name.clone())],
+        vec![(
+            owner.to_owned(),
+            repo.to_owned(),
+            release.tag_name.clone(),
+            asset.name.clone(),
+        )],
     )?;
 
     print_async(format!(

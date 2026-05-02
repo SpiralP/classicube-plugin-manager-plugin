@@ -22,6 +22,8 @@ pub struct Subscription {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installed_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_asset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_tag: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_at: Option<u64>,
@@ -73,6 +75,7 @@ mod tests {
             owner: owner.into(),
             repo: repo.into(),
             installed_version: None,
+            installed_asset: None,
             cached_tag: None,
             cached_at: None,
         }
@@ -162,6 +165,7 @@ mod tests {
                 owner: "octocat".into(),
                 repo: "hello-world".into(),
                 installed_version: Some("v1.2.3".into()),
+                installed_asset: Some("hello-world.so".into()),
                 cached_tag: Some("v1.2.4".into()),
                 cached_at: Some(1_700_000_000),
             }],
@@ -181,6 +185,7 @@ mod tests {
         cfg.save_to(f.path()).unwrap();
         let on_disk = fs::read_to_string(f.path()).unwrap();
         assert!(!on_disk.contains("installed_version"));
+        assert!(!on_disk.contains("installed_asset"));
         assert!(!on_disk.contains("cached_tag"));
         assert!(!on_disk.contains("cached_at"));
         // Round-trip still works.

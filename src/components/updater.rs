@@ -130,23 +130,28 @@ fn persist_cache_updates_to(
     fresh.save_to(path)
 }
 
-pub fn persist_installed_versions(now: u64, updates: Vec<(String, String, String)>) -> Result<()> {
+// Tuple shape: (owner, repo, version, asset_filename).
+pub fn persist_installed_versions(
+    now: u64,
+    updates: Vec<(String, String, String, String)>,
+) -> Result<()> {
     persist_installed_versions_to(config::config_path(), now, updates)
 }
 
 pub fn persist_installed_versions_to(
     path: &Path,
     now: u64,
-    updates: Vec<(String, String, String)>,
+    updates: Vec<(String, String, String, String)>,
 ) -> Result<()> {
     let mut fresh = Config::load_from(path)?;
-    for (owner, repo, version) in updates {
+    for (owner, repo, version, asset) in updates {
         if let Some(sub) = fresh
             .subscriptions
             .iter_mut()
             .find(|s| s.owner == owner && s.repo == repo)
         {
             sub.installed_version = Some(version.clone());
+            sub.installed_asset = Some(asset);
             // Installing the version means whatever we just stored *is* the
             // up-to-date cached tag from the user's perspective.
             sub.cached_tag = Some(version);
@@ -213,6 +218,7 @@ mod tests {
             owner: owner.into(),
             repo: repo.into(),
             installed_version: None,
+            installed_asset: None,
             cached_tag: None,
             cached_at: None,
         }
@@ -291,7 +297,12 @@ mod tests {
         persist_installed_versions_to(
             f.path(),
             999,
-            vec![("alice".into(), "one".into(), "v1.0.0".into())],
+            vec![(
+                "alice".into(),
+                "one".into(),
+                "v1.0.0".into(),
+                "one.so".into(),
+            )],
         )
         .unwrap();
 
@@ -299,9 +310,11 @@ mod tests {
         let alice = &loaded.subscriptions[0];
         let bob = &loaded.subscriptions[1];
         assert_eq!(alice.installed_version.as_deref(), Some("v1.0.0"));
+        assert_eq!(alice.installed_asset.as_deref(), Some("one.so"));
         assert_eq!(alice.cached_tag.as_deref(), Some("v1.0.0"));
         assert_eq!(alice.cached_at, Some(999));
         assert!(bob.installed_version.is_none());
+        assert!(bob.installed_asset.is_none());
         assert!(bob.cached_tag.is_none());
     }
 
@@ -316,13 +329,19 @@ mod tests {
         persist_installed_versions_to(
             f.path(),
             42,
-            vec![("ghost".into(), "missing".into(), "v9.9.9".into())],
+            vec![(
+                "ghost".into(),
+                "missing".into(),
+                "v9.9.9".into(),
+                "missing.so".into(),
+            )],
         )
         .unwrap();
 
         let loaded = Config::load_from(f.path()).unwrap();
         assert_eq!(loaded.subscriptions.len(), 1);
         assert!(loaded.subscriptions[0].installed_version.is_none());
+        assert!(loaded.subscriptions[0].installed_asset.is_none());
     }
 
     #[test]
@@ -332,7 +351,12 @@ mod tests {
         persist_installed_versions_to(
             &path,
             7,
-            vec![("alice".into(), "one".into(), "v1.0.0".into())],
+            vec![(
+                "alice".into(),
+                "one".into(),
+                "v1.0.0".into(),
+                "one.so".into(),
+            )],
         )
         .unwrap();
         let loaded = Config::load_from(&path).unwrap();
