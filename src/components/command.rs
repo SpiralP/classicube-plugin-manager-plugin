@@ -41,6 +41,8 @@ fn parse_owner_repo(s: &str) -> Option<(String, String)> {
 const USAGE_LINES: &[&str] = &[
     "&a/client Updater subscribe <owner>/<repo>",
     "&a/client Updater unsubscribe <owner>/<repo>",
+    "&a/client Updater disable <owner>/<repo>",
+    "&a/client Updater enable <owner>/<repo>",
     "&a/client Updater list",
     "&a/client Updater update [<owner>/<repo>]",
 ];
@@ -102,6 +104,7 @@ fn handle_subscribe(spec: &str) {
     config.subscriptions.push(Subscription {
         owner: owner.clone(),
         repo: repo.clone(),
+        disabled: false,
         installed_version: None,
         installed_asset: None,
         cached_tag: None,
@@ -162,6 +165,62 @@ fn handle_unsubscribe(spec: &str) {
     ));
 }
 
+fn set_disabled(spec: &str, disabled: bool) {
+    let Some((owner, repo)) = parse_owner_repo(spec) else {
+        print_wrapped(format!("{}Expected owner/repo, got: {spec}", color::RED));
+        return;
+    };
+
+    let mut config = match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            print_load_error(&e);
+            return;
+        }
+    };
+
+    let Some(sub) = config
+        .subscriptions
+        .iter_mut()
+        .find(|s| s.owner.eq_ignore_ascii_case(&owner) && s.repo.eq_ignore_ascii_case(&repo))
+    else {
+        print_wrapped(format!(
+            "{}Not subscribed to {}{}/{}",
+            color::YELLOW,
+            color::LIME,
+            owner,
+            repo,
+        ));
+        return;
+    };
+
+    if sub.disabled == disabled {
+        let word = if disabled { "disabled" } else { "enabled" };
+        print_wrapped(format!(
+            "{}Already {word} {}{}/{}",
+            color::YELLOW,
+            color::LIME,
+            owner,
+            repo,
+        ));
+        return;
+    }
+    sub.disabled = disabled;
+
+    if let Err(e) = config.save() {
+        print_save_error(&e);
+        return;
+    }
+    let word = if disabled { "Disabled" } else { "Enabled" };
+    print_wrapped(format!(
+        "{}{word} {}{}/{}",
+        color::PINK,
+        color::LIME,
+        owner,
+        repo,
+    ));
+}
+
 fn handle_list() {
     let config = match Config::load() {
         Ok(c) => c,
@@ -186,9 +245,14 @@ fn handle_list() {
         config.subscriptions.len()
     ));
     for sub in &config.subscriptions {
+        let suffix = if sub.disabled {
+            format!(" {}[disabled]", color::RED)
+        } else {
+            String::new()
+        };
         match &sub.installed_version {
             Some(v) => print_wrapped(format!(
-                "  {}{}/{} {}(installed: {}{}{})",
+                "  {}{}/{} {}(installed: {}{}{}){suffix}",
                 color::LIME,
                 sub.owner,
                 sub.repo,
@@ -197,7 +261,12 @@ fn handle_list() {
                 v,
                 color::PINK,
             )),
-            None => print_wrapped(format!("  {}{}/{}", color::LIME, sub.owner, sub.repo)),
+            None => print_wrapped(format!(
+                "  {}{}/{}{suffix}",
+                color::LIME,
+                sub.owner,
+                sub.repo,
+            )),
         }
     }
 }
@@ -216,11 +285,11 @@ fn handle_update_one(spec: &str) {
         }
     };
 
-    let subscribed = config
+    let Some(sub) = config
         .subscriptions
         .iter()
-        .any(|s| s.owner.eq_ignore_ascii_case(&owner) && s.repo.eq_ignore_ascii_case(&repo));
-    if !subscribed {
+        .find(|s| s.owner.eq_ignore_ascii_case(&owner) && s.repo.eq_ignore_ascii_case(&repo))
+    else {
         print_wrapped(format!(
             "{}Not subscribed to {}{}/{}{}; use {}subscribe{} first",
             color::YELLOW,
@@ -229,6 +298,22 @@ fn handle_update_one(spec: &str) {
             repo,
             color::YELLOW,
             color::LIME,
+            color::YELLOW,
+        ));
+        return;
+    };
+
+    if sub.disabled {
+        print_wrapped(format!(
+            "{}Subscription {}{}/{} {}is disabled; use {}enable {}/{}{} first",
+            color::YELLOW,
+            color::LIME,
+            owner,
+            repo,
+            color::YELLOW,
+            color::LIME,
+            owner,
+            repo,
             color::YELLOW,
         ));
         return;
@@ -249,6 +334,7 @@ fn handle_update_all() {
     let stale: Vec<(String, String)> = config
         .subscriptions
         .iter()
+        .filter(|s| !s.disabled)
         .filter(|s| match (&s.installed_version, &s.cached_tag) {
             (Some(installed), Some(latest)) => installed != latest,
             _ => true,
@@ -367,6 +453,8 @@ extern "C" fn c_callback(args: *const cc_string, args_count: c_int) {
     match args.as_slice() {
         ["subscribe", spec] => handle_subscribe(spec),
         ["unsubscribe", spec] => handle_unsubscribe(spec),
+        ["disable", spec] => set_disabled(spec, true),
+        ["enable", spec] => set_disabled(spec, false),
         ["list"] => handle_list(),
         ["update"] => handle_update_all(),
         ["update", spec] => handle_update_one(spec),

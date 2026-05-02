@@ -63,6 +63,11 @@ async fn check_subscriptions() -> Result<()> {
     let mut new_tags: Vec<(String, String, String)> = Vec::new();
 
     for sub in &subs {
+        if sub.disabled {
+            debug!("{}/{} disabled; skipping check", sub.owner, sub.repo);
+            continue;
+        }
+
         let cached = sub.fresh_cached_tag(now, TTL_SECS).map(str::to_owned);
 
         let tag = match cached {

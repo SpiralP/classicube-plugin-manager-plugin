@@ -22,6 +22,8 @@ pub struct Config {
 pub struct Subscription {
     pub owner: String,
     pub repo: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installed_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
