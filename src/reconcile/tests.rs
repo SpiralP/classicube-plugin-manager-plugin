@@ -12,8 +12,10 @@ fn sub(owner: &str, repo: &str) -> Subscription {
         disabled: false,
         installed_version: None,
         installed_asset: None,
+        installed_at: None,
         cached_tag: None,
         cached_at: None,
+        cached_published_at: None,
     }
 }
 

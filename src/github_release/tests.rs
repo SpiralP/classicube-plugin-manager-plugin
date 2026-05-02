@@ -2,9 +2,10 @@ use super::*;
 
 #[test]
 fn parses_minimal_release() {
-    let json = br#"{"tag_name":"v1.0.0"}"#;
+    let json = br#"{"tag_name":"v1.0.0","published_at":"2024-12-15T12:34:56Z"}"#;
     let r: GitHubRelease = serde_json::from_slice(json).unwrap();
     assert_eq!(r.tag_name, "v1.0.0");
+    assert_eq!(r.published_at, 1_734_266_096);
     assert!(r.assets.is_empty());
 }
 
@@ -12,7 +13,7 @@ fn parses_minimal_release() {
 fn parses_release_with_no_assets_field() {
     // Releases without an `assets` key (rare, but `#[serde(default)]` should
     // make it lenient) should deserialize to an empty vec, not fail.
-    let json = br#"{"tag_name":"v0.0.1"}"#;
+    let json = br#"{"tag_name":"v0.0.1","published_at":"2024-01-01T00:00:00Z"}"#;
     let r: GitHubRelease = serde_json::from_slice(json).unwrap();
     assert!(r.assets.is_empty());
 }
@@ -38,6 +39,7 @@ fn ignores_extra_release_fields() {
     }"#;
     let r: GitHubRelease = serde_json::from_slice(json).unwrap();
     assert_eq!(r.tag_name, "v2.3.4");
+    assert_eq!(r.published_at, 1_767_225_600);
     assert_eq!(r.assets.len(), 2);
     assert_eq!(r.assets[0].name, "plugin.so");
     assert_eq!(
@@ -45,6 +47,21 @@ fn ignores_extra_release_fields() {
         "https://example/plugin.so"
     );
     assert_eq!(r.assets[1].name, "plugin.dll");
+}
+
+#[test]
+fn missing_published_at_fails() {
+    // GitHub always sends `published_at` for a published release; absence is
+    // a real signal that something's wrong with the payload, not something
+    // we want to paper over.
+    let json = br#"{"tag_name":"v1.0.0"}"#;
+    assert!(serde_json::from_slice::<GitHubRelease>(json).is_err());
+}
+
+#[test]
+fn malformed_published_at_fails() {
+    let json = br#"{"tag_name":"v1.0.0","published_at":"not-a-date"}"#;
+    assert!(serde_json::from_slice::<GitHubRelease>(json).is_err());
 }
 
 #[test]
@@ -58,6 +75,49 @@ fn parses_error_payload() {
 fn release_payload_does_not_match_error_shape() {
     // Sanity check: the success-path body does not accidentally deserialize
     // into GitHubError (the get_latest_release flow tries error first).
-    let json = br#"{"tag_name":"v1.0.0"}"#;
+    let json = br#"{"tag_name":"v1.0.0","published_at":"2024-01-01T00:00:00Z"}"#;
     assert!(serde_json::from_slice::<GitHubError>(json).is_err());
+}
+
+#[test]
+fn iso8601_epoch() {
+    assert_eq!(parse_iso8601_z("1970-01-01T00:00:00Z"), Some(0));
+}
+
+#[test]
+fn iso8601_known_date() {
+    // 2024-12-15T12:34:56Z verified via `date -u -d ... +%s`.
+    assert_eq!(parse_iso8601_z("2024-12-15T12:34:56Z"), Some(1_734_266_096),);
+}
+
+#[test]
+fn iso8601_leap_day() {
+    // 2024-02-29 is valid; 2023-02-29 is not.
+    assert!(parse_iso8601_z("2024-02-29T00:00:00Z").is_some());
+    assert_eq!(parse_iso8601_z("2023-02-29T00:00:00Z"), None);
+}
+
+#[test]
+fn iso8601_century_leap_rule() {
+    // 2000 is a leap year (divisible by 400); 2100 is not (divisible by 100
+    // but not 400). The parser only sees years up to 9999 so 2100 is the
+    // smallest century non-leap we can hit.
+    assert!(parse_iso8601_z("2000-02-29T00:00:00Z").is_some());
+    assert_eq!(parse_iso8601_z("2100-02-29T00:00:00Z"), None);
+}
+
+#[test]
+fn iso8601_rejects_malformed() {
+    // Wrong length / missing separators / wrong tz indicator — all None.
+    assert_eq!(parse_iso8601_z(""), None);
+    assert_eq!(parse_iso8601_z("not-a-date"), None);
+    assert_eq!(parse_iso8601_z("2024-12-15T12:34:56"), None); // missing Z
+    assert_eq!(parse_iso8601_z("2024-12-15T12:34:56+0000"), None); // not Z
+    assert_eq!(parse_iso8601_z("2024/12/15T12:34:56Z"), None); // wrong sep
+    assert_eq!(parse_iso8601_z("2024-13-01T00:00:00Z"), None); // bad month
+    assert_eq!(parse_iso8601_z("2024-12-32T00:00:00Z"), None); // bad day
+    assert_eq!(parse_iso8601_z("2024-12-15T24:00:00Z"), None); // bad hour
+    assert_eq!(parse_iso8601_z("2024-12-15T12:60:00Z"), None); // bad minute
+    assert_eq!(parse_iso8601_z("2024-12-15T12:00:60Z"), None); // bad second
+    assert_eq!(parse_iso8601_z("1969-12-31T23:59:59Z"), None); // pre-epoch
 }

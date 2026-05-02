@@ -107,8 +107,10 @@ fn handle_subscribe(spec: &str) {
         disabled: false,
         installed_version: None,
         installed_asset: None,
+        installed_at: None,
         cached_tag: None,
         cached_at: None,
+        cached_published_at: None,
     });
     if let Err(e) = config.save() {
         print_save_error(&e);
@@ -335,8 +337,8 @@ fn handle_update_all() {
         .subscriptions
         .iter()
         .filter(|s| !s.disabled)
-        .filter(|s| match (&s.installed_version, &s.cached_tag) {
-            (Some(installed), Some(latest)) => installed != latest,
+        .filter(|s| match (s.installed_at, s.cached_published_at) {
+            (Some(installed_at), Some(latest_pub_at)) => latest_pub_at > installed_at,
             _ => true,
         })
         .map(|s| (s.owner.clone(), s.repo.clone()))
@@ -417,6 +419,7 @@ async fn run_update(owner: &str, repo: &str) -> anyhow::Result<()> {
             repo.to_owned(),
             release.tag_name.clone(),
             asset.name.clone(),
+            release.published_at,
         )],
     )?;
 
