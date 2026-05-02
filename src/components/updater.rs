@@ -17,7 +17,7 @@ use crate::{
     component::Component,
     config::{self, Config, Subscription},
     github_release::{self, GitHubRelease},
-    installer, loader,
+    installer, loader, reconcile,
 };
 
 const TTL_SECS: u64 = 60 * 60;
@@ -66,6 +66,8 @@ impl Component for Updater {
 }
 
 async fn run_initial_pass() -> Result<()> {
+    run_reconcile_and_warn().await;
+
     let subs = Config::load()?.subscriptions;
     if subs.is_empty() {
         info!("no subscriptions; skipping update check");
@@ -218,6 +220,55 @@ async fn run_initial_pass() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn run_reconcile_and_warn() {
+    let report =
+        match reconcile::reconcile(config::config_path(), Path::new(installer::MANAGED_DIR)) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("reconcile failed: {e:#}");
+                print_async(format!(
+                    "{}Reconcile failed: {}{e}",
+                    color::RED,
+                    color::WHITE,
+                ))
+                .await;
+                return;
+            }
+        };
+    for missing in &report.missing {
+        warn!(
+            "missing managed file for {}/{}: {} (sub disabled)",
+            missing.owner, missing.repo, missing.asset,
+        );
+        print_async(format!(
+            "{}Missing {}{}{} for {}{}/{}{}: subscription disabled (edit toml to re-enable)",
+            color::YELLOW,
+            color::LIME,
+            missing.asset,
+            color::YELLOW,
+            color::LIME,
+            missing.owner,
+            missing.repo,
+            color::YELLOW,
+        ))
+        .await;
+    }
+    for name in &report.orphans {
+        warn!("orphan in {}: {name}", installer::MANAGED_DIR);
+        print_async(format!(
+            "{}Orphan in {}{}{}: {}{}{} (no subscription claims this)",
+            color::YELLOW,
+            color::LIME,
+            installer::MANAGED_DIR,
+            color::YELLOW,
+            color::LIME,
+            name,
+            color::YELLOW,
+        ))
+        .await;
+    }
 }
 
 /// Whether a subscription's on-disk install needs to be (re)written.
