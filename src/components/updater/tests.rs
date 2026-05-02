@@ -6,6 +6,7 @@ fn sub(owner: &str, repo: &str) -> Subscription {
     Subscription {
         owner: owner.into(),
         repo: repo.into(),
+        disabled: false,
         installed_version: None,
         installed_asset: None,
         cached_tag: None,
@@ -131,6 +132,36 @@ fn installed_version_unknown_owner_repo_skipped() {
     assert_eq!(loaded.subscriptions.len(), 1);
     assert!(loaded.subscriptions[0].installed_version.is_none());
     assert!(loaded.subscriptions[0].installed_asset.is_none());
+}
+
+#[test]
+fn persist_helpers_ignore_disabled_flag() {
+    // Disabling is enforced at the call site (auto-check loop, /update commands).
+    // The persist helpers stay dumb: if a row is in the updates list, they
+    // write to it regardless of `disabled`. This documents that contract.
+    let cfg = Config {
+        subscriptions: vec![Subscription {
+            disabled: true,
+            ..sub("alice", "one")
+        }],
+    };
+    let f = NamedTempFile::new().unwrap();
+    cfg.save_to(f.path()).unwrap();
+
+    persist_cache_updates_to(
+        f.path(),
+        77,
+        vec![("alice".into(), "one".into(), "v2.0.0".into())],
+    )
+    .unwrap();
+
+    let loaded = Config::load_from(f.path()).unwrap();
+    assert!(loaded.subscriptions[0].disabled);
+    assert_eq!(
+        loaded.subscriptions[0].cached_tag.as_deref(),
+        Some("v2.0.0")
+    );
+    assert_eq!(loaded.subscriptions[0].cached_at, Some(77));
 }
 
 #[test]

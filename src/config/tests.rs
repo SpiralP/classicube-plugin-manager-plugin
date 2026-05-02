@@ -6,6 +6,7 @@ fn sub(owner: &str, repo: &str) -> Subscription {
     Subscription {
         owner: owner.into(),
         repo: repo.into(),
+        disabled: false,
         installed_version: None,
         installed_asset: None,
         cached_tag: None,
@@ -96,6 +97,7 @@ fn round_trip_populated_subscription() {
         subscriptions: vec![Subscription {
             owner: "octocat".into(),
             repo: "hello-world".into(),
+            disabled: false,
             installed_version: Some("v1.2.3".into()),
             installed_asset: Some("hello-world.so".into()),
             cached_tag: Some("v1.2.4".into()),
@@ -116,6 +118,7 @@ fn bare_subscription_skips_optional_fields_in_toml() {
     let f = NamedTempFile::new().unwrap();
     cfg.save_to(f.path()).unwrap();
     let on_disk = fs::read_to_string(f.path()).unwrap();
+    assert!(!on_disk.contains("disabled"));
     assert!(!on_disk.contains("installed_version"));
     assert!(!on_disk.contains("installed_asset"));
     assert!(!on_disk.contains("cached_tag"));
@@ -123,4 +126,37 @@ fn bare_subscription_skips_optional_fields_in_toml() {
     // Round-trip still works.
     let loaded = Config::load_from(f.path()).unwrap();
     assert_eq!(loaded, cfg);
+}
+
+#[test]
+fn disabled_round_trip() {
+    let cfg = Config {
+        subscriptions: vec![Subscription {
+            disabled: true,
+            ..sub("octocat", "hello-world")
+        }],
+    };
+    let f = NamedTempFile::new().unwrap();
+    cfg.save_to(f.path()).unwrap();
+    let on_disk = fs::read_to_string(f.path()).unwrap();
+    assert!(
+        on_disk.contains("disabled = true"),
+        "expected `disabled = true` in: {on_disk}",
+    );
+    let loaded = Config::load_from(f.path()).unwrap();
+    assert_eq!(loaded, cfg);
+}
+
+#[test]
+fn disabled_default_when_missing_from_toml() {
+    // Older configs (written before this field existed) must continue to load.
+    let mut f = NamedTempFile::new().unwrap();
+    std::io::Write::write_all(
+        &mut f,
+        b"[[subscriptions]]\nowner = \"octocat\"\nrepo = \"hello-world\"\n",
+    )
+    .unwrap();
+    let loaded = Config::load_from(f.path()).unwrap();
+    assert_eq!(loaded.subscriptions.len(), 1);
+    assert!(!loaded.subscriptions[0].disabled);
 }
