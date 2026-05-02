@@ -1,10 +1,11 @@
 use std::{cell::RefCell, os::raw::c_int, slice};
 
-use classicube_helpers::{chat, color};
+use classicube_helpers::color;
 use classicube_sys::{OwnedChatCommand, cc_string};
 use tracing::error;
 
 use crate::{
+    chat::print_wrapped,
     component::Component,
     config::{Config, Subscription},
 };
@@ -33,15 +34,15 @@ const USAGE_LINES: &[&str] = &[
 ];
 
 fn print_usage() {
-    chat::print(format!("{}Usage:", color::YELLOW));
+    print_wrapped(format!("{}Usage:", color::YELLOW));
     for line in USAGE_LINES {
-        chat::print(*line);
+        print_wrapped(*line);
     }
 }
 
 fn print_load_error(e: &anyhow::Error) {
     error!("loading config: {e:#}");
-    chat::print(format!(
+    print_wrapped(format!(
         "{}Refusing to modify config (load failed — fix plugins/plugin-updater.toml first): {}{e}",
         color::RED,
         color::WHITE,
@@ -50,7 +51,7 @@ fn print_load_error(e: &anyhow::Error) {
 
 fn print_save_error(e: &anyhow::Error) {
     error!("saving config: {e:#}");
-    chat::print(format!(
+    print_wrapped(format!(
         "{}Failed to save config: {}{e}",
         color::RED,
         color::WHITE,
@@ -59,7 +60,7 @@ fn print_save_error(e: &anyhow::Error) {
 
 fn handle_subscribe(spec: &str) {
     let Some((owner, repo)) = parse_owner_repo(spec) else {
-        chat::print(format!("{}Expected owner/repo, got: {spec}", color::RED));
+        print_wrapped(format!("{}Expected owner/repo, got: {spec}", color::RED));
         return;
     };
 
@@ -76,7 +77,7 @@ fn handle_subscribe(spec: &str) {
         .iter()
         .any(|s| s.owner.eq_ignore_ascii_case(&owner) && s.repo.eq_ignore_ascii_case(&repo));
     if already {
-        chat::print(format!(
+        print_wrapped(format!(
             "{}Already subscribed to {}{}/{}",
             color::YELLOW,
             color::LIME,
@@ -97,7 +98,7 @@ fn handle_subscribe(spec: &str) {
         print_save_error(&e);
         return;
     }
-    chat::print(format!(
+    print_wrapped(format!(
         "{}Subscribed to {}{}/{}",
         color::PINK,
         color::LIME,
@@ -108,7 +109,7 @@ fn handle_subscribe(spec: &str) {
 
 fn handle_unsubscribe(spec: &str) {
     let Some((owner, repo)) = parse_owner_repo(spec) else {
-        chat::print(format!("{}Expected owner/repo, got: {spec}", color::RED));
+        print_wrapped(format!("{}Expected owner/repo, got: {spec}", color::RED));
         return;
     };
 
@@ -125,7 +126,7 @@ fn handle_unsubscribe(spec: &str) {
         .subscriptions
         .retain(|s| !(s.owner.eq_ignore_ascii_case(&owner) && s.repo.eq_ignore_ascii_case(&repo)));
     if config.subscriptions.len() == before {
-        chat::print(format!(
+        print_wrapped(format!(
             "{}Not subscribed to {}{}/{}",
             color::YELLOW,
             color::LIME,
@@ -139,7 +140,7 @@ fn handle_unsubscribe(spec: &str) {
         print_save_error(&e);
         return;
     }
-    chat::print(format!(
+    print_wrapped(format!(
         "{}Unsubscribed from {}{}/{}",
         color::PINK,
         color::LIME,
@@ -153,7 +154,7 @@ fn handle_list() {
         Ok(c) => c,
         Err(e) => {
             error!("loading config: {e:#}");
-            chat::print(format!(
+            print_wrapped(format!(
                 "{}Failed to load config: {}{e}",
                 color::RED,
                 color::WHITE,
@@ -163,17 +164,17 @@ fn handle_list() {
     };
 
     if config.subscriptions.is_empty() {
-        chat::print(format!("{}No subscriptions", color::YELLOW));
+        print_wrapped(format!("{}No subscriptions", color::YELLOW));
         return;
     }
-    chat::print(format!(
+    print_wrapped(format!(
         "{}Subscriptions ({}):",
         color::PINK,
         config.subscriptions.len()
     ));
     for sub in &config.subscriptions {
         match &sub.installed_version {
-            Some(v) => chat::print(format!(
+            Some(v) => print_wrapped(format!(
                 "  {}{}/{} {}(installed: {}{}{})",
                 color::LIME,
                 sub.owner,
@@ -183,7 +184,7 @@ fn handle_list() {
                 v,
                 color::PINK,
             )),
-            None => chat::print(format!("  {}{}/{}", color::LIME, sub.owner, sub.repo)),
+            None => print_wrapped(format!("  {}{}/{}", color::LIME, sub.owner, sub.repo)),
         }
     }
 }
