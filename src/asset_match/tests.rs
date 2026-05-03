@@ -33,6 +33,38 @@ fn matches_arm64_alias_for_aarch64() {
 }
 
 #[test]
+fn picks_macos_dylib_over_other_suffixes() {
+    // OS discrimination is implicit in the suffix — `.dylib` is macOS-only,
+    // so no `macos`/`darwin` token filter is needed.
+    let assets = [
+        asset("plugin_linux_aarch64.so"),
+        asset("plugin_windows_aarch64.dll"),
+        asset("plugin_macos_aarch64.dylib"),
+    ];
+    let got = pick_asset(&assets, "aarch64", ".dylib").unwrap();
+    assert_eq!(got.name, "plugin_macos_aarch64.dylib");
+}
+
+#[test]
+fn picks_self_update_naming() {
+    // Locks in the self-update path against this repo's own release naming
+    // (see `.github/workflows/build.yml` mac job).
+    let assets = [asset("classicube_plugin_updater_macos_aarch64.dylib")];
+    let got = pick_asset(&assets, "aarch64", ".dylib").unwrap();
+    assert_eq!(got.name, "classicube_plugin_updater_macos_aarch64.dylib");
+}
+
+#[test]
+fn matches_darwin_arm64_naming() {
+    // Confirms the `darwin`+`arm64` convention some plugins use works without
+    // any explicit `darwin` alias — the `arm64` arch token already aliases
+    // `aarch64`, and `.dylib` discriminates macOS.
+    let assets = [asset("plugin_darwin_arm64.dylib")];
+    let got = pick_asset(&assets, "aarch64", ".dylib").unwrap();
+    assert_eq!(got.name, "plugin_darwin_arm64.dylib");
+}
+
+#[test]
 fn case_insensitive() {
     let assets = [asset("Plugin_X86_64.SO")];
     let got = pick_asset(&assets, "x86_64", ".so").unwrap();
