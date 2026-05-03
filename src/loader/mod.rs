@@ -17,7 +17,7 @@ use tracing::{debug, error, warn};
 use crate::{
     chat::print_wrapped,
     component::Plugin_ApiVersion,
-    config::Subscription,
+    config::{self, Subscription},
     installer::{MANAGED_DIR, PLUGINS_DIR},
 };
 
@@ -31,20 +31,20 @@ thread_local!(
     static LOADED: RefCell<Vec<LoadedPlugin>> = const { RefCell::new(Vec::new()) };
 );
 
-pub fn init_managed(subs: &[Subscription]) {
-    for sub in subs {
+pub fn init_managed(subs: &[(String, String, Subscription)]) {
+    for (owner, repo, sub) in subs {
         if sub.disabled {
             continue;
         }
         // The self subscription lives in plugins/, not plugins/managed/, and
         // is already loaded by the game — dlopen'ing it here would double-load.
-        if sub.is_self() {
+        if config::is_self(owner, repo) {
             continue;
         }
-        let Some(asset) = sub.installed_asset.as_deref() else {
+        let Some(asset) = sub.state.installed_asset.as_deref() else {
             continue;
         };
-        let id = format!("{}/{}", sub.owner, sub.repo);
+        let id = format!("{owner}/{repo}");
         let already_loaded = LOADED.with_borrow(|loaded| loaded.iter().any(|p| p.id == id));
         if already_loaded {
             continue;

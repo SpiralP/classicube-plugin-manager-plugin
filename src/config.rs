@@ -1,9 +1,9 @@
 #[cfg(test)]
 mod tests;
 
-use std::{fs, io, path::Path, str::FromStr};
+use std::{collections::BTreeMap, fs, io, path::Path, str::FromStr};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 
 const CONFIG_PATH: &str = "plugins/plugin-updater.toml";
@@ -26,10 +26,14 @@ pub fn is_self(owner: &str, repo: &str) -> bool {
     owner == SELF_OWNER && repo == SELF_REPO
 }
 
+/// Top-level config. The TOML document is the map directly: each subscription
+/// renders as a `[owner.repo]` table at the document root, with no wrapper.
+/// `BTreeMap` sorts keys alphabetically, so `save()` always rewrites the file
+/// in a deterministic order regardless of the order subscriptions were added.
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Config {
-    #[serde(default)]
-    pub subscriptions: Vec<Subscription>,
+    pub subscriptions: BTreeMap<String, BTreeMap<String, Subscription>>,
 }
 
 /// Which release line a subscription tracks. Stable is the default — same as
@@ -109,14 +113,24 @@ impl<'de> Deserialize<'de> for Channel {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// User-editable subscription fields. Machine-managed install + cache fields
+/// live under the nested `state` table (`[owner.repo.state]` in TOML), so
+/// hand-edits to channel/disabled don't accidentally touch fields the plugin
+/// owns.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Subscription {
-    pub owner: String,
-    pub repo: String,
     #[serde(default, skip_serializing_if = "Channel::is_default")]
     pub channel: Channel,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disabled: bool,
+    #[serde(default, skip_serializing_if = "SubscriptionState::is_empty")]
+    pub state: SubscriptionState,
+}
+
+/// Plugin-managed state for a subscription. Renders as a `[owner.repo.state]`
+/// subtable in TOML, omitted entirely when every field is `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscriptionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installed_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -131,18 +145,25 @@ pub struct Subscription {
     pub cached_published_at: Option<u64>,
 }
 
-impl Subscription {
-    /// Whether this subscription refers to the updater plugin itself.
-    pub fn is_self(&self) -> bool {
-        is_self(&self.owner, &self.repo)
+impl SubscriptionState {
+    pub fn is_empty(&self) -> bool {
+        self.installed_version.is_none()
+            && self.installed_asset.is_none()
+            && self.installed_at.is_none()
+            && self.cached_tag.is_none()
+            && self.cached_at.is_none()
+            && self.cached_published_at.is_none()
     }
+}
 
+impl Subscription {
     /// Returns `(cached_tag, cached_published_at)` when the cache is within
     /// `ttl_secs` and both fields are populated. Both are required because
     /// downstream needs the tag for display/logging *and* the timestamp for
     /// the install decision.
     pub fn fresh_cached_release(&self, now: u64, ttl_secs: u64) -> Option<(&str, u64)> {
-        match (&self.cached_tag, self.cached_at, self.cached_published_at) {
+        let s = &self.state;
+        match (&s.cached_tag, s.cached_at, s.cached_published_at) {
             (Some(tag), Some(at), Some(pub_at)) if now.saturating_sub(at) < ttl_secs => {
                 Some((tag, pub_at))
             }
@@ -158,21 +179,11 @@ impl Config {
     /// An existing entry — even one the user has disabled or pinned — is
     /// left alone.
     pub fn ensure_self(&mut self) -> bool {
-        if self.subscriptions.iter().any(Subscription::is_self) {
+        let owner_map = self.subscriptions.entry(SELF_OWNER.into()).or_default();
+        if owner_map.contains_key(SELF_REPO) {
             return false;
         }
-        self.subscriptions.push(Subscription {
-            owner: SELF_OWNER.into(),
-            repo: SELF_REPO.into(),
-            channel: Channel::Stable,
-            disabled: false,
-            installed_version: None,
-            installed_asset: None,
-            installed_at: None,
-            cached_tag: None,
-            cached_at: None,
-            cached_published_at: None,
-        });
+        owner_map.insert(SELF_REPO.into(), Subscription::default());
         true
     }
 
@@ -187,7 +198,11 @@ impl Config {
     pub fn load_from(path: &Path) -> Result<Self> {
         match fs::read_to_string(path) {
             Ok(contents) => {
-                toml::from_str(&contents).with_context(|| format!("parsing {}", path.display()))
+                let cfg: Self = toml::from_str(&contents)
+                    .with_context(|| format!("parsing {}", path.display()))?;
+                cfg.validate()
+                    .with_context(|| format!("validating {}", path.display()))?;
+                Ok(cfg)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
@@ -199,4 +214,35 @@ impl Config {
         fs::write(path, toml_str).with_context(|| format!("writing {}", path.display()))?;
         Ok(())
     }
+
+    /// Reject configs whose owner/repo keys would be ambiguous or unsafe.
+    /// `.` in a repo segment is a TOML nesting marker, so `[a.b.c]` parses
+    /// as three nested tables, not as `repo = "b.c"`. We reject it on load
+    /// so a hand-edit that uses an unquoted dotted name fails fast with a
+    /// clear message instead of silently producing a deeper map.
+    fn validate(&self) -> Result<()> {
+        for (owner, repos) in &self.subscriptions {
+            validate_segment("owner", owner)?;
+            for repo in repos.keys() {
+                validate_segment("repo", repo)?;
+                if repo.contains('.') {
+                    bail!(
+                        "repo {repo:?} contains '.', which TOML parses as a nested table; rename \
+                         the entry or use a quoted key"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_segment(kind: &str, s: &str) -> Result<()> {
+    if s.is_empty() {
+        bail!("{kind} segment is empty");
+    }
+    if s.chars().any(char::is_whitespace) {
+        bail!("{kind} {s:?} contains whitespace");
+    }
+    Ok(())
 }

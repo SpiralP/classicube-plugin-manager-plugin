@@ -5,7 +5,7 @@ use std::{collections::HashSet, fs, io, path::Path};
 
 use anyhow::{Context, Result};
 
-use crate::config::Config;
+use crate::config::{self, Config};
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ReconcileReport {
@@ -38,28 +38,30 @@ pub fn reconcile(config_path: &Path, managed_dir: &Path) -> Result<ReconcileRepo
     let mut report = ReconcileReport::default();
     let mut claimed: HashSet<String> = HashSet::new();
 
-    for sub in &mut config.subscriptions {
-        // The self subscription installs into plugins/ (not plugins/managed/),
-        // so it never participates in this reconcile pass — checking here
-        // would always flag it missing.
-        if sub.is_self() {
-            continue;
-        }
-        let Some(asset) = sub.installed_asset.clone() else {
-            continue;
-        };
-        if on_disk.contains(&asset) {
-            claimed.insert(asset);
-        } else {
-            report.missing.push(MissingFile {
-                owner: sub.owner.clone(),
-                repo: sub.repo.clone(),
-                asset,
-            });
-            sub.disabled = true;
-            sub.installed_version = None;
-            sub.installed_asset = None;
-            sub.installed_at = None;
+    for (owner, repos) in &mut config.subscriptions {
+        for (repo, sub) in repos {
+            // The self subscription installs into plugins/ (not plugins/managed/),
+            // so it never participates in this reconcile pass — checking here
+            // would always flag it missing.
+            if config::is_self(owner, repo) {
+                continue;
+            }
+            let Some(asset) = sub.state.installed_asset.clone() else {
+                continue;
+            };
+            if on_disk.contains(&asset) {
+                claimed.insert(asset);
+            } else {
+                report.missing.push(MissingFile {
+                    owner: owner.clone(),
+                    repo: repo.clone(),
+                    asset,
+                });
+                sub.disabled = true;
+                sub.state.installed_version = None;
+                sub.state.installed_asset = None;
+                sub.state.installed_at = None;
+            }
         }
     }
 

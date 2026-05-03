@@ -16,7 +16,7 @@ use crate::{
     asset_match::pick_asset,
     chat::print_async,
     component::Component,
-    config::{Config, Subscription, config_path},
+    config::{self, Config, Subscription, config_path},
     github_release::{GitHubRelease, get_release_for_channel, resolve_expected_digest},
     installer::{MANAGED_DIR, cleanup_self_old, download_self, download_to_managed_dir},
     loader::init_managed,
@@ -57,9 +57,18 @@ impl Component for Updater {
             // Hand off to the loader on the main thread regardless of update
             // outcome — load whatever's on disk even if a network fetch failed.
             // Load fresh off-thread so we see installed_asset writes from the
-            // pass, then hop to main only for the dlopen.
-            let subs = match Config::load() {
-                Ok(cfg) => cfg.subscriptions,
+            // pass, then hop to main only for the dlopen. Flatten the nested
+            // map into triples so the loader keeps a simple slice signature.
+            let subs: Vec<(String, String, Subscription)> = match Config::load() {
+                Ok(cfg) => cfg
+                    .subscriptions
+                    .into_iter()
+                    .flat_map(|(owner, repos)| {
+                        repos
+                            .into_iter()
+                            .map(move |(repo, sub)| (owner.clone(), repo, sub))
+                    })
+                    .collect(),
                 Err(e) => {
                     error!("loading config for managed-load: {e:#}");
                     return;
@@ -87,173 +96,157 @@ async fn run_initial_pass() -> Result<()> {
     let mut new_tags: Vec<(String, String, String, u64)> = Vec::new();
     let mut installed: Vec<(String, String, String, String, u64)> = Vec::new();
 
-    for sub in &subs {
-        if sub.disabled {
-            debug!("{}/{} disabled; skipping", sub.owner, sub.repo);
-            continue;
-        }
-
-        let (tag, published_at, mut release_in_hand) = match resolve_latest_release(sub, now).await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("checking {}/{}: {e:#}", sub.owner, sub.repo);
-                print_async(format!(
-                    "{}Failed to check {}{}/{}{}: {}{e}",
-                    color::RED,
-                    color::LIME,
-                    sub.owner,
-                    sub.repo,
-                    color::RED,
-                    color::WHITE,
-                ))
-                .await;
+    for (owner, repos) in &subs {
+        for (repo, sub) in repos {
+            if sub.disabled {
+                debug!("{owner}/{repo} disabled; skipping");
                 continue;
             }
-        };
-        if release_in_hand.is_some() {
-            new_tags.push((
-                sub.owner.clone(),
-                sub.repo.clone(),
-                tag.clone(),
+
+            let (tag, published_at, mut release_in_hand) =
+                match resolve_latest_release(owner, repo, sub, now).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!("checking {owner}/{repo}: {e:#}");
+                        print_async(format!(
+                            "{}Failed to check {}{owner}/{repo}{}: {}{e}",
+                            color::RED,
+                            color::LIME,
+                            color::RED,
+                            color::WHITE,
+                        ))
+                        .await;
+                        continue;
+                    }
+                };
+            if release_in_hand.is_some() {
+                new_tags.push((owner.clone(), repo.clone(), tag.clone(), published_at));
+            }
+
+            if !needs_install(
+                sub.state.installed_at,
+                sub.state.installed_asset.as_deref(),
                 published_at,
-            ));
-        }
+            ) {
+                debug!("{owner}/{repo} up to date ({tag})");
+                continue;
+            }
 
-        if !needs_install(
-            sub.installed_at,
-            sub.installed_asset.as_deref(),
-            published_at,
-        ) {
-            debug!("{}/{} up to date ({tag})", sub.owner, sub.repo);
-            continue;
-        }
+            let release = match release_in_hand.take() {
+                Some(r) => r,
+                None => match get_release_for_channel(owner, repo, &sub.channel).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("fetching release for {owner}/{repo}: {e:#}");
+                        print_async(format!(
+                            "{}Failed to fetch release for {}{owner}/{repo}{}: {}{e}",
+                            color::RED,
+                            color::LIME,
+                            color::RED,
+                            color::WHITE,
+                        ))
+                        .await;
+                        continue;
+                    }
+                },
+            };
 
-        let release = match release_in_hand.take() {
-            Some(r) => r,
-            None => match get_release_for_channel(&sub.owner, &sub.repo, &sub.channel).await {
-                Ok(r) => r,
+            let asset =
+                match pick_asset(&release.assets, env::consts::ARCH, env::consts::DLL_SUFFIX) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        warn!("asset match {owner}/{repo}: {e:#}");
+                        print_async(format!(
+                            "{}No suitable asset for {}{owner}/{repo}{}: {}{e}",
+                            color::RED,
+                            color::LIME,
+                            color::RED,
+                            color::WHITE,
+                        ))
+                        .await;
+                        continue;
+                    }
+                };
+
+            print_async(format!(
+                "{}Installing {}{} {}for {}{owner}/{repo} {}({}{}{})",
+                color::PINK,
+                color::GREEN,
+                release.tag_name,
+                color::PINK,
+                color::LIME,
+                color::PINK,
+                color::LIME,
+                asset.name,
+                color::PINK,
+            ))
+            .await;
+
+            let expected_digest = match resolve_expected_digest(asset) {
+                Ok(d) => d,
                 Err(e) => {
-                    warn!("fetching release for {}/{}: {e:#}", sub.owner, sub.repo);
+                    warn!("digest resolve failed for {owner}/{repo}: {e:#}");
                     print_async(format!(
-                        "{}Failed to fetch release for {}{}/{}{}: {}{e}",
+                        "{}Digest check failed for {}{owner}/{repo}{}: {}{e}",
                         color::RED,
                         color::LIME,
-                        sub.owner,
-                        sub.repo,
                         color::RED,
                         color::WHITE,
                     ))
                     .await;
                     continue;
                 }
-            },
-        };
+            };
 
-        let asset = match pick_asset(&release.assets, env::consts::ARCH, env::consts::DLL_SUFFIX) {
-            Ok(a) => a,
-            Err(e) => {
-                warn!("asset match {}/{}: {e:#}", sub.owner, sub.repo);
-                print_async(format!(
-                    "{}No suitable asset for {}{}/{}{}: {}{e}",
-                    color::RED,
-                    color::LIME,
-                    sub.owner,
-                    sub.repo,
-                    color::RED,
-                    color::WHITE,
-                ))
-                .await;
-                continue;
-            }
-        };
-
-        print_async(format!(
-            "{}Installing {}{} {}for {}{}/{} {}({}{}{})",
-            color::PINK,
-            color::GREEN,
-            release.tag_name,
-            color::PINK,
-            color::LIME,
-            sub.owner,
-            sub.repo,
-            color::PINK,
-            color::LIME,
-            asset.name,
-            color::PINK,
-        ))
-        .await;
-
-        let expected_digest = match resolve_expected_digest(asset) {
-            Ok(d) => d,
-            Err(e) => {
-                warn!(
-                    "digest resolve failed for {}/{}: {e:#}",
-                    sub.owner, sub.repo
-                );
-                print_async(format!(
-                    "{}Digest check failed for {}{}/{}{}: {}{e}",
-                    color::RED,
-                    color::LIME,
-                    sub.owner,
-                    sub.repo,
-                    color::RED,
-                    color::WHITE,
-                ))
-                .await;
-                continue;
-            }
-        };
-
-        let install_result = if sub.is_self() {
-            download_self(asset, expected_digest.as_deref()).await
-        } else {
-            download_to_managed_dir(asset, expected_digest.as_deref()).await
-        };
-        match install_result {
-            Ok(path) => {
-                installed.push((
-                    sub.owner.clone(),
-                    sub.repo.clone(),
-                    release.tag_name.clone(),
-                    asset.name.clone(),
-                    release.published_at,
-                ));
-                if sub.is_self() {
+            let is_self = config::is_self(owner, repo);
+            let install_result = if is_self {
+                download_self(asset, expected_digest.as_deref()).await
+            } else {
+                download_to_managed_dir(asset, expected_digest.as_deref()).await
+            };
+            match install_result {
+                Ok(path) => {
+                    installed.push((
+                        owner.clone(),
+                        repo.clone(),
+                        release.tag_name.clone(),
+                        asset.name.clone(),
+                        release.published_at,
+                    ));
+                    if is_self {
+                        print_async(format!(
+                            "{}Plugin updater updated to {}{}{} — restart ClassiCube to use the \
+                             new version",
+                            color::PINK,
+                            color::GREEN,
+                            release.tag_name,
+                            color::PINK,
+                        ))
+                        .await;
+                    } else {
+                        print_async(format!(
+                            "{}Installed {}{} {}-> {}{}",
+                            color::PINK,
+                            color::GREEN,
+                            release.tag_name,
+                            color::PINK,
+                            color::YELLOW,
+                            path.display(),
+                        ))
+                        .await;
+                    }
+                }
+                Err(e) => {
+                    error!("installing {owner}/{repo}: {e:#}");
                     print_async(format!(
-                        "{}Plugin updater updated to {}{}{} — restart ClassiCube to use the new \
-                         version",
-                        color::PINK,
-                        color::GREEN,
-                        release.tag_name,
-                        color::PINK,
-                    ))
-                    .await;
-                } else {
-                    print_async(format!(
-                        "{}Installed {}{} {}-> {}{}",
-                        color::PINK,
-                        color::GREEN,
-                        release.tag_name,
-                        color::PINK,
-                        color::YELLOW,
-                        path.display(),
+                        "{}Install failed for {}{owner}/{repo}{}: {}{e}",
+                        color::RED,
+                        color::LIME,
+                        color::RED,
+                        color::WHITE,
                     ))
                     .await;
                 }
-            }
-            Err(e) => {
-                error!("installing {}/{}: {e:#}", sub.owner, sub.repo);
-                print_async(format!(
-                    "{}Install failed for {}{}/{}{}: {}{e}",
-                    color::RED,
-                    color::LIME,
-                    sub.owner,
-                    sub.repo,
-                    color::RED,
-                    color::WHITE,
-                ))
-                .await;
             }
         }
     }
@@ -358,14 +351,16 @@ fn needs_install(
 }
 
 async fn resolve_latest_release(
+    owner: &str,
+    repo: &str,
     sub: &Subscription,
     now: u64,
 ) -> Result<(String, u64, Option<GitHubRelease>)> {
     if let Some((tag, pub_at)) = sub.fresh_cached_release(now, TTL_SECS) {
-        debug!("{}/{} served from cache ({tag})", sub.owner, sub.repo);
+        debug!("{owner}/{repo} served from cache ({tag})");
         return Ok((tag.to_owned(), pub_at, None));
     }
-    let release = get_release_for_channel(&sub.owner, &sub.repo, &sub.channel).await?;
+    let release = get_release_for_channel(owner, repo, &sub.channel).await?;
     Ok((
         release.tag_name.clone(),
         release.published_at,
@@ -388,12 +383,12 @@ fn persist_cache_updates_to(
     for (owner, repo, tag, published_at) in updates {
         if let Some(sub) = fresh
             .subscriptions
-            .iter_mut()
-            .find(|s| s.owner == owner && s.repo == repo)
+            .get_mut(&owner)
+            .and_then(|m| m.get_mut(&repo))
         {
-            sub.cached_tag = Some(tag);
-            sub.cached_at = Some(now);
-            sub.cached_published_at = Some(published_at);
+            sub.state.cached_tag = Some(tag);
+            sub.state.cached_at = Some(now);
+            sub.state.cached_published_at = Some(published_at);
         }
     }
     fresh.save_to(path)
@@ -416,17 +411,17 @@ pub fn persist_installed_versions_to(
     for (owner, repo, version, asset, published_at) in updates {
         if let Some(sub) = fresh
             .subscriptions
-            .iter_mut()
-            .find(|s| s.owner == owner && s.repo == repo)
+            .get_mut(&owner)
+            .and_then(|m| m.get_mut(&repo))
         {
-            sub.installed_version = Some(version.clone());
-            sub.installed_asset = Some(asset);
-            sub.installed_at = Some(published_at);
+            sub.state.installed_version = Some(version.clone());
+            sub.state.installed_asset = Some(asset);
+            sub.state.installed_at = Some(published_at);
             // Installing the version means whatever we just stored *is* the
             // up-to-date cached tag from the user's perspective.
-            sub.cached_tag = Some(version);
-            sub.cached_at = Some(now);
-            sub.cached_published_at = Some(published_at);
+            sub.state.cached_tag = Some(version);
+            sub.state.cached_at = Some(now);
+            sub.state.cached_published_at = Some(published_at);
         }
     }
     fresh.save_to(path)
