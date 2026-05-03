@@ -3,6 +3,7 @@ mod chat;
 mod component;
 mod components;
 mod config;
+mod discover;
 mod github_release;
 mod installer;
 mod loader;

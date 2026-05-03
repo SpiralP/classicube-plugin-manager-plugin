@@ -21,6 +21,7 @@ use crate::{
     component::Component,
     components::updater::persist_installed_versions,
     config::{self, Channel, Config, Subscription, SubscriptionState},
+    discover,
     github_release::{get_release_for_channel, resolve_expected_digest},
     installer::{download_self, download_to_managed_dir},
 };
@@ -43,6 +44,16 @@ const DEFAULT_OWNER: &str = "SpiralP";
 /// - `owner/classicube-foo-plugin`    → [(owner, classicube-foo-plugin)]
 /// - `classicube-foo-plugin`          → [(SpiralP, classicube-foo-plugin)]
 fn expand_candidates(input: &str) -> Option<Vec<(String, String)>> {
+    // Curated shorthand wins over the generic `classicube-$name-plugin`
+    // expansion: bare input only (no slash) — owner-prefixed input always
+    // means "I know what I want" and skips the curated lookup. A hit returns
+    // a single canonical candidate, so callers like `handle_subscribe` skip
+    // `resolve_canonical`'s speculative 404 probe.
+    if !input.contains('/')
+        && let Some(entry) = discover::lookup_shorthand(input)
+    {
+        return Some(vec![(entry.owner.clone(), entry.repo.clone())]);
+    }
     let (owner, repo) = match input.split_once('/') {
         Some((o, r)) => (o, r),
         None => (DEFAULT_OWNER, input),
@@ -134,6 +145,7 @@ const USAGE_LINES: &[&str] = &[
     "&a/client Updater enable <owner>/<repo>",
     "&a/client Updater list",
     "&a/client Updater update [<owner>/<repo>]",
+    "&a/client Updater discover [<search>]",
 ];
 
 /// Parse the trailing channel arguments after `<owner>/<repo>`.
@@ -731,7 +743,43 @@ extern "C" fn c_callback(args: *const cc_string, args_count: c_int) {
         ["list"] => handle_list(),
         ["update"] => handle_update_all(),
         ["update", spec] => handle_update_one(spec),
+        ["discover"] => handle_discover(None),
+        ["discover", term] => handle_discover(Some(term)),
         _ => print_usage(),
+    }
+}
+
+fn handle_discover(term: Option<&str>) {
+    let header = match term {
+        None => format!("{}Curated plugins:", color::YELLOW),
+        Some(t) => format!(
+            "{}Plugins matching {}{t}{}:",
+            color::YELLOW,
+            color::LIME,
+            color::YELLOW
+        ),
+    };
+    print_wrapped(header);
+
+    let mut any = false;
+    for entry in discover::iter_filtered(term) {
+        any = true;
+        let shorthand = match &entry.shorthand {
+            Some(s) => format!(" {}[{s}]", color::YELLOW),
+            None => String::new(),
+        };
+        print_wrapped(format!(
+            "{}{}/{}{shorthand} {}- {}{}",
+            color::LIME,
+            entry.owner,
+            entry.repo,
+            color::WHITE,
+            color::WHITE,
+            entry.description,
+        ));
+    }
+    if !any {
+        print_wrapped(format!("{}No matches.", color::YELLOW));
     }
 }
 
