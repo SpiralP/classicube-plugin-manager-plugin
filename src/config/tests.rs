@@ -1,31 +1,37 @@
-use std::io::Write;
+use std::{collections::BTreeMap, io::Write};
 
 use tempfile::{NamedTempFile, tempdir};
 
 use super::*;
 
-fn sub(owner: &str, repo: &str) -> Subscription {
-    Subscription {
-        owner: owner.into(),
-        repo: repo.into(),
-        channel: Channel::default(),
-        disabled: false,
-        installed_version: None,
-        installed_asset: None,
-        installed_at: None,
-        cached_tag: None,
-        cached_at: None,
-        cached_published_at: None,
-    }
+fn sub() -> Subscription {
+    Subscription::default()
+}
+
+fn one_sub_config(owner: &str, repo: &str, sub: Subscription) -> Config {
+    let mut subscriptions = BTreeMap::new();
+    let mut repos = BTreeMap::new();
+    repos.insert(repo.into(), sub);
+    subscriptions.insert(owner.into(), repos);
+    Config { subscriptions }
+}
+
+fn first_sub(cfg: &Config) -> (&str, &str, &Subscription) {
+    let (owner, repos) = cfg.subscriptions.iter().next().unwrap();
+    let (repo, sub) = repos.iter().next().unwrap();
+    (owner, repo, sub)
 }
 
 #[test]
 fn fresh_within_ttl() {
     let s = Subscription {
-        cached_tag: Some("v1.0.0".into()),
-        cached_at: Some(100),
-        cached_published_at: Some(50),
-        ..sub("a", "b")
+        state: SubscriptionState {
+            cached_tag: Some("v1.0.0".into()),
+            cached_at: Some(100),
+            cached_published_at: Some(50),
+            ..SubscriptionState::default()
+        },
+        ..sub()
     };
     assert_eq!(s.fresh_cached_release(150, 100), Some(("v1.0.0", 50)));
 }
@@ -34,10 +40,13 @@ fn fresh_within_ttl() {
 fn fresh_at_ttl_boundary_is_stale() {
     // The check is strict `<`, so equal-to-TTL counts as expired.
     let s = Subscription {
-        cached_tag: Some("v1.0.0".into()),
-        cached_at: Some(100),
-        cached_published_at: Some(50),
-        ..sub("a", "b")
+        state: SubscriptionState {
+            cached_tag: Some("v1.0.0".into()),
+            cached_at: Some(100),
+            cached_published_at: Some(50),
+            ..SubscriptionState::default()
+        },
+        ..sub()
     };
     assert_eq!(s.fresh_cached_release(200, 100), None);
 }
@@ -46,10 +55,13 @@ fn fresh_at_ttl_boundary_is_stale() {
 fn fresh_with_clock_skew() {
     // saturating_sub avoids panicking when `now < cached_at`; treat as fresh.
     let s = Subscription {
-        cached_tag: Some("v1.0.0".into()),
-        cached_at: Some(500),
-        cached_published_at: Some(50),
-        ..sub("a", "b")
+        state: SubscriptionState {
+            cached_tag: Some("v1.0.0".into()),
+            cached_at: Some(500),
+            cached_published_at: Some(50),
+            ..SubscriptionState::default()
+        },
+        ..sub()
     };
     assert_eq!(s.fresh_cached_release(100, 60), Some(("v1.0.0", 50)));
 }
@@ -57,10 +69,12 @@ fn fresh_with_clock_skew() {
 #[test]
 fn missing_cached_tag_is_stale() {
     let s = Subscription {
-        cached_tag: None,
-        cached_at: Some(100),
-        cached_published_at: Some(50),
-        ..sub("a", "b")
+        state: SubscriptionState {
+            cached_at: Some(100),
+            cached_published_at: Some(50),
+            ..SubscriptionState::default()
+        },
+        ..sub()
     };
     assert_eq!(s.fresh_cached_release(150, 100), None);
 }
@@ -68,10 +82,12 @@ fn missing_cached_tag_is_stale() {
 #[test]
 fn missing_cached_at_is_stale() {
     let s = Subscription {
-        cached_tag: Some("v1.0.0".into()),
-        cached_at: None,
-        cached_published_at: Some(50),
-        ..sub("a", "b")
+        state: SubscriptionState {
+            cached_tag: Some("v1.0.0".into()),
+            cached_published_at: Some(50),
+            ..SubscriptionState::default()
+        },
+        ..sub()
     };
     assert_eq!(s.fresh_cached_release(150, 100), None);
 }
@@ -81,10 +97,12 @@ fn missing_cached_published_at_is_stale() {
     // Without the timestamp the cached tag is useless for the install
     // decision, so treat it as stale and force a refetch.
     let s = Subscription {
-        cached_tag: Some("v1.0.0".into()),
-        cached_at: Some(100),
-        cached_published_at: None,
-        ..sub("a", "b")
+        state: SubscriptionState {
+            cached_tag: Some("v1.0.0".into()),
+            cached_at: Some(100),
+            ..SubscriptionState::default()
+        },
+        ..sub()
     };
     assert_eq!(s.fresh_cached_release(150, 100), None);
 }
@@ -116,20 +134,21 @@ fn round_trip_default_config() {
 
 #[test]
 fn round_trip_populated_subscription() {
-    let cfg = Config {
-        subscriptions: vec![Subscription {
-            owner: "octocat".into(),
-            repo: "hello-world".into(),
-            channel: Channel::default(),
-            disabled: false,
-            installed_version: Some("v1.2.3".into()),
-            installed_asset: Some("hello-world.so".into()),
-            installed_at: Some(1_700_000_000),
-            cached_tag: Some("v1.2.4".into()),
-            cached_at: Some(1_700_000_500),
-            cached_published_at: Some(1_700_000_400),
-        }],
-    };
+    let cfg = one_sub_config(
+        "octocat",
+        "hello-world",
+        Subscription {
+            state: SubscriptionState {
+                installed_version: Some("v1.2.3".into()),
+                installed_asset: Some("hello-world.so".into()),
+                installed_at: Some(1_700_000_000),
+                cached_tag: Some("v1.2.4".into()),
+                cached_at: Some(1_700_000_500),
+                cached_published_at: Some(1_700_000_400),
+            },
+            ..sub()
+        },
+    );
     let f = NamedTempFile::new().unwrap();
     cfg.save_to(f.path()).unwrap();
     let loaded = Config::load_from(f.path()).unwrap();
@@ -137,10 +156,44 @@ fn round_trip_populated_subscription() {
 }
 
 #[test]
+fn dotted_key_round_trip() {
+    // Two repos under the same owner share an outer table; the file uses
+    // `[owner.repo]` headers (no `[[subscriptions]]` wrapper).
+    let mut repos = BTreeMap::new();
+    repos.insert("classicube-foo-plugin".into(), sub());
+    repos.insert(
+        "classicube-bar-plugin".into(),
+        Subscription {
+            channel: Channel::Prerelease,
+            ..sub()
+        },
+    );
+    let mut subscriptions = BTreeMap::new();
+    subscriptions.insert("SpiralP".into(), repos);
+    let cfg = Config { subscriptions };
+
+    let f = NamedTempFile::new().unwrap();
+    cfg.save_to(f.path()).unwrap();
+    let on_disk = fs::read_to_string(f.path()).unwrap();
+    assert!(
+        on_disk.contains("[SpiralP.classicube-foo-plugin]"),
+        "expected dotted-key header in: {on_disk}",
+    );
+    assert!(
+        on_disk.contains("[SpiralP.classicube-bar-plugin]"),
+        "expected dotted-key header in: {on_disk}",
+    );
+    assert!(
+        !on_disk.contains("[[subscriptions]]"),
+        "should not emit array-of-tables: {on_disk}",
+    );
+    let loaded = Config::load_from(f.path()).unwrap();
+    assert_eq!(loaded, cfg);
+}
+
+#[test]
 fn bare_subscription_skips_optional_fields_in_toml() {
-    let cfg = Config {
-        subscriptions: vec![sub("octocat", "hello-world")],
-    };
+    let cfg = one_sub_config("octocat", "hello-world", sub());
     let f = NamedTempFile::new().unwrap();
     cfg.save_to(f.path()).unwrap();
     let on_disk = fs::read_to_string(f.path()).unwrap();
@@ -151,19 +204,50 @@ fn bare_subscription_skips_optional_fields_in_toml() {
     assert!(!on_disk.contains("cached_tag"));
     assert!(!on_disk.contains("cached_at"));
     assert!(!on_disk.contains("cached_published_at"));
-    // Round-trip still works.
+    // The empty-state subtable is omitted entirely so a freshly-subscribed
+    // entry doesn't carry an empty `[octocat.hello-world.state]` header.
+    assert!(
+        !on_disk.contains(".state]"),
+        "empty state subtable should be skipped: {on_disk}",
+    );
+    let loaded = Config::load_from(f.path()).unwrap();
+    assert_eq!(loaded, cfg);
+}
+
+#[test]
+fn state_subtable_round_trip() {
+    let cfg = one_sub_config(
+        "octocat",
+        "hello-world",
+        Subscription {
+            state: SubscriptionState {
+                installed_version: Some("v1.0.0".into()),
+                ..SubscriptionState::default()
+            },
+            ..sub()
+        },
+    );
+    let f = NamedTempFile::new().unwrap();
+    cfg.save_to(f.path()).unwrap();
+    let on_disk = fs::read_to_string(f.path()).unwrap();
+    assert!(
+        on_disk.contains("[octocat.hello-world.state]"),
+        "expected state subtable header in: {on_disk}",
+    );
     let loaded = Config::load_from(f.path()).unwrap();
     assert_eq!(loaded, cfg);
 }
 
 #[test]
 fn disabled_round_trip() {
-    let cfg = Config {
-        subscriptions: vec![Subscription {
+    let cfg = one_sub_config(
+        "octocat",
+        "hello-world",
+        Subscription {
             disabled: true,
-            ..sub("octocat", "hello-world")
-        }],
-    };
+            ..sub()
+        },
+    );
     let f = NamedTempFile::new().unwrap();
     cfg.save_to(f.path()).unwrap();
     let on_disk = fs::read_to_string(f.path()).unwrap();
@@ -173,17 +257,6 @@ fn disabled_round_trip() {
     );
     let loaded = Config::load_from(f.path()).unwrap();
     assert_eq!(loaded, cfg);
-}
-
-#[test]
-fn disabled_default_when_missing_from_toml() {
-    // Older configs (written before this field existed) must continue to load.
-    let mut f = NamedTempFile::new().unwrap();
-    f.write_all(b"[[subscriptions]]\nowner = \"octocat\"\nrepo = \"hello-world\"\n")
-        .unwrap();
-    let loaded = Config::load_from(f.path()).unwrap();
-    assert_eq!(loaded.subscriptions.len(), 1);
-    assert!(!loaded.subscriptions[0].disabled);
 }
 
 #[test]
@@ -242,22 +315,32 @@ fn channel_rejects_unknown() {
 
 #[test]
 fn channel_round_trip_in_subscription() {
-    let cfg = Config {
-        subscriptions: vec![
-            Subscription {
-                channel: Channel::Stable,
-                ..sub("a", "stable")
-            },
-            Subscription {
-                channel: Channel::Prerelease,
-                ..sub("a", "pre")
-            },
-            Subscription {
-                channel: Channel::Tag("v1.2.3".into()),
-                ..sub("a", "pinned")
-            },
-        ],
-    };
+    let mut repos = BTreeMap::new();
+    repos.insert(
+        "stable".into(),
+        Subscription {
+            channel: Channel::Stable,
+            ..sub()
+        },
+    );
+    repos.insert(
+        "pre".into(),
+        Subscription {
+            channel: Channel::Prerelease,
+            ..sub()
+        },
+    );
+    repos.insert(
+        "pinned".into(),
+        Subscription {
+            channel: Channel::Tag("v1.2.3".into()),
+            ..sub()
+        },
+    );
+    let mut subscriptions = BTreeMap::new();
+    subscriptions.insert("a".into(), repos);
+    let cfg = Config { subscriptions };
+
     let f = NamedTempFile::new().unwrap();
     cfg.save_to(f.path()).unwrap();
     let on_disk = fs::read_to_string(f.path()).unwrap();
@@ -276,12 +359,14 @@ fn channel_round_trip_in_subscription() {
 fn channel_round_trips_complex_tag() {
     // Real-world tags include rc / build-metadata characters; make sure the
     // `tag:<ref>` form round-trips them as-is rather than mangling them.
-    let cfg = Config {
-        subscriptions: vec![Subscription {
+    let cfg = one_sub_config(
+        "a",
+        "b",
+        Subscription {
             channel: Channel::Tag("v1.2.3-rc1+build.5".into()),
-            ..sub("a", "b")
-        }],
-    };
+            ..sub()
+        },
+    );
     let f = NamedTempFile::new().unwrap();
     cfg.save_to(f.path()).unwrap();
     let on_disk = fs::read_to_string(f.path()).unwrap();
@@ -294,26 +379,14 @@ fn channel_round_trips_complex_tag() {
 }
 
 #[test]
-fn legacy_subscription_without_channel_loads_as_stable() {
-    let mut f = NamedTempFile::new().unwrap();
-    f.write_all(b"[[subscriptions]]\nowner = \"octocat\"\nrepo = \"hello-world\"\n")
-        .unwrap();
-    let loaded = Config::load_from(f.path()).unwrap();
-    assert_eq!(loaded.subscriptions[0].channel, Channel::Stable);
-}
-
-#[test]
 fn is_self_matches_pkg_identity() {
     assert!(super::is_self(SELF_OWNER, SELF_REPO));
-    assert!(sub(SELF_OWNER, SELF_REPO).is_self());
 }
 
 #[test]
 fn is_self_rejects_other_owners_and_repos() {
     assert!(!super::is_self("octocat", SELF_REPO));
     assert!(!super::is_self(SELF_OWNER, "some-other-plugin"));
-    assert!(!sub("octocat", SELF_REPO).is_self());
-    assert!(!sub(SELF_OWNER, "some-other-plugin").is_self());
 }
 
 #[test]
@@ -328,70 +401,128 @@ fn is_self_is_case_sensitive() {
 fn ensure_self_adds_when_missing() {
     let mut cfg = Config::default();
     assert!(cfg.ensure_self());
-    assert_eq!(cfg.subscriptions.len(), 1);
-    let added = &cfg.subscriptions[0];
-    assert!(added.is_self());
+    let added = cfg
+        .subscriptions
+        .get(SELF_OWNER)
+        .and_then(|m| m.get(SELF_REPO))
+        .expect("self subscription should exist after ensure_self");
     assert_eq!(added.channel, Channel::Stable);
     assert!(!added.disabled);
-    assert!(added.installed_version.is_none());
+    assert!(added.state.is_empty());
 }
 
 #[test]
 fn ensure_self_is_noop_when_present() {
-    let mut cfg = Config {
-        subscriptions: vec![Subscription {
-            channel: Channel::Prerelease,
-            disabled: true,
+    let prepared = Subscription {
+        channel: Channel::Prerelease,
+        disabled: true,
+        state: SubscriptionState {
             installed_version: Some("v9.9.9".into()),
-            ..sub(SELF_OWNER, SELF_REPO)
-        }],
+            ..SubscriptionState::default()
+        },
     };
+    let mut cfg = one_sub_config(SELF_OWNER, SELF_REPO, prepared.clone());
     assert!(!cfg.ensure_self());
-    // User-set fields are left alone — ensure_self never overwrites
-    // existing entries even when their state looks unusual.
-    let kept = &cfg.subscriptions[0];
-    assert_eq!(kept.channel, Channel::Prerelease);
-    assert!(kept.disabled);
-    assert_eq!(kept.installed_version.as_deref(), Some("v9.9.9"));
+    let kept = cfg
+        .subscriptions
+        .get(SELF_OWNER)
+        .and_then(|m| m.get(SELF_REPO))
+        .unwrap();
+    assert_eq!(kept, &prepared);
 }
 
 #[test]
 fn ensure_self_does_not_disturb_other_subscriptions() {
     let other = Subscription {
-        installed_version: Some("v1.0.0".into()),
-        installed_asset: Some("other.so".into()),
-        ..sub("octocat", "hello-world")
+        state: SubscriptionState {
+            installed_version: Some("v1.0.0".into()),
+            installed_asset: Some("other.so".into()),
+            ..SubscriptionState::default()
+        },
+        ..sub()
     };
-    let mut cfg = Config {
-        subscriptions: vec![other.clone()],
-    };
+    let mut cfg = one_sub_config("octocat", "hello-world", other.clone());
     assert!(cfg.ensure_self());
-    assert_eq!(cfg.subscriptions.len(), 2);
-    // Existing entry stays at index 0; self is appended.
-    assert_eq!(cfg.subscriptions[0], other);
-    assert!(cfg.subscriptions[1].is_self());
+    // Both entries are present; BTreeMap order is alphabetical.
+    assert_eq!(
+        cfg.subscriptions
+            .get("octocat")
+            .and_then(|m| m.get("hello-world")),
+        Some(&other),
+    );
+    assert!(
+        cfg.subscriptions
+            .get(SELF_OWNER)
+            .and_then(|m| m.get(SELF_REPO))
+            .is_some()
+    );
 }
 
 #[test]
-fn legacy_config_without_timestamps_loads() {
-    // A config written by an older version of the plugin lacks
-    // installed_at / cached_published_at. Loading must still succeed; the
-    // missing fields default to None and trigger a reinstall on next check.
-    let mut f = NamedTempFile::new().unwrap();
-    f.write_all(
-        b"[[subscriptions]]
-owner = \"octocat\"
-repo = \"hello-world\"
-installed_version = \"v1.2.3\"
-installed_asset = \"hello-world.so\"
-cached_tag = \"v1.2.3\"
-cached_at = 1700000000
-",
-    )
-    .unwrap();
+fn keys_round_trip_in_alphabetical_order() {
+    let mut subscriptions = BTreeMap::new();
+    for owner in ["c", "a", "b"] {
+        let mut repos = BTreeMap::new();
+        repos.insert("only".into(), sub());
+        subscriptions.insert(owner.into(), repos);
+    }
+    let cfg = Config { subscriptions };
+    let f = NamedTempFile::new().unwrap();
+    cfg.save_to(f.path()).unwrap();
     let loaded = Config::load_from(f.path()).unwrap();
-    let sub = &loaded.subscriptions[0];
-    assert_eq!(sub.installed_version.as_deref(), Some("v1.2.3"));
-    assert!(sub.installed_at.is_none());
-    assert!(sub.cached_published_at.is_none());
+    let owners: Vec<&String> = loaded.subscriptions.keys().collect();
+    assert_eq!(
+        owners,
+        vec![&"a".to_string(), &"b".to_string(), &"c".to_string()]
+    );
+}
+
+#[test]
+fn rejects_repo_with_dot_on_load() {
+    // `[a."b.c"]` parses fine in TOML (quoted key keeps the dot intact in
+    // the inner key name), so we have to reject it explicitly during
+    // validation — without that, the loader would accept a repo name TOML
+    // would later silently re-nest if the user removed the quotes.
+    let mut f = NamedTempFile::new().unwrap();
+    f.write_all(b"[a.\"b.c\"]\n").unwrap();
+    let err = Config::load_from(f.path()).unwrap_err();
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains("'.'") || chain.contains("nested table"),
+        "expected dot-rejection message in: {chain}",
+    );
+}
+
+#[test]
+fn rejects_empty_owner_segment() {
+    // Quoted empty TOML key — invalid for our schema even if TOML allows it.
+    let mut f = NamedTempFile::new().unwrap();
+    f.write_all(b"[\"\".\"some-repo\"]\n").unwrap();
+    let err = Config::load_from(f.path()).unwrap_err();
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains("empty"),
+        "expected empty-segment error in: {chain}",
+    );
+}
+
+#[test]
+fn rejects_whitespace_in_keys() {
+    let mut f = NamedTempFile::new().unwrap();
+    f.write_all(b"[\"some owner\".\"some-repo\"]\n").unwrap();
+    let err = Config::load_from(f.path()).unwrap_err();
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains("whitespace"),
+        "expected whitespace error in: {chain}",
+    );
+}
+
+#[test]
+fn first_sub_helper_smoke() {
+    // Sanity check that the test helper still surfaces the single entry.
+    let cfg = one_sub_config("a", "b", sub());
+    let (owner, repo, _) = first_sub(&cfg);
+    assert_eq!(owner, "a");
+    assert_eq!(repo, "b");
 }

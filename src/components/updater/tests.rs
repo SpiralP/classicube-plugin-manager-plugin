@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
+
 use tempfile::{NamedTempFile, tempdir};
 
 use super::*;
-use crate::config::Channel;
+use crate::config::{Channel, SubscriptionState};
 
 #[test]
 fn needs_install_no_prior_state() {
@@ -43,26 +45,28 @@ fn needs_install_asset_known_but_no_timestamp() {
     assert!(needs_install(None, Some("p.so"), 200));
 }
 
-fn sub(owner: &str, repo: &str) -> Subscription {
-    Subscription {
-        owner: owner.into(),
-        repo: repo.into(),
-        channel: Channel::default(),
-        disabled: false,
-        installed_version: None,
-        installed_asset: None,
-        installed_at: None,
-        cached_tag: None,
-        cached_at: None,
-        cached_published_at: None,
+fn empty_sub() -> Subscription {
+    Subscription::default()
+}
+
+fn config_with(entries: &[(&str, &str, Subscription)]) -> Config {
+    let mut subscriptions: BTreeMap<String, BTreeMap<String, Subscription>> = BTreeMap::new();
+    for (owner, repo, sub) in entries {
+        subscriptions
+            .entry((*owner).into())
+            .or_default()
+            .insert((*repo).into(), sub.clone());
     }
+    Config { subscriptions }
+}
+
+fn pick<'a>(cfg: &'a Config, owner: &str, repo: &str) -> &'a Subscription {
+    cfg.subscriptions.get(owner).unwrap().get(repo).unwrap()
 }
 
 #[test]
 fn updates_targeted_subscription_only() {
-    let cfg = Config {
-        subscriptions: vec![sub("alice", "one"), sub("bob", "two")],
-    };
+    let cfg = config_with(&[("alice", "one", empty_sub()), ("bob", "two", empty_sub())]);
     let f = NamedTempFile::new().unwrap();
     cfg.save_to(f.path()).unwrap();
 
@@ -74,21 +78,19 @@ fn updates_targeted_subscription_only() {
     .unwrap();
 
     let loaded = Config::load_from(f.path()).unwrap();
-    let alice = &loaded.subscriptions[0];
-    let bob = &loaded.subscriptions[1];
-    assert_eq!(alice.cached_tag.as_deref(), Some("v9.9.9"));
-    assert_eq!(alice.cached_at, Some(12_345));
-    assert_eq!(alice.cached_published_at, Some(9_000));
-    assert!(bob.cached_tag.is_none());
-    assert!(bob.cached_at.is_none());
-    assert!(bob.cached_published_at.is_none());
+    let alice = pick(&loaded, "alice", "one");
+    let bob = pick(&loaded, "bob", "two");
+    assert_eq!(alice.state.cached_tag.as_deref(), Some("v9.9.9"));
+    assert_eq!(alice.state.cached_at, Some(12_345));
+    assert_eq!(alice.state.cached_published_at, Some(9_000));
+    assert!(bob.state.cached_tag.is_none());
+    assert!(bob.state.cached_at.is_none());
+    assert!(bob.state.cached_published_at.is_none());
 }
 
 #[test]
 fn unknown_owner_repo_silently_skipped() {
-    let cfg = Config {
-        subscriptions: vec![sub("alice", "one")],
-    };
+    let cfg = config_with(&[("alice", "one", empty_sub())]);
     let f = NamedTempFile::new().unwrap();
     cfg.save_to(f.path()).unwrap();
 
@@ -100,10 +102,10 @@ fn unknown_owner_repo_silently_skipped() {
     .unwrap();
 
     let loaded = Config::load_from(f.path()).unwrap();
-    assert_eq!(loaded.subscriptions.len(), 1);
-    assert!(loaded.subscriptions[0].cached_tag.is_none());
-    assert!(loaded.subscriptions[0].cached_at.is_none());
-    assert!(loaded.subscriptions[0].cached_published_at.is_none());
+    let alice = pick(&loaded, "alice", "one");
+    assert!(alice.state.cached_tag.is_none());
+    assert!(alice.state.cached_at.is_none());
+    assert!(alice.state.cached_published_at.is_none());
 }
 
 #[test]
@@ -125,9 +127,7 @@ fn missing_config_file_writes_empty_default() {
 
 #[test]
 fn installed_version_writes_targeted_subscription() {
-    let cfg = Config {
-        subscriptions: vec![sub("alice", "one"), sub("bob", "two")],
-    };
+    let cfg = config_with(&[("alice", "one", empty_sub()), ("bob", "two", empty_sub())]);
     let f = NamedTempFile::new().unwrap();
     cfg.save_to(f.path()).unwrap();
 
@@ -145,25 +145,23 @@ fn installed_version_writes_targeted_subscription() {
     .unwrap();
 
     let loaded = Config::load_from(f.path()).unwrap();
-    let alice = &loaded.subscriptions[0];
-    let bob = &loaded.subscriptions[1];
-    assert_eq!(alice.installed_version.as_deref(), Some("v1.0.0"));
-    assert_eq!(alice.installed_asset.as_deref(), Some("one.so"));
-    assert_eq!(alice.installed_at, Some(500));
-    assert_eq!(alice.cached_tag.as_deref(), Some("v1.0.0"));
-    assert_eq!(alice.cached_at, Some(999));
-    assert_eq!(alice.cached_published_at, Some(500));
-    assert!(bob.installed_version.is_none());
-    assert!(bob.installed_asset.is_none());
-    assert!(bob.installed_at.is_none());
-    assert!(bob.cached_tag.is_none());
+    let alice = pick(&loaded, "alice", "one");
+    let bob = pick(&loaded, "bob", "two");
+    assert_eq!(alice.state.installed_version.as_deref(), Some("v1.0.0"));
+    assert_eq!(alice.state.installed_asset.as_deref(), Some("one.so"));
+    assert_eq!(alice.state.installed_at, Some(500));
+    assert_eq!(alice.state.cached_tag.as_deref(), Some("v1.0.0"));
+    assert_eq!(alice.state.cached_at, Some(999));
+    assert_eq!(alice.state.cached_published_at, Some(500));
+    assert!(bob.state.installed_version.is_none());
+    assert!(bob.state.installed_asset.is_none());
+    assert!(bob.state.installed_at.is_none());
+    assert!(bob.state.cached_tag.is_none());
 }
 
 #[test]
 fn installed_version_unknown_owner_repo_skipped() {
-    let cfg = Config {
-        subscriptions: vec![sub("alice", "one")],
-    };
+    let cfg = config_with(&[("alice", "one", empty_sub())]);
     let f = NamedTempFile::new().unwrap();
     cfg.save_to(f.path()).unwrap();
 
@@ -181,10 +179,10 @@ fn installed_version_unknown_owner_repo_skipped() {
     .unwrap();
 
     let loaded = Config::load_from(f.path()).unwrap();
-    assert_eq!(loaded.subscriptions.len(), 1);
-    assert!(loaded.subscriptions[0].installed_version.is_none());
-    assert!(loaded.subscriptions[0].installed_asset.is_none());
-    assert!(loaded.subscriptions[0].installed_at.is_none());
+    let alice = pick(&loaded, "alice", "one");
+    assert!(alice.state.installed_version.is_none());
+    assert!(alice.state.installed_asset.is_none());
+    assert!(alice.state.installed_at.is_none());
 }
 
 #[test]
@@ -192,12 +190,15 @@ fn persist_helpers_ignore_disabled_flag() {
     // Disabling is enforced at the call site (auto-check loop, /update commands).
     // The persist helpers stay dumb: if a row is in the updates list, they
     // write to it regardless of `disabled`. This documents that contract.
-    let cfg = Config {
-        subscriptions: vec![Subscription {
+    let cfg = config_with(&[(
+        "alice",
+        "one",
+        Subscription {
             disabled: true,
-            ..sub("alice", "one")
-        }],
-    };
+            channel: Channel::default(),
+            state: SubscriptionState::default(),
+        },
+    )]);
     let f = NamedTempFile::new().unwrap();
     cfg.save_to(f.path()).unwrap();
 
@@ -209,13 +210,11 @@ fn persist_helpers_ignore_disabled_flag() {
     .unwrap();
 
     let loaded = Config::load_from(f.path()).unwrap();
-    assert!(loaded.subscriptions[0].disabled);
-    assert_eq!(
-        loaded.subscriptions[0].cached_tag.as_deref(),
-        Some("v2.0.0")
-    );
-    assert_eq!(loaded.subscriptions[0].cached_at, Some(77));
-    assert_eq!(loaded.subscriptions[0].cached_published_at, Some(200));
+    let alice = pick(&loaded, "alice", "one");
+    assert!(alice.disabled);
+    assert_eq!(alice.state.cached_tag.as_deref(), Some("v2.0.0"));
+    assert_eq!(alice.state.cached_at, Some(77));
+    assert_eq!(alice.state.cached_published_at, Some(200));
 }
 
 #[test]

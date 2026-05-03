@@ -1,23 +1,27 @@
-use std::fs;
+use std::{collections::BTreeMap, fs};
 
 use tempfile::tempdir;
 
 use super::*;
-use crate::config::{Channel, SELF_OWNER, SELF_REPO, Subscription};
+use crate::config::{Channel, SELF_OWNER, SELF_REPO, Subscription, SubscriptionState};
 
-fn sub(owner: &str, repo: &str) -> Subscription {
+fn empty_sub() -> Subscription {
     Subscription {
-        owner: owner.into(),
-        repo: repo.into(),
         channel: Channel::default(),
         disabled: false,
-        installed_version: None,
-        installed_asset: None,
-        installed_at: None,
-        cached_tag: None,
-        cached_at: None,
-        cached_published_at: None,
+        state: SubscriptionState::default(),
     }
+}
+
+fn config_with(entries: Vec<(&str, &str, Subscription)>) -> Config {
+    let mut subscriptions: BTreeMap<String, BTreeMap<String, Subscription>> = BTreeMap::new();
+    for (owner, repo, sub) in entries {
+        subscriptions
+            .entry(owner.into())
+            .or_default()
+            .insert(repo.into(), sub);
+    }
+    Config { subscriptions }
 }
 
 fn write_config(path: &Path, cfg: &Config) {
@@ -26,6 +30,10 @@ fn write_config(path: &Path, cfg: &Config) {
 
 fn touch(dir: &Path, name: &str) {
     fs::write(dir.join(name), b"").unwrap();
+}
+
+fn pick<'a>(cfg: &'a Config, owner: &str, repo: &str) -> &'a Subscription {
+    cfg.subscriptions.get(owner).unwrap().get(repo).unwrap()
 }
 
 #[test]
@@ -46,19 +54,15 @@ fn sub_without_installed_asset_is_ignored() {
     let cfg_path = dir.path().join("c.toml");
     let managed = dir.path().join("managed");
     fs::create_dir(&managed).unwrap();
-    write_config(
-        &cfg_path,
-        &Config {
-            subscriptions: vec![sub("a", "b")],
-        },
-    );
+    let cfg = config_with(vec![("a", "b", empty_sub())]);
+    write_config(&cfg_path, &cfg);
 
     let report = reconcile(&cfg_path, &managed).unwrap();
 
     assert!(report.missing.is_empty());
     assert!(report.orphans.is_empty());
     let after = Config::load_from(&cfg_path).unwrap();
-    assert_eq!(after.subscriptions, vec![sub("a", "b")]);
+    assert_eq!(after, cfg);
 }
 
 #[test]
@@ -70,23 +74,22 @@ fn file_present_for_sub_is_claimed_and_no_changes() {
     touch(&managed, "lib.so");
 
     let original = Subscription {
-        installed_version: Some("v1.0.0".into()),
-        installed_asset: Some("lib.so".into()),
-        ..sub("a", "b")
-    };
-    write_config(
-        &cfg_path,
-        &Config {
-            subscriptions: vec![original.clone()],
+        state: SubscriptionState {
+            installed_version: Some("v1.0.0".into()),
+            installed_asset: Some("lib.so".into()),
+            ..SubscriptionState::default()
         },
-    );
+        ..empty_sub()
+    };
+    let cfg = config_with(vec![("a", "b", original.clone())]);
+    write_config(&cfg_path, &cfg);
 
     let report = reconcile(&cfg_path, &managed).unwrap();
 
     assert!(report.missing.is_empty());
     assert!(report.orphans.is_empty());
     let after = Config::load_from(&cfg_path).unwrap();
-    assert_eq!(after.subscriptions, vec![original]);
+    assert_eq!(pick(&after, "a", "b"), &original);
 }
 
 #[test]
@@ -97,25 +100,31 @@ fn file_absent_disables_sub_and_clears_installed_fields() {
     fs::create_dir(&managed).unwrap();
 
     let other = Subscription {
-        installed_version: Some("v9.9.9".into()),
-        installed_asset: Some("other.so".into()),
-        ..sub("c", "d")
+        state: SubscriptionState {
+            installed_version: Some("v9.9.9".into()),
+            installed_asset: Some("other.so".into()),
+            ..SubscriptionState::default()
+        },
+        ..empty_sub()
     };
     touch(&managed, "other.so");
 
-    write_config(
-        &cfg_path,
-        &Config {
-            subscriptions: vec![
-                Subscription {
+    let cfg = config_with(vec![
+        (
+            "a",
+            "b",
+            Subscription {
+                state: SubscriptionState {
                     installed_version: Some("v1.0.0".into()),
                     installed_asset: Some("lib.so".into()),
-                    ..sub("a", "b")
+                    ..SubscriptionState::default()
                 },
-                other.clone(),
-            ],
-        },
-    );
+                ..empty_sub()
+            },
+        ),
+        ("c", "d", other.clone()),
+    ]);
+    write_config(&cfg_path, &cfg);
 
     let report = reconcile(&cfg_path, &managed).unwrap();
 
@@ -130,13 +139,12 @@ fn file_absent_disables_sub_and_clears_installed_fields() {
     assert!(report.orphans.is_empty());
 
     let after = Config::load_from(&cfg_path).unwrap();
-    assert_eq!(after.subscriptions.len(), 2);
-    let a_b = &after.subscriptions[0];
+    let a_b = pick(&after, "a", "b");
     assert!(a_b.disabled);
-    assert_eq!(a_b.installed_version, None);
-    assert_eq!(a_b.installed_asset, None);
+    assert_eq!(a_b.state.installed_version, None);
+    assert_eq!(a_b.state.installed_asset, None);
     // Other sub untouched.
-    assert_eq!(after.subscriptions[1], other);
+    assert_eq!(pick(&after, "c", "d"), &other);
 }
 
 #[test]
@@ -147,12 +155,8 @@ fn orphan_file_is_reported_without_rewriting_config() {
     fs::create_dir(&managed).unwrap();
     touch(&managed, "stranger.so");
 
-    write_config(
-        &cfg_path,
-        &Config {
-            subscriptions: vec![sub("a", "b")],
-        },
-    );
+    let cfg = config_with(vec![("a", "b", empty_sub())]);
+    write_config(&cfg_path, &cfg);
     let mtime_before = fs::metadata(&cfg_path).unwrap().modified().unwrap();
 
     let report = reconcile(&cfg_path, &managed).unwrap();
@@ -172,23 +176,33 @@ fn missing_and_orphan_combined() {
     touch(&managed, "stranger.so");
     touch(&managed, "kept.so");
 
-    write_config(
-        &cfg_path,
-        &Config {
-            subscriptions: vec![
-                Subscription {
+    let cfg = config_with(vec![
+        (
+            "a",
+            "b",
+            Subscription {
+                state: SubscriptionState {
                     installed_version: Some("v1.0.0".into()),
                     installed_asset: Some("kept.so".into()),
-                    ..sub("a", "b")
+                    ..SubscriptionState::default()
                 },
-                Subscription {
+                ..empty_sub()
+            },
+        ),
+        (
+            "c",
+            "d",
+            Subscription {
+                state: SubscriptionState {
                     installed_version: Some("v2.0.0".into()),
                     installed_asset: Some("missing.so".into()),
-                    ..sub("c", "d")
+                    ..SubscriptionState::default()
                 },
-            ],
-        },
-    );
+                ..empty_sub()
+            },
+        ),
+    ]);
+    write_config(&cfg_path, &cfg);
 
     let report = reconcile(&cfg_path, &managed).unwrap();
 
@@ -203,13 +217,13 @@ fn missing_and_orphan_combined() {
     assert_eq!(report.orphans, vec!["stranger.so".to_string()]);
 
     let after = Config::load_from(&cfg_path).unwrap();
-    let kept = &after.subscriptions[0];
-    assert_eq!(kept.installed_asset.as_deref(), Some("kept.so"));
+    let kept = pick(&after, "a", "b");
+    assert_eq!(kept.state.installed_asset.as_deref(), Some("kept.so"));
     assert!(!kept.disabled);
-    let dropped = &after.subscriptions[1];
+    let dropped = pick(&after, "c", "d");
     assert!(dropped.disabled);
-    assert_eq!(dropped.installed_asset, None);
-    assert_eq!(dropped.installed_version, None);
+    assert_eq!(dropped.state.installed_asset, None);
+    assert_eq!(dropped.state.installed_version, None);
 }
 
 #[test]
@@ -221,17 +235,20 @@ fn idempotent_after_reconcile_clears_missing_sub() {
     let managed = dir.path().join("managed");
     fs::create_dir(&managed).unwrap();
 
-    write_config(
-        &cfg_path,
-        &Config {
-            subscriptions: vec![Subscription {
-                disabled: true,
+    let cfg = config_with(vec![(
+        "a",
+        "b",
+        Subscription {
+            disabled: true,
+            state: SubscriptionState {
                 installed_version: Some("v1.0.0".into()),
                 installed_asset: Some("gone.so".into()),
-                ..sub("a", "b")
-            }],
+                ..SubscriptionState::default()
+            },
+            ..empty_sub()
         },
-    );
+    )]);
+    write_config(&cfg_path, &cfg);
 
     let first = reconcile(&cfg_path, &managed).unwrap();
     assert_eq!(first.missing.len(), 1);
@@ -265,16 +282,15 @@ fn disabled_sub_claims_its_file_so_it_is_not_an_orphan() {
 
     let original = Subscription {
         disabled: true,
-        installed_version: Some("v1.0.0".into()),
-        installed_asset: Some("kept.so".into()),
-        ..sub("a", "b")
-    };
-    write_config(
-        &cfg_path,
-        &Config {
-            subscriptions: vec![original.clone()],
+        state: SubscriptionState {
+            installed_version: Some("v1.0.0".into()),
+            installed_asset: Some("kept.so".into()),
+            ..SubscriptionState::default()
         },
-    );
+        ..empty_sub()
+    };
+    let cfg = config_with(vec![("a", "b", original.clone())]);
+    write_config(&cfg_path, &cfg);
     let mtime_before = fs::metadata(&cfg_path).unwrap().modified().unwrap();
 
     let report = reconcile(&cfg_path, &managed).unwrap();
@@ -282,7 +298,7 @@ fn disabled_sub_claims_its_file_so_it_is_not_an_orphan() {
     assert!(report.missing.is_empty());
     assert!(report.orphans.is_empty());
     let after = Config::load_from(&cfg_path).unwrap();
-    assert_eq!(after.subscriptions, vec![original]);
+    assert_eq!(pick(&after, "a", "b"), &original);
     let mtime_after = fs::metadata(&cfg_path).unwrap().modified().unwrap();
     assert_eq!(mtime_before, mtime_after);
 }
@@ -299,12 +315,7 @@ fn orphans_are_sorted_for_deterministic_output() {
         touch(&managed, name);
     }
 
-    write_config(
-        &cfg_path,
-        &Config {
-            subscriptions: vec![],
-        },
-    );
+    write_config(&cfg_path, &Config::default());
 
     let report = reconcile(&cfg_path, &managed).unwrap();
     assert_eq!(
@@ -324,35 +335,50 @@ fn every_sub_missing_disables_all_and_reports_all() {
     let managed = dir.path().join("managed");
     fs::create_dir(&managed).unwrap();
 
-    write_config(
-        &cfg_path,
-        &Config {
-            subscriptions: vec![
-                Subscription {
+    let cfg = config_with(vec![
+        (
+            "o1",
+            "r1",
+            Subscription {
+                state: SubscriptionState {
                     installed_version: Some("v1".into()),
                     installed_asset: Some("a.so".into()),
-                    ..sub("o1", "r1")
+                    ..SubscriptionState::default()
                 },
-                Subscription {
+                ..empty_sub()
+            },
+        ),
+        (
+            "o2",
+            "r2",
+            Subscription {
+                state: SubscriptionState {
                     installed_version: Some("v2".into()),
                     installed_asset: Some("b.so".into()),
-                    ..sub("o2", "r2")
+                    ..SubscriptionState::default()
                 },
-            ],
-        },
-    );
+                ..empty_sub()
+            },
+        ),
+    ]);
+    write_config(&cfg_path, &cfg);
 
     let report = reconcile(&cfg_path, &managed).unwrap();
 
     assert_eq!(report.missing.len(), 2);
     assert!(report.orphans.is_empty());
     let after = Config::load_from(&cfg_path).unwrap();
-    assert!(after.subscriptions.iter().all(|s| s.disabled));
+    let all_subs: Vec<&Subscription> = after
+        .subscriptions
+        .values()
+        .flat_map(BTreeMap::values)
+        .collect();
+    assert_eq!(all_subs.len(), 2);
+    assert!(all_subs.iter().all(|s| s.disabled));
     assert!(
-        after
-            .subscriptions
+        all_subs
             .iter()
-            .all(|s| s.installed_asset.is_none() && s.installed_version.is_none())
+            .all(|s| s.state.installed_asset.is_none() && s.state.installed_version.is_none())
     );
 }
 
@@ -366,17 +392,16 @@ fn self_subscription_is_skipped() {
     fs::create_dir(&managed).unwrap();
 
     let original = Subscription {
-        installed_version: Some("v1.0.0".into()),
-        installed_asset: Some("plugin_updater.so".into()),
-        installed_at: Some(1_700_000_000),
-        ..sub(SELF_OWNER, SELF_REPO)
-    };
-    write_config(
-        &cfg_path,
-        &Config {
-            subscriptions: vec![original.clone()],
+        state: SubscriptionState {
+            installed_version: Some("v1.0.0".into()),
+            installed_asset: Some("plugin_updater.so".into()),
+            installed_at: Some(1_700_000_000),
+            ..SubscriptionState::default()
         },
-    );
+        ..empty_sub()
+    };
+    let cfg = config_with(vec![(SELF_OWNER, SELF_REPO, original.clone())]);
+    write_config(&cfg_path, &cfg);
     let mtime_before = fs::metadata(&cfg_path).unwrap().modified().unwrap();
 
     let report = reconcile(&cfg_path, &managed).unwrap();
@@ -388,7 +413,7 @@ fn self_subscription_is_skipped() {
     );
     assert!(report.orphans.is_empty());
     let after = Config::load_from(&cfg_path).unwrap();
-    assert_eq!(after.subscriptions, vec![original]);
+    assert_eq!(pick(&after, SELF_OWNER, SELF_REPO), &original);
     let mtime_after = fs::metadata(&cfg_path).unwrap().modified().unwrap();
     assert_eq!(
         mtime_before, mtime_after,
@@ -404,12 +429,7 @@ fn directories_in_managed_are_not_treated_as_files() {
     fs::create_dir(&managed).unwrap();
     fs::create_dir(managed.join("subdir")).unwrap();
 
-    write_config(
-        &cfg_path,
-        &Config {
-            subscriptions: vec![],
-        },
-    );
+    write_config(&cfg_path, &Config::default());
 
     let report = reconcile(&cfg_path, &managed).unwrap();
     assert!(report.orphans.is_empty(), "subdir should not be an orphan");

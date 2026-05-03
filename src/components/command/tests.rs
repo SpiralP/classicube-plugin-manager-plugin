@@ -1,18 +1,20 @@
+use std::collections::BTreeMap;
+
 use super::*;
 
-fn sub(owner: &str, repo: &str) -> Subscription {
-    Subscription {
-        owner: owner.into(),
-        repo: repo.into(),
-        channel: Channel::default(),
-        disabled: false,
-        installed_version: None,
-        installed_asset: None,
-        installed_at: None,
-        cached_tag: None,
-        cached_at: None,
-        cached_published_at: None,
+fn empty_sub() -> Subscription {
+    Subscription::default()
+}
+
+fn config_with(entries: &[(&str, &str, Subscription)]) -> Config {
+    let mut subscriptions: BTreeMap<String, BTreeMap<String, Subscription>> = BTreeMap::new();
+    for (owner, repo, sub) in entries {
+        subscriptions
+            .entry((*owner).into())
+            .or_default()
+            .insert((*repo).into(), sub.clone());
     }
+    Config { subscriptions }
 }
 
 #[test]
@@ -141,40 +143,42 @@ fn empty_middle_still_expands() {
 
 #[test]
 fn find_subscription_picks_literal_over_expanded() {
-    // Both forms are subscribed; the literal candidate (index 0) wins even
-    // when it appears later in the subscription list.
-    let config = Config {
-        subscriptions: vec![
-            sub("SpiralP", "classicube-foo-plugin"),
-            sub("SpiralP", "foo"),
-        ],
-    };
+    // Both forms are subscribed; the literal candidate (index 0) wins.
+    let config = config_with(&[
+        ("SpiralP", "classicube-foo-plugin", empty_sub()),
+        ("SpiralP", "foo", empty_sub()),
+    ]);
     let candidates = vec![
         ("SpiralP".into(), "foo".into()),
         ("SpiralP".into(), "classicube-foo-plugin".into()),
     ];
-    assert_eq!(find_subscription_index(&config, &candidates), Some(1));
+    let (owner, repo, _) = find_subscription(&config, &candidates).unwrap();
+    assert_eq!(owner, "SpiralP");
+    assert_eq!(repo, "foo");
 }
 
 #[test]
 fn find_subscription_falls_back_to_expanded() {
-    let config = Config {
-        subscriptions: vec![sub("SpiralP", "classicube-foo-plugin")],
-    };
+    let config = config_with(&[("SpiralP", "classicube-foo-plugin", empty_sub())]);
     let candidates = vec![
         ("SpiralP".into(), "foo".into()),
         ("SpiralP".into(), "classicube-foo-plugin".into()),
     ];
-    assert_eq!(find_subscription_index(&config, &candidates), Some(0));
+    let (owner, repo, _) = find_subscription(&config, &candidates).unwrap();
+    assert_eq!(owner, "SpiralP");
+    assert_eq!(repo, "classicube-foo-plugin");
 }
 
 #[test]
-fn find_subscription_case_insensitive() {
-    let config = Config {
-        subscriptions: vec![sub("SpiralP", "classicube-foo-plugin")],
-    };
+fn find_subscription_case_insensitive_returns_stored_keys() {
+    // Lookup is case-insensitive but the returned keys preserve the user's
+    // original casing — handlers use them for chat messages and as
+    // map-removal keys.
+    let config = config_with(&[("SpiralP", "classicube-foo-plugin", empty_sub())]);
     let candidates = vec![("spiralp".into(), "CLASSICUBE-FOO-PLUGIN".into())];
-    assert_eq!(find_subscription_index(&config, &candidates), Some(0));
+    let (owner, repo, _) = find_subscription(&config, &candidates).unwrap();
+    assert_eq!(owner, "SpiralP");
+    assert_eq!(repo, "classicube-foo-plugin");
 }
 
 #[test]
@@ -226,16 +230,19 @@ fn parse_channel_args_rejects_bare_tag() {
 fn apply_channel_switch_clears_cache_fields() {
     let mut s = Subscription {
         channel: Channel::Stable,
-        cached_tag: Some("v1.0.0".into()),
-        cached_at: Some(100),
-        cached_published_at: Some(50),
-        ..sub("a", "b")
+        state: SubscriptionState {
+            cached_tag: Some("v1.0.0".into()),
+            cached_at: Some(100),
+            cached_published_at: Some(50),
+            ..SubscriptionState::default()
+        },
+        ..empty_sub()
     };
     apply_channel_switch(&mut s, Channel::Prerelease);
     assert_eq!(s.channel, Channel::Prerelease);
-    assert!(s.cached_tag.is_none());
-    assert!(s.cached_at.is_none());
-    assert!(s.cached_published_at.is_none());
+    assert!(s.state.cached_tag.is_none());
+    assert!(s.state.cached_at.is_none());
+    assert!(s.state.cached_published_at.is_none());
 }
 
 #[test]
@@ -244,15 +251,18 @@ fn apply_channel_switch_preserves_installed_state() {
     // the user pointed the subscription at a different channel.
     let mut s = Subscription {
         channel: Channel::Stable,
-        installed_version: Some("v1.0.0".into()),
-        installed_asset: Some("a.so".into()),
-        installed_at: Some(500),
-        ..sub("a", "b")
+        state: SubscriptionState {
+            installed_version: Some("v1.0.0".into()),
+            installed_asset: Some("a.so".into()),
+            installed_at: Some(500),
+            ..SubscriptionState::default()
+        },
+        ..empty_sub()
     };
     apply_channel_switch(&mut s, Channel::Tag("v2.0.0".into()));
-    assert_eq!(s.installed_version.as_deref(), Some("v1.0.0"));
-    assert_eq!(s.installed_asset.as_deref(), Some("a.so"));
-    assert_eq!(s.installed_at, Some(500));
+    assert_eq!(s.state.installed_version.as_deref(), Some("v1.0.0"));
+    assert_eq!(s.state.installed_asset.as_deref(), Some("a.so"));
+    assert_eq!(s.state.installed_at, Some(500));
 }
 
 #[test]
@@ -272,5 +282,5 @@ fn channel_suffix_skips_default() {
 fn find_subscription_no_match() {
     let config = Config::default();
     let candidates = vec![("SpiralP".into(), "foo".into())];
-    assert_eq!(find_subscription_index(&config, &candidates), None);
+    assert!(find_subscription(&config, &candidates).is_none());
 }

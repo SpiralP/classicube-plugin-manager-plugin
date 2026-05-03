@@ -3,6 +3,7 @@ mod tests;
 
 use std::{
     cell::RefCell,
+    collections::BTreeMap,
     env,
     os::raw::c_int,
     slice,
@@ -19,7 +20,7 @@ use crate::{
     chat::{print_async, print_wrapped},
     component::Component,
     components::updater::persist_installed_versions,
-    config::{self, Channel, Config, Subscription},
+    config::{self, Channel, Config, Subscription, SubscriptionState},
     github_release::{get_release_for_channel, resolve_expected_digest},
     installer::{download_self, download_to_managed_dir},
 };
@@ -70,17 +71,56 @@ fn is_canonical_repo_name(repo: &str) -> bool {
         .is_some_and(|middle| !middle.is_empty())
 }
 
-/// Find the index of the first subscription that matches any candidate,
-/// preferring earlier candidates (literal before expanded). Comparison is
+/// Find the first subscription that matches any candidate, preferring
+/// earlier candidates (literal before expanded). Comparison is
 /// case-insensitive, mirroring how `handle_subscribe` checks for duplicates.
-fn find_subscription_index(config: &Config, candidates: &[(String, String)]) -> Option<usize> {
+/// Returns the *stored* keys (preserving the user's original case) plus a
+/// reference to the subscription, so callers can use them as map-removal /
+/// chat-display keys without re-walking.
+fn find_subscription<'a>(
+    config: &'a Config,
+    candidates: &[(String, String)],
+) -> Option<(String, String, &'a Subscription)> {
     for (owner, repo) in candidates {
-        if let Some(idx) = config
+        if let Some((stored_owner, repos)) = config
             .subscriptions
             .iter()
-            .position(|s| s.owner.eq_ignore_ascii_case(owner) && s.repo.eq_ignore_ascii_case(repo))
+            .find(|(o, _)| o.eq_ignore_ascii_case(owner))
+            && let Some((stored_repo, sub)) =
+                repos.iter().find(|(r, _)| r.eq_ignore_ascii_case(repo))
         {
-            return Some(idx);
+            return Some((stored_owner.clone(), stored_repo.clone(), sub));
+        }
+    }
+    None
+}
+
+fn find_subscription_mut<'a>(
+    config: &'a mut Config,
+    candidates: &[(String, String)],
+) -> Option<(String, String, &'a mut Subscription)> {
+    let (stored_owner, stored_repo) = find_stored_keys(config, candidates)?;
+    let sub = config
+        .subscriptions
+        .get_mut(&stored_owner)?
+        .get_mut(&stored_repo)?;
+    Some((stored_owner, stored_repo, sub))
+}
+
+/// Resolve `candidates` to the actual stored keys (preserving the user's
+/// original case) via case-insensitive comparison. Returns the first hit in
+/// candidate order. Used by `find_subscription_mut` to decouple the
+/// immutable lookup phase from the final mutable borrow, so the borrow
+/// checker accepts a `&'a mut Subscription` return.
+fn find_stored_keys(config: &Config, candidates: &[(String, String)]) -> Option<(String, String)> {
+    for (owner, repo) in candidates {
+        if let Some((stored_owner, repos)) = config
+            .subscriptions
+            .iter()
+            .find(|(o, _)| o.eq_ignore_ascii_case(owner))
+            && let Some((stored_repo, _)) = repos.iter().find(|(r, _)| r.eq_ignore_ascii_case(repo))
+        {
+            return Some((stored_owner.clone(), stored_repo.clone()));
         }
     }
     None
@@ -123,9 +163,9 @@ fn parse_channel_args(args: &[&str]) -> Result<Channel, String> {
 /// — those describe what's on disk, not what's on GitHub.
 fn apply_channel_switch(sub: &mut Subscription, new: Channel) {
     sub.channel = new;
-    sub.cached_tag = None;
-    sub.cached_at = None;
-    sub.cached_published_at = None;
+    sub.state.cached_tag = None;
+    sub.state.cached_at = None;
+    sub.state.cached_published_at = None;
 }
 
 /// Suffix to append after `owner/repo` in chat output when the channel is
@@ -181,15 +221,12 @@ fn handle_subscribe(spec: &str, channel: Channel) {
             }
         };
 
-        if let Some(idx) = find_subscription_index(&config, &candidates) {
-            let existing = &config.subscriptions[idx];
+        if let Some((existing_owner, existing_repo, _)) = find_subscription(&config, &candidates) {
             print_async(format!(
-                "{}Already subscribed to {}{}/{} {}(use {}/client Updater channel{} to switch \
-                 channels)",
+                "{}Already subscribed to {}{existing_owner}/{existing_repo} {}(use {}/client \
+                 Updater channel{} to switch channels)",
                 color::YELLOW,
                 color::LIME,
-                existing.owner,
-                existing.repo,
                 color::YELLOW,
                 color::LIME,
                 color::YELLOW,
@@ -221,18 +258,18 @@ fn handle_subscribe(spec: &str, channel: Channel) {
             }
         };
 
-        config.subscriptions.push(Subscription {
-            owner: owner.clone(),
-            repo: repo.clone(),
-            channel: channel.clone(),
-            disabled: false,
-            installed_version: None,
-            installed_asset: None,
-            installed_at: None,
-            cached_tag: None,
-            cached_at: None,
-            cached_published_at: None,
-        });
+        config
+            .subscriptions
+            .entry(owner.clone())
+            .or_default()
+            .insert(
+                repo.clone(),
+                Subscription {
+                    channel: channel.clone(),
+                    disabled: false,
+                    state: SubscriptionState::default(),
+                },
+            );
         if let Err(e) = config.save() {
             print_save_error(&e).await;
             return;
@@ -289,7 +326,7 @@ fn handle_unsubscribe(spec: &str) {
             }
         };
 
-        let Some(idx) = find_subscription_index(&config, &candidates) else {
+        let Some((stored_owner, stored_repo, _)) = find_subscription(&config, &candidates) else {
             print_async(format!(
                 "{}Not subscribed to {}{}",
                 color::YELLOW,
@@ -300,17 +337,20 @@ fn handle_unsubscribe(spec: &str) {
             return;
         };
 
-        let removed = config.subscriptions.remove(idx);
+        if let Some(repos) = config.subscriptions.get_mut(&stored_owner) {
+            repos.remove(&stored_repo);
+            if repos.is_empty() {
+                config.subscriptions.remove(&stored_owner);
+            }
+        }
         if let Err(e) = config.save() {
             print_save_error(&e).await;
             return;
         }
         print_async(format!(
-            "{}Unsubscribed from {}{}/{}",
+            "{}Unsubscribed from {}{stored_owner}/{stored_repo}",
             color::PINK,
             color::LIME,
-            removed.owner,
-            removed.repo,
         ))
         .await;
     });
@@ -332,7 +372,7 @@ fn handle_channel(spec: &str, channel: Channel) {
             }
         };
 
-        let Some(idx) = find_subscription_index(&config, &candidates) else {
+        let Some((owner, repo, sub)) = find_subscription_mut(&mut config, &candidates) else {
             print_async(format!(
                 "{}Not subscribed to {}{}",
                 color::YELLOW,
@@ -343,13 +383,10 @@ fn handle_channel(spec: &str, channel: Channel) {
             return;
         };
 
-        let sub = &mut config.subscriptions[idx];
         if sub.channel == channel {
             print_async(format!(
-                "{}{}/{} {}already on channel {}{}",
+                "{}{owner}/{repo} {}already on channel {}{}",
                 color::LIME,
-                sub.owner,
-                sub.repo,
                 color::YELLOW,
                 color::PINK,
                 channel.pretty(),
@@ -358,19 +395,15 @@ fn handle_channel(spec: &str, channel: Channel) {
             return;
         }
         apply_channel_switch(sub, channel.clone());
-        let owner = sub.owner.clone();
-        let repo = sub.repo.clone();
 
         if let Err(e) = config.save() {
             print_save_error(&e).await;
             return;
         }
         print_async(format!(
-            "{}Channel for {}{}/{} {}set to {}{}",
+            "{}Channel for {}{owner}/{repo} {}set to {}{}",
             color::PINK,
             color::LIME,
-            owner,
-            repo,
             color::PINK,
             color::YELLOW,
             channel.pretty(),
@@ -395,7 +428,7 @@ fn set_disabled(spec: &str, disabled: bool) {
             }
         };
 
-        let Some(idx) = find_subscription_index(&config, &candidates) else {
+        let Some((owner, repo, sub)) = find_subscription_mut(&mut config, &candidates) else {
             print_async(format!(
                 "{}Not subscribed to {}{}",
                 color::YELLOW,
@@ -406,22 +439,17 @@ fn set_disabled(spec: &str, disabled: bool) {
             return;
         };
 
-        let sub = &mut config.subscriptions[idx];
         if sub.disabled == disabled {
             let word = if disabled { "disabled" } else { "enabled" };
             print_async(format!(
-                "{}Already {word} {}{}/{}",
+                "{}Already {word} {}{owner}/{repo}",
                 color::YELLOW,
                 color::LIME,
-                sub.owner,
-                sub.repo,
             ))
             .await;
             return;
         }
         sub.disabled = disabled;
-        let owner = sub.owner.clone();
-        let repo = sub.repo.clone();
 
         if let Err(e) = config.save() {
             print_save_error(&e).await;
@@ -429,11 +457,9 @@ fn set_disabled(spec: &str, disabled: bool) {
         }
         let word = if disabled { "Disabled" } else { "Enabled" };
         print_async(format!(
-            "{}{word} {}{}/{}",
+            "{}{word} {}{owner}/{repo}",
             color::PINK,
             color::LIME,
-            owner,
-            repo,
         ))
         .await;
     });
@@ -455,32 +481,30 @@ fn handle_list() {
             }
         };
 
-        if config.subscriptions.is_empty() {
+        let total: usize = config.subscriptions.values().map(BTreeMap::len).sum();
+        if total == 0 {
             print_async(format!("{}No subscriptions", color::YELLOW)).await;
             return;
         }
-        print_async(format!(
-            "{}Subscriptions ({}):",
-            color::PINK,
-            config.subscriptions.len()
-        ))
-        .await;
-        for sub in &config.subscriptions {
-            let mut line = format!("  {}{}/{}", color::LIME, sub.owner, sub.repo);
-            if let Some(v) = &sub.installed_version {
-                line.push_str(&format!(
-                    " {}(installed: {}{}{})",
-                    color::PINK,
-                    color::YELLOW,
-                    v,
-                    color::PINK,
-                ));
+        print_async(format!("{}Subscriptions ({total}):", color::PINK,)).await;
+        for (owner, repos) in &config.subscriptions {
+            for (repo, sub) in repos {
+                let mut line = format!("  {}{owner}/{repo}", color::LIME);
+                if let Some(v) = &sub.state.installed_version {
+                    line.push_str(&format!(
+                        " {}(installed: {}{}{})",
+                        color::PINK,
+                        color::YELLOW,
+                        v,
+                        color::PINK,
+                    ));
+                }
+                line.push_str(&channel_suffix(&sub.channel));
+                if sub.disabled {
+                    line.push_str(&format!(" {}[disabled]", color::RED));
+                }
+                print_async(line).await;
             }
-            line.push_str(&channel_suffix(&sub.channel));
-            if sub.disabled {
-                line.push_str(&format!(" {}[disabled]", color::RED));
-            }
-            print_async(line).await;
         }
     });
 }
@@ -501,7 +525,7 @@ fn handle_update_one(spec: &str) {
             }
         };
 
-        let Some(idx) = find_subscription_index(&config, &candidates) else {
+        let Some((owner, repo, sub)) = find_subscription(&config, &candidates) else {
             print_async(format!(
                 "{}Not subscribed to {}{}{}; use {}subscribe{} first",
                 color::YELLOW,
@@ -515,25 +539,21 @@ fn handle_update_one(spec: &str) {
             return;
         };
 
-        let sub = &config.subscriptions[idx];
         if sub.disabled {
             print_async(format!(
-                "{}Subscription {}{}/{} {}is disabled; use {}enable {}/{}{} first",
+                "{}Subscription {}{owner}/{repo} {}is disabled; use {}enable {owner}/{repo}{} \
+                 first",
                 color::YELLOW,
                 color::LIME,
-                sub.owner,
-                sub.repo,
                 color::YELLOW,
                 color::LIME,
-                sub.owner,
-                sub.repo,
                 color::YELLOW,
             ))
             .await;
             return;
         }
 
-        spawn_update_task(sub.owner.clone(), sub.repo.clone(), sub.channel.clone());
+        spawn_update_task(owner, repo, sub.channel.clone());
     });
 }
 
@@ -550,12 +570,19 @@ fn handle_update_all() {
         let stale: Vec<(String, String, Channel)> = config
             .subscriptions
             .iter()
-            .filter(|s| !s.disabled)
-            .filter(|s| match (s.installed_at, s.cached_published_at) {
-                (Some(installed_at), Some(latest_pub_at)) => latest_pub_at > installed_at,
-                _ => true,
+            .flat_map(|(owner, repos)| {
+                repos
+                    .iter()
+                    .map(move |(repo, sub)| (owner.clone(), repo.clone(), sub))
             })
-            .map(|s| (s.owner.clone(), s.repo.clone(), s.channel.clone()))
+            .filter(|(_, _, s)| !s.disabled)
+            .filter(
+                |(_, _, s)| match (s.state.installed_at, s.state.cached_published_at) {
+                    (Some(installed_at), Some(latest_pub_at)) => latest_pub_at > installed_at,
+                    _ => true,
+                },
+            )
+            .map(|(owner, repo, s)| (owner, repo, s.channel.clone()))
             .collect();
 
         if stale.is_empty() {
