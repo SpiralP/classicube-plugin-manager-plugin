@@ -53,13 +53,17 @@ impl Component for Updater {
 
             // Hand off to the loader on the main thread regardless of update
             // outcome — load whatever's on disk even if a network fetch failed.
-            async_manager::spawn_on_main_thread(async move {
-                match Config::load() {
-                    Ok(cfg) => loader::init_managed(&cfg.subscriptions),
-                    Err(e) => {
-                        error!("loading config for managed-load: {e:#}");
-                    }
+            // Load fresh off-thread so we see installed_asset writes from the
+            // pass, then hop to main only for the dlopen.
+            let subs = match Config::load() {
+                Ok(cfg) => cfg.subscriptions,
+                Err(e) => {
+                    error!("loading config for managed-load: {e:#}");
+                    return;
                 }
+            };
+            async_manager::spawn_on_main_thread(async move {
+                loader::init_managed(&subs);
             });
         });
     }
