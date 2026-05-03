@@ -183,7 +183,28 @@ async fn run_initial_pass() -> Result<()> {
         ))
         .await;
 
-        match installer::download_to_managed_dir(asset).await {
+        let expected_digest = match github_release::resolve_expected_digest(asset) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(
+                    "digest resolve failed for {}/{}: {e:#}",
+                    sub.owner, sub.repo
+                );
+                print_async(format!(
+                    "{}Digest check failed for {}{}/{}{}: {}{e}",
+                    color::RED,
+                    color::LIME,
+                    sub.owner,
+                    sub.repo,
+                    color::RED,
+                    color::WHITE,
+                ))
+                .await;
+                continue;
+            }
+        };
+
+        match installer::download_to_managed_dir(asset, expected_digest.as_deref()).await {
             Ok(path) => {
                 installed.push((
                     sub.owner.clone(),

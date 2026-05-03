@@ -6,6 +6,7 @@ use std::{env, time::Duration};
 use anyhow::{Error, Result, bail};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::{Deserialize, Deserializer};
+use tracing::warn;
 
 const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
@@ -36,6 +37,10 @@ pub struct GitHubRelease {
 pub struct GitHubReleaseAsset {
     pub name: String,
     pub browser_download_url: String,
+    /// `"sha256:<hex>"` when GitHub publishes one. Older releases / older API
+    /// responses omit this, so it stays optional.
+    #[serde(default)]
+    pub digest: Option<String>,
 }
 
 pub async fn get_latest_release(owner: &str, repo: &str) -> Result<GitHubRelease> {
@@ -119,4 +124,26 @@ where
     let s = String::deserialize(d)?;
     parse_iso8601_z(&s)
         .ok_or_else(|| serde::de::Error::custom(format!("invalid ISO-8601-Z timestamp: {s}")))
+}
+
+/// Pick which SHA-256 digest to enforce on the upcoming download.
+///
+/// GitHub's per-asset `digest` field is authoritative — if it's present but
+/// malformed, that's a real problem (API change / MITM / bug) and we hard
+/// fail rather than silently skip. Absent is fine — older releases / older
+/// API responses omit it and we don't want to block their updates.
+pub fn resolve_expected_digest(asset: &GitHubReleaseAsset) -> Result<Option<String>> {
+    match asset.digest.as_deref() {
+        Some(d) => {
+            crate::installer::parse_sha256_digest(d)?;
+            Ok(Some(d.to_owned()))
+        }
+        None => {
+            warn!(
+                "no published digest for {}; skipping verification",
+                asset.name
+            );
+            Ok(None)
+        }
+    }
 }
