@@ -50,6 +50,30 @@ fn ignores_extra_release_fields() {
 }
 
 #[test]
+fn parses_asset_with_digest() {
+    let json = br#"{
+        "name": "plugin.so",
+        "browser_download_url": "https://example/plugin.so",
+        "digest": "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    }"#;
+    let a: GitHubReleaseAsset = serde_json::from_slice(json).unwrap();
+    assert_eq!(
+        a.digest.as_deref(),
+        Some("sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"),
+    );
+}
+
+#[test]
+fn parses_asset_without_digest_field() {
+    let json = br#"{
+        "name": "plugin.so",
+        "browser_download_url": "https://example/plugin.so"
+    }"#;
+    let a: GitHubReleaseAsset = serde_json::from_slice(json).unwrap();
+    assert!(a.digest.is_none());
+}
+
+#[test]
 fn missing_published_at_fails() {
     // GitHub always sends `published_at` for a published release; absence is
     // a real signal that something's wrong with the payload, not something

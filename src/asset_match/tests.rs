@@ -4,6 +4,7 @@ fn asset(name: &str) -> GitHubReleaseAsset {
     GitHubReleaseAsset {
         name: name.into(),
         browser_download_url: format!("https://example/{name}"),
+        digest: None,
     }
 }
 

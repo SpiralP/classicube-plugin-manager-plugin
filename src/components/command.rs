@@ -514,7 +514,8 @@ async fn run_update(owner: &str, repo: &str) -> anyhow::Result<()> {
     ))
     .await;
 
-    let path = installer::download_to_managed_dir(asset).await?;
+    let expected_digest = github_release::resolve_expected_digest(asset)?;
+    let path = installer::download_to_managed_dir(asset, expected_digest.as_deref()).await?;
 
     let now = unix_now();
     persist_installed_versions(
