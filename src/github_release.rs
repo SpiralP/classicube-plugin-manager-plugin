@@ -1,19 +1,22 @@
 #[cfg(test)]
 mod tests;
 
-use std::{env, time::Duration};
+use std::{env, result, time::Duration};
 
 use anyhow::{Error, Result, anyhow, bail};
-use reqwest::header::{AUTHORIZATION, HeaderValue};
-use serde::{Deserialize, Deserializer};
+use reqwest::{
+    Client,
+    header::{AUTHORIZATION, HeaderValue},
+};
+use serde::{Deserialize, Deserializer, de::Error as DeError};
 use tracing::warn;
 
-use crate::config::Channel;
+use crate::{config::Channel, installer::parse_sha256_digest};
 
 const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
-pub fn make_client() -> reqwest::Client {
-    reqwest::Client::builder()
+pub fn make_client() -> Client {
+    Client::builder()
         .user_agent(APP_USER_AGENT)
         .connect_timeout(Duration::from_secs(5))
         .read_timeout(Duration::from_secs(5))
@@ -157,13 +160,12 @@ fn parse_iso8601_z(s: &str) -> Option<u64> {
     Some(days * 86_400 + u64::from(hour) * 3600 + u64::from(minute) * 60 + u64::from(second))
 }
 
-fn deserialize_iso8601_z<'de, D>(d: D) -> std::result::Result<u64, D::Error>
+fn deserialize_iso8601_z<'de, D>(d: D) -> result::Result<u64, D::Error>
 where
     D: Deserializer<'de>,
 {
     let s = String::deserialize(d)?;
-    parse_iso8601_z(&s)
-        .ok_or_else(|| serde::de::Error::custom(format!("invalid ISO-8601-Z timestamp: {s}")))
+    parse_iso8601_z(&s).ok_or_else(|| DeError::custom(format!("invalid ISO-8601-Z timestamp: {s}")))
 }
 
 /// Pick which SHA-256 digest to enforce on the upcoming download.
@@ -175,7 +177,7 @@ where
 pub fn resolve_expected_digest(asset: &GitHubReleaseAsset) -> Result<Option<String>> {
     match asset.digest.as_deref() {
         Some(d) => {
-            crate::installer::parse_sha256_digest(d)?;
+            parse_sha256_digest(d)?;
             Ok(Some(d.to_owned()))
         }
         None => {

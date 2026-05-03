@@ -3,22 +3,25 @@ mod tests;
 
 use std::{
     cell::RefCell,
+    env,
     os::raw::c_int,
     slice,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use anyhow::{Error, Result, bail};
 use classicube_helpers::{async_manager, color};
 use classicube_sys::{OwnedChatCommand, cc_string};
 use tracing::error;
 
 use crate::{
-    asset_match,
+    asset_match::pick_asset,
     chat::{print_async, print_wrapped},
     component::Component,
     components::updater::persist_installed_versions,
     config::{Channel, Config, Subscription},
-    github_release, installer,
+    github_release::{get_release_for_channel, resolve_expected_digest},
+    installer::download_to_managed_dir,
 };
 
 thread_local!(
@@ -142,7 +145,7 @@ fn print_usage() {
     }
 }
 
-async fn print_load_error(e: &anyhow::Error) {
+async fn print_load_error(e: &Error) {
     error!("loading config: {e:#}");
     print_async(format!(
         "{}Refusing to modify config (load failed — fix plugins/plugin-updater.toml first): {}{e}",
@@ -152,7 +155,7 @@ async fn print_load_error(e: &anyhow::Error) {
     .await;
 }
 
-async fn print_save_error(e: &anyhow::Error) {
+async fn print_save_error(e: &Error) {
     error!("saving config: {e:#}");
     print_async(format!(
         "{}Failed to save config: {}{e}",
@@ -253,7 +256,7 @@ fn handle_subscribe(spec: &str, channel: Channel) {
 async fn resolve_canonical(
     candidates: &[(String, String)],
     channel: &Channel,
-) -> anyhow::Result<(String, String)> {
+) -> Result<(String, String)> {
     let mut errors: Vec<String> = Vec::new();
     for (owner, repo) in candidates {
         match probe_release(owner, repo, channel).await {
@@ -261,16 +264,12 @@ async fn resolve_canonical(
             Err(e) => errors.push(format!("{owner}/{repo}: {e}")),
         }
     }
-    anyhow::bail!("{}", errors.join("; "));
+    bail!("{}", errors.join("; "));
 }
 
-async fn probe_release(owner: &str, repo: &str, channel: &Channel) -> anyhow::Result<()> {
-    let release = github_release::get_release_for_channel(owner, repo, channel).await?;
-    asset_match::pick_asset(
-        &release.assets,
-        std::env::consts::ARCH,
-        std::env::consts::DLL_SUFFIX,
-    )?;
+async fn probe_release(owner: &str, repo: &str, channel: &Channel) -> Result<()> {
+    let release = get_release_for_channel(owner, repo, channel).await?;
+    pick_asset(&release.assets, env::consts::ARCH, env::consts::DLL_SUFFIX)?;
     Ok(())
 }
 
@@ -596,7 +595,7 @@ fn spawn_update_task(owner: String, repo: String, channel: Channel) {
     });
 }
 
-async fn run_update(owner: &str, repo: &str, channel: &Channel) -> anyhow::Result<()> {
+async fn run_update(owner: &str, repo: &str, channel: &Channel) -> Result<()> {
     print_async(format!(
         "{}Checking {}{}/{}{} for latest release...",
         color::PINK,
@@ -607,12 +606,8 @@ async fn run_update(owner: &str, repo: &str, channel: &Channel) -> anyhow::Resul
     ))
     .await;
 
-    let release = github_release::get_release_for_channel(owner, repo, channel).await?;
-    let asset = asset_match::pick_asset(
-        &release.assets,
-        std::env::consts::ARCH,
-        std::env::consts::DLL_SUFFIX,
-    )?;
+    let release = get_release_for_channel(owner, repo, channel).await?;
+    let asset = pick_asset(&release.assets, env::consts::ARCH, env::consts::DLL_SUFFIX)?;
 
     print_async(format!(
         "{}Downloading {}{} {}({}{}{}) ...",
@@ -626,8 +621,8 @@ async fn run_update(owner: &str, repo: &str, channel: &Channel) -> anyhow::Resul
     ))
     .await;
 
-    let expected_digest = github_release::resolve_expected_digest(asset)?;
-    let path = installer::download_to_managed_dir(asset, expected_digest.as_deref()).await?;
+    let expected_digest = resolve_expected_digest(asset)?;
+    let path = download_to_managed_dir(asset, expected_digest.as_deref()).await?;
 
     let now = unix_now();
     persist_installed_versions(

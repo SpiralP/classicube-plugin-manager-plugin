@@ -1,6 +1,7 @@
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, tempdir};
 
 use super::*;
+use crate::config::Channel;
 
 #[test]
 fn needs_install_no_prior_state() {
@@ -46,7 +47,7 @@ fn sub(owner: &str, repo: &str) -> Subscription {
     Subscription {
         owner: owner.into(),
         repo: repo.into(),
-        channel: crate::config::Channel::default(),
+        channel: Channel::default(),
         disabled: false,
         installed_version: None,
         installed_asset: None,
@@ -110,7 +111,7 @@ fn missing_config_file_writes_empty_default() {
     // load() returns default on NotFound, so the update is applied to an
     // empty subs list — every entry takes the unknown-row branch — and
     // save() writes back the empty default.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let path = dir.path().join("nope.toml");
     persist_cache_updates_to(
         &path,
@@ -219,7 +220,7 @@ fn persist_helpers_ignore_disabled_flag() {
 
 #[test]
 fn installed_version_missing_config_file_writes_empty_default() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let path = dir.path().join("nope.toml");
     persist_installed_versions_to(
         &path,

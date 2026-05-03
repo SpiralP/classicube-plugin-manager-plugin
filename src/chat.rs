@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod tests;
 
+use std::mem;
+
 use classicube_helpers::{async_manager, chat};
 
 const WRAP_WIDTH: usize = 80;
@@ -70,7 +72,7 @@ fn push_buf(atoms: &mut Vec<Atom>, buf: &mut String, kind: &mut Option<bool>) {
     if buf.is_empty() {
         return;
     }
-    let s = std::mem::take(buf);
+    let s = mem::take(buf);
     match kind.take() {
         Some(true) => atoms.push(Atom::Word(s)),
         Some(false) => atoms.push(Atom::Whitespace(s)),
@@ -183,7 +185,7 @@ fn flush_line(
     while current.ends_with(|c: char| c.is_whitespace()) {
         current.pop();
     }
-    out.push(std::mem::take(current));
+    out.push(mem::take(current));
     *visible = 0;
     *first_line = false;
     if let Some(c) = active_color {

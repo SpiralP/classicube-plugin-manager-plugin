@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
@@ -80,7 +80,7 @@ pub fn install_bytes_to(
             && e2.kind() != io::ErrorKind::NotFound
         {
             let _ = fs::remove_file(&new_path);
-            return Err(anyhow::anyhow!(
+            return Err(anyhow!(
                 "couldn't replace {}: rename failed ({e}) and delete failed ({e2})",
                 final_path.display()
             ));
@@ -105,16 +105,14 @@ pub fn install_bytes_to(
 pub fn parse_sha256_digest(s: &str) -> Result<[u8; 32]> {
     let hex = s
         .strip_prefix("sha256:")
-        .ok_or_else(|| anyhow::anyhow!("digest missing 'sha256:' prefix: {s}"))?;
+        .ok_or_else(|| anyhow!("digest missing 'sha256:' prefix: {s}"))?;
     if hex.len() != 64 {
         bail!("sha256 digest must be 64 hex chars, got {}: {s}", hex.len());
     }
     let mut out = [0u8; 32];
     for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
-        let hi =
-            hex_nibble(chunk[0]).ok_or_else(|| anyhow::anyhow!("non-hex char in digest: {s}"))?;
-        let lo =
-            hex_nibble(chunk[1]).ok_or_else(|| anyhow::anyhow!("non-hex char in digest: {s}"))?;
+        let hi = hex_nibble(chunk[0]).ok_or_else(|| anyhow!("non-hex char in digest: {s}"))?;
+        let lo = hex_nibble(chunk[1]).ok_or_else(|| anyhow!("non-hex char in digest: {s}"))?;
         out[i] = (hi << 4) | lo;
     }
     Ok(out)

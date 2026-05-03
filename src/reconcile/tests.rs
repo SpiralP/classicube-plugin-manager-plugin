@@ -3,13 +3,13 @@ use std::fs;
 use tempfile::tempdir;
 
 use super::*;
-use crate::config::Subscription;
+use crate::config::{Channel, Subscription};
 
 fn sub(owner: &str, repo: &str) -> Subscription {
     Subscription {
         owner: owner.into(),
         repo: repo.into(),
-        channel: crate::config::Channel::default(),
+        channel: Channel::default(),
         disabled: false,
         installed_version: None,
         installed_asset: None,
