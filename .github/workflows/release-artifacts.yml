@@ -30,4 +30,5 @@ jobs:
         run: |
           gh release upload "$TAG" \
             classicube_plugin_updater_windows_x86_64/classicube_plugin_updater_windows_x86_64.dll \
-            classicube_plugin_updater_linux_x86_64/classicube_plugin_updater_linux_x86_64.so
+            classicube_plugin_updater_linux_x86_64/classicube_plugin_updater_linux_x86_64.so \
+            classicube_plugin_updater_macos_aarch64/classicube_plugin_updater_macos_aarch64.dylib
