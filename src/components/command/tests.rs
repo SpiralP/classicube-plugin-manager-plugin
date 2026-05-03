@@ -284,3 +284,53 @@ fn find_subscription_no_match() {
     let candidates = vec![("SpiralP".into(), "foo".into())];
     assert!(find_subscription(&config, &candidates).is_none());
 }
+
+#[test]
+fn expand_candidates_curated_shorthand_wins() {
+    // A bare curated shorthand returns the single canonical pair; the
+    // generic two-candidate `classicube-$name-plugin` expansion is skipped.
+    assert_eq!(
+        expand_candidates("cef"),
+        Some(vec![(
+            "SpiralP".into(),
+            "classicube-cef-loader-plugin".into(),
+        )])
+    );
+}
+
+#[test]
+fn expand_candidates_curated_shorthand_case_insensitive() {
+    assert_eq!(
+        expand_candidates("CEF"),
+        Some(vec![(
+            "SpiralP".into(),
+            "classicube-cef-loader-plugin".into(),
+        )])
+    );
+}
+
+#[test]
+fn expand_candidates_owner_prefixed_skips_curated() {
+    // Owner-prefixed input always means "I know what I want" — the curated
+    // lookup is skipped even when the bare name would have matched.
+    assert_eq!(
+        expand_candidates("octocat/cef"),
+        Some(vec![
+            ("octocat".into(), "cef".into()),
+            ("octocat".into(), "classicube-cef-plugin".into()),
+        ])
+    );
+}
+
+#[test]
+fn expand_candidates_uncurated_bare_still_expands() {
+    // A bare name with no curated entry still falls through to the generic
+    // two-candidate expansion.
+    assert_eq!(
+        expand_candidates("zzz-not-curated"),
+        Some(vec![
+            ("SpiralP".into(), "zzz-not-curated".into()),
+            ("SpiralP".into(), "classicube-zzz-not-curated-plugin".into()),
+        ])
+    );
+}

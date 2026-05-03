@@ -1,0 +1,17 @@
+[[plugins]]
+owner = "SpiralP"
+repo = "classicube-cef-loader-plugin"
+shorthand = "cef"
+description = "Embed Chromium-rendered web content (videos, sites) in-game."
+
+[[plugins]]
+owner = "SpiralP"
+repo = "classicube-deno-plugin"
+shorthand = "deno"
+description = "JavaScript scripting engine for ClassiCube."
+
+[[plugins]]
+owner = "SpiralP"
+repo = "classicube-plugin-updater-plugin"
+shorthand = "updater"
+description = "This plugin: keeps subscribed plugins up to date from GitHub releases."
