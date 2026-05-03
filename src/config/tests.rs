@@ -303,6 +303,76 @@ fn legacy_subscription_without_channel_loads_as_stable() {
 }
 
 #[test]
+fn is_self_matches_pkg_identity() {
+    assert!(super::is_self(SELF_OWNER, SELF_REPO));
+    assert!(sub(SELF_OWNER, SELF_REPO).is_self());
+}
+
+#[test]
+fn is_self_rejects_other_owners_and_repos() {
+    assert!(!super::is_self("octocat", SELF_REPO));
+    assert!(!super::is_self(SELF_OWNER, "some-other-plugin"));
+    assert!(!sub("octocat", SELF_REPO).is_self());
+    assert!(!sub(SELF_OWNER, "some-other-plugin").is_self());
+}
+
+#[test]
+fn is_self_is_case_sensitive() {
+    // The chat-command path normalizes case before storage; once stored,
+    // is_self compares verbatim against the pkg-name constant.
+    assert!(!super::is_self(&SELF_OWNER.to_lowercase(), SELF_REPO));
+    assert!(!super::is_self(SELF_OWNER, &SELF_REPO.to_uppercase()));
+}
+
+#[test]
+fn ensure_self_adds_when_missing() {
+    let mut cfg = Config::default();
+    assert!(cfg.ensure_self());
+    assert_eq!(cfg.subscriptions.len(), 1);
+    let added = &cfg.subscriptions[0];
+    assert!(added.is_self());
+    assert_eq!(added.channel, Channel::Stable);
+    assert!(!added.disabled);
+    assert!(added.installed_version.is_none());
+}
+
+#[test]
+fn ensure_self_is_noop_when_present() {
+    let mut cfg = Config {
+        subscriptions: vec![Subscription {
+            channel: Channel::Prerelease,
+            disabled: true,
+            installed_version: Some("v9.9.9".into()),
+            ..sub(SELF_OWNER, SELF_REPO)
+        }],
+    };
+    assert!(!cfg.ensure_self());
+    // User-set fields are left alone — ensure_self never overwrites
+    // existing entries even when their state looks unusual.
+    let kept = &cfg.subscriptions[0];
+    assert_eq!(kept.channel, Channel::Prerelease);
+    assert!(kept.disabled);
+    assert_eq!(kept.installed_version.as_deref(), Some("v9.9.9"));
+}
+
+#[test]
+fn ensure_self_does_not_disturb_other_subscriptions() {
+    let other = Subscription {
+        installed_version: Some("v1.0.0".into()),
+        installed_asset: Some("other.so".into()),
+        ..sub("octocat", "hello-world")
+    };
+    let mut cfg = Config {
+        subscriptions: vec![other.clone()],
+    };
+    assert!(cfg.ensure_self());
+    assert_eq!(cfg.subscriptions.len(), 2);
+    // Existing entry stays at index 0; self is appended.
+    assert_eq!(cfg.subscriptions[0], other);
+    assert!(cfg.subscriptions[1].is_self());
+}
+
+#[test]
 fn legacy_config_without_timestamps_loads() {
     // A config written by an older version of the plugin lacks
     // installed_at / cached_published_at. Loading must still succeed; the

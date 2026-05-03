@@ -8,8 +8,22 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeErr
 
 const CONFIG_PATH: &str = "plugins/plugin-updater.toml";
 
+/// Owner of this plugin's own repo. Used to identify the "self" subscription
+/// so the auto-update path can install over the loaded binary instead of
+/// going through the managed-plugin pipeline.
+pub const SELF_OWNER: &str = "SpiralP";
+
+/// Repo of this plugin's own repo, derived from the crate name so the two
+/// can't drift. Matches the canonical `classicube-$name-plugin` convention.
+pub const SELF_REPO: &str = env!("CARGO_PKG_NAME");
+
 pub fn config_path() -> &'static Path {
     Path::new(CONFIG_PATH)
+}
+
+/// Whether `(owner, repo)` refers to this plugin itself.
+pub fn is_self(owner: &str, repo: &str) -> bool {
+    owner == SELF_OWNER && repo == SELF_REPO
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +132,11 @@ pub struct Subscription {
 }
 
 impl Subscription {
+    /// Whether this subscription refers to the updater plugin itself.
+    pub fn is_self(&self) -> bool {
+        is_self(&self.owner, &self.repo)
+    }
+
     /// Returns `(cached_tag, cached_published_at)` when the cache is within
     /// `ttl_secs` and both fields are populated. Both are required because
     /// downstream needs the tag for display/logging *and* the timestamp for
@@ -133,6 +152,30 @@ impl Subscription {
 }
 
 impl Config {
+    /// Ensure a subscription for this plugin's own repo exists so the
+    /// self-update path picks it up automatically. Returns `true` if a
+    /// fresh entry was added; the caller is responsible for persisting.
+    /// An existing entry — even one the user has disabled or pinned — is
+    /// left alone.
+    pub fn ensure_self(&mut self) -> bool {
+        if self.subscriptions.iter().any(Subscription::is_self) {
+            return false;
+        }
+        self.subscriptions.push(Subscription {
+            owner: SELF_OWNER.into(),
+            repo: SELF_REPO.into(),
+            channel: Channel::Stable,
+            disabled: false,
+            installed_version: None,
+            installed_asset: None,
+            installed_at: None,
+            cached_tag: None,
+            cached_at: None,
+            cached_published_at: None,
+        });
+        true
+    }
+
     pub fn load() -> Result<Self> {
         Self::load_from(config_path())
     }

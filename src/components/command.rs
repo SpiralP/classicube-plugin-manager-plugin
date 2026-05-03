@@ -19,9 +19,9 @@ use crate::{
     chat::{print_async, print_wrapped},
     component::Component,
     components::updater::persist_installed_versions,
-    config::{Channel, Config, Subscription},
+    config::{self, Channel, Config, Subscription},
     github_release::{get_release_for_channel, resolve_expected_digest},
-    installer::download_to_managed_dir,
+    installer::{download_self, download_to_managed_dir},
 };
 
 thread_local!(
@@ -622,7 +622,12 @@ async fn run_update(owner: &str, repo: &str, channel: &Channel) -> Result<()> {
     .await;
 
     let expected_digest = resolve_expected_digest(asset)?;
-    let path = download_to_managed_dir(asset, expected_digest.as_deref()).await?;
+    let is_self = config::is_self(owner, repo);
+    let path = if is_self {
+        download_self(asset, expected_digest.as_deref()).await?
+    } else {
+        download_to_managed_dir(asset, expected_digest.as_deref()).await?
+    };
 
     let now = unix_now();
     persist_installed_versions(
@@ -636,21 +641,32 @@ async fn run_update(owner: &str, repo: &str, channel: &Channel) -> Result<()> {
         )],
     )?;
 
-    print_async(format!(
-        "{}Installed {}{} {}for {}{}/{} {}-> {}{}{} (restart to load)",
-        color::PINK,
-        color::GREEN,
-        release.tag_name,
-        color::PINK,
-        color::LIME,
-        owner,
-        repo,
-        color::PINK,
-        color::YELLOW,
-        path.display(),
-        color::PINK,
-    ))
-    .await;
+    if is_self {
+        print_async(format!(
+            "{}Plugin updater updated to {}{}{} — restart ClassiCube to use the new version",
+            color::PINK,
+            color::GREEN,
+            release.tag_name,
+            color::PINK,
+        ))
+        .await;
+    } else {
+        print_async(format!(
+            "{}Installed {}{} {}for {}{}/{} {}-> {}{}{} (restart to load)",
+            color::PINK,
+            color::GREEN,
+            release.tag_name,
+            color::PINK,
+            color::LIME,
+            owner,
+            repo,
+            color::PINK,
+            color::YELLOW,
+            path.display(),
+            color::PINK,
+        ))
+        .await;
+    }
 
     Ok(())
 }

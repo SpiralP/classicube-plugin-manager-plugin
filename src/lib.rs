@@ -7,3 +7,4 @@ mod github_release;
 mod installer;
 mod loader;
 mod reconcile;
+mod self_path;
