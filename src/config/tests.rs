@@ -6,6 +6,7 @@ fn sub(owner: &str, repo: &str) -> Subscription {
     Subscription {
         owner: owner.into(),
         repo: repo.into(),
+        channel: Channel::default(),
         disabled: false,
         installed_version: None,
         installed_asset: None,
@@ -117,6 +118,7 @@ fn round_trip_populated_subscription() {
         subscriptions: vec![Subscription {
             owner: "octocat".into(),
             repo: "hello-world".into(),
+            channel: Channel::default(),
             disabled: false,
             installed_version: Some("v1.2.3".into()),
             installed_asset: Some("hello-world.so".into()),
@@ -183,6 +185,125 @@ fn disabled_default_when_missing_from_toml() {
     let loaded = Config::load_from(f.path()).unwrap();
     assert_eq!(loaded.subscriptions.len(), 1);
     assert!(!loaded.subscriptions[0].disabled);
+}
+
+#[test]
+fn channel_default_is_stable() {
+    assert_eq!(Channel::default(), Channel::Stable);
+    assert!(Channel::Stable.is_default());
+    assert!(!Channel::Prerelease.is_default());
+    assert!(!Channel::Tag("v1".into()).is_default());
+}
+
+#[test]
+fn channel_parses_known_strings() {
+    assert_eq!("stable".parse::<Channel>(), Ok(Channel::Stable));
+    assert_eq!("prerelease".parse::<Channel>(), Ok(Channel::Prerelease));
+    assert_eq!(
+        "tag:v1.2.3".parse::<Channel>(),
+        Ok(Channel::Tag("v1.2.3".into()))
+    );
+}
+
+#[test]
+fn channel_rejects_empty_or_whitespace_tag() {
+    assert!("tag:".parse::<Channel>().is_err());
+    assert!("tag:   ".parse::<Channel>().is_err());
+    assert!("tag:foo bar".parse::<Channel>().is_err());
+}
+
+#[test]
+fn channel_from_tag_trims_and_validates() {
+    assert_eq!(
+        Channel::from_tag("v1.2.3"),
+        Ok(Channel::Tag("v1.2.3".into())),
+    );
+    // Surrounding whitespace is trimmed; this matters for hand-edited tomls.
+    assert_eq!(
+        Channel::from_tag("  v1.2.3  "),
+        Ok(Channel::Tag("v1.2.3".into())),
+    );
+    assert!(Channel::from_tag("").is_err());
+    assert!(Channel::from_tag("   ").is_err());
+    assert!(Channel::from_tag("v 1").is_err());
+}
+
+#[test]
+fn channel_pretty_per_variant() {
+    assert_eq!(Channel::Stable.pretty(), "stable");
+    assert_eq!(Channel::Prerelease.pretty(), "prerelease");
+    assert_eq!(Channel::Tag("v1.2.3".into()).pretty(), "tag: v1.2.3");
+}
+
+#[test]
+fn channel_rejects_unknown() {
+    assert!("nightly".parse::<Channel>().is_err());
+    assert!("".parse::<Channel>().is_err());
+}
+
+#[test]
+fn channel_round_trip_in_subscription() {
+    let cfg = Config {
+        subscriptions: vec![
+            Subscription {
+                channel: Channel::Stable,
+                ..sub("a", "stable")
+            },
+            Subscription {
+                channel: Channel::Prerelease,
+                ..sub("a", "pre")
+            },
+            Subscription {
+                channel: Channel::Tag("v1.2.3".into()),
+                ..sub("a", "pinned")
+            },
+        ],
+    };
+    let f = NamedTempFile::new().unwrap();
+    cfg.save_to(f.path()).unwrap();
+    let on_disk = fs::read_to_string(f.path()).unwrap();
+    // Default (stable) is skipped, others render as the agreed string form.
+    assert!(
+        !on_disk.contains("channel = \"stable\""),
+        "stable should be skipped: {on_disk}",
+    );
+    assert!(on_disk.contains("channel = \"prerelease\""));
+    assert!(on_disk.contains("channel = \"tag:v1.2.3\""));
+    let loaded = Config::load_from(f.path()).unwrap();
+    assert_eq!(loaded, cfg);
+}
+
+#[test]
+fn channel_round_trips_complex_tag() {
+    // Real-world tags include rc / build-metadata characters; make sure the
+    // `tag:<ref>` form round-trips them as-is rather than mangling them.
+    let cfg = Config {
+        subscriptions: vec![Subscription {
+            channel: Channel::Tag("v1.2.3-rc1+build.5".into()),
+            ..sub("a", "b")
+        }],
+    };
+    let f = NamedTempFile::new().unwrap();
+    cfg.save_to(f.path()).unwrap();
+    let on_disk = fs::read_to_string(f.path()).unwrap();
+    assert!(
+        on_disk.contains("channel = \"tag:v1.2.3-rc1+build.5\""),
+        "expected exact tag form in: {on_disk}",
+    );
+    let loaded = Config::load_from(f.path()).unwrap();
+    assert_eq!(loaded, cfg);
+}
+
+#[test]
+fn legacy_subscription_without_channel_loads_as_stable() {
+    let mut f = NamedTempFile::new().unwrap();
+    std::io::Write::write_all(
+        &mut f,
+        b"[[subscriptions]]\nowner = \"octocat\"\nrepo = \"hello-world\"\n",
+    )
+    .unwrap();
+    let loaded = Config::load_from(f.path()).unwrap();
+    assert_eq!(loaded.subscriptions[0].channel, Channel::Stable);
 }
 
 #[test]

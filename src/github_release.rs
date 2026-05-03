@@ -3,10 +3,12 @@ mod tests;
 
 use std::{env, time::Duration};
 
-use anyhow::{Error, Result, bail};
+use anyhow::{Error, Result, anyhow, bail};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::{Deserialize, Deserializer};
 use tracing::warn;
+
+use crate::config::Channel;
 
 const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
@@ -43,22 +45,60 @@ pub struct GitHubReleaseAsset {
     pub digest: Option<String>,
 }
 
-pub async fn get_latest_release(owner: &str, repo: &str) -> Result<GitHubRelease> {
-    let mut request = make_client().get(format!(
-        "https://api.github.com/repos/{owner}/{repo}/releases/latest"
-    ));
+/// Fetch the appropriate release for `channel`:
+/// - `Stable` hits `/releases/latest` (GitHub's "latest non-prerelease").
+/// - `Prerelease` lists recent releases and picks the one with the latest
+///   `published_at` — including prereleases. We don't filter on the
+///   `prerelease` bit because users on this channel want the absolute newest
+///   release on the timeline regardless of its label.
+/// - `Tag(t)` hits `/releases/tags/{t}` directly.
+pub async fn get_release_for_channel(
+    owner: &str,
+    repo: &str,
+    channel: &Channel,
+) -> Result<GitHubRelease> {
+    match channel {
+        Channel::Stable => {
+            let url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
+            fetch_one(&url).await
+        }
+        Channel::Prerelease => fetch_newest_release(owner, repo).await,
+        Channel::Tag(tag) => {
+            let url = format!("https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}");
+            fetch_one(&url).await
+        }
+    }
+}
+
+async fn fetch_one(url: &str) -> Result<GitHubRelease> {
+    let bytes = send(url).await?;
+    if let Ok(error) = serde_json::from_slice::<GitHubError>(&bytes) {
+        bail!("{}", error.message);
+    }
+    Ok::<_, Error>(serde_json::from_slice::<GitHubRelease>(&bytes)?)
+}
+
+async fn fetch_newest_release(owner: &str, repo: &str) -> Result<GitHubRelease> {
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/releases?per_page=10");
+    let bytes = send(&url).await?;
+    if let Ok(error) = serde_json::from_slice::<GitHubError>(&bytes) {
+        bail!("{}", error.message);
+    }
+    let releases: Vec<GitHubRelease> = serde_json::from_slice(&bytes)?;
+    releases
+        .into_iter()
+        .max_by_key(|r| r.published_at)
+        .ok_or_else(|| anyhow!("no releases found for {owner}/{repo}"))
+}
+
+async fn send(url: &str) -> Result<Vec<u8>> {
+    let mut request = make_client().get(url);
     if let Ok(token) = env::var("GITHUB_TOKEN") {
         let mut header_value = HeaderValue::from_str(&format!("token {token}")).unwrap();
         header_value.set_sensitive(true);
         request = request.header(AUTHORIZATION, header_value);
     }
-
-    let bytes = request.send().await?.bytes().await?;
-
-    if let Ok(error) = serde_json::from_slice::<GitHubError>(&bytes) {
-        bail!("{}", error.message);
-    }
-    Ok::<_, Error>(serde_json::from_slice::<GitHubRelease>(&bytes)?)
+    Ok(request.send().await?.bytes().await?.to_vec())
 }
 
 /// Parse GitHub's release timestamp format (`YYYY-MM-DDTHH:MM:SSZ`, RFC3339

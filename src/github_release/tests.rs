@@ -74,6 +74,34 @@ fn parses_asset_without_digest_field() {
 }
 
 #[test]
+fn parses_releases_list_picks_newest_by_published_at() {
+    // Mirrors the `/releases?per_page=N` payload that `fetch_newest_release`
+    // hits for the prerelease channel. The selection logic is one line —
+    // `max_by_key(|r| r.published_at)` — but exercising it here pins down
+    // both the JSON-list parse and the contract that ordering in the payload
+    // doesn't matter (real GitHub responses are usually but not strictly
+    // sorted).
+    let json = br#"[
+        {"tag_name":"v1.0.0","published_at":"2024-01-15T00:00:00Z"},
+        {"tag_name":"v1.1.0-rc1","published_at":"2024-03-01T00:00:00Z"},
+        {"tag_name":"v0.9.0","published_at":"2024-02-10T00:00:00Z"}
+    ]"#;
+    let releases: Vec<GitHubRelease> = serde_json::from_slice(json).unwrap();
+    let newest = releases.into_iter().max_by_key(|r| r.published_at).unwrap();
+    assert_eq!(newest.tag_name, "v1.1.0-rc1");
+}
+
+#[test]
+fn parses_empty_releases_list() {
+    // A repo with no releases (yet) returns `[]`. The prerelease channel
+    // should treat that as "nothing to install" rather than crashing on the
+    // parse — handled at the call site by `max_by_key` returning None.
+    let json = b"[]";
+    let releases: Vec<GitHubRelease> = serde_json::from_slice(json).unwrap();
+    assert!(releases.is_empty());
+}
+
+#[test]
 fn missing_published_at_fails() {
     // GitHub always sends `published_at` for a published release; absence is
     // a real signal that something's wrong with the payload, not something

@@ -126,23 +126,27 @@ async fn run_initial_pass() -> Result<()> {
 
         let release = match release_in_hand.take() {
             Some(r) => r,
-            None => match github_release::get_latest_release(&sub.owner, &sub.repo).await {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("fetching release for {}/{}: {e:#}", sub.owner, sub.repo);
-                    print_async(format!(
-                        "{}Failed to fetch release for {}{}/{}{}: {}{e}",
-                        color::RED,
-                        color::LIME,
-                        sub.owner,
-                        sub.repo,
-                        color::RED,
-                        color::WHITE,
-                    ))
-                    .await;
-                    continue;
+            None => {
+                match github_release::get_release_for_channel(&sub.owner, &sub.repo, &sub.channel)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("fetching release for {}/{}: {e:#}", sub.owner, sub.repo);
+                        print_async(format!(
+                            "{}Failed to fetch release for {}{}/{}{}: {}{e}",
+                            color::RED,
+                            color::LIME,
+                            sub.owner,
+                            sub.repo,
+                            color::RED,
+                            color::WHITE,
+                        ))
+                        .await;
+                        continue;
+                    }
                 }
-            },
+            }
         };
 
         let asset = match asset_match::pick_asset(
@@ -330,7 +334,8 @@ async fn resolve_latest_release(
         debug!("{}/{} served from cache ({tag})", sub.owner, sub.repo);
         return Ok((tag.to_owned(), pub_at, None));
     }
-    let release = github_release::get_latest_release(&sub.owner, &sub.repo).await?;
+    let release =
+        github_release::get_release_for_channel(&sub.owner, &sub.repo, &sub.channel).await?;
     Ok((
         release.tag_name.clone(),
         release.published_at,
