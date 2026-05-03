@@ -25,8 +25,24 @@ thread_local!(
     static COMMAND: RefCell<Option<OwnedChatCommand>> = const { RefCell::new(None) };
 );
 
-fn parse_owner_repo(s: &str) -> Option<(String, String)> {
-    let (owner, repo) = s.split_once('/')?;
+/// Default owner used when a shorthand has no `owner/` prefix. SpiralP owns
+/// most ClassiCube plugins and follows the `classicube-$name-plugin` naming
+/// convention, so `/subscribe foo` resolves to `SpiralP/classicube-foo-plugin`.
+const DEFAULT_OWNER: &str = "SpiralP";
+
+/// Expand user-typed shorthand into ordered `(owner, repo)` candidates to try.
+/// The literal interpretation comes first; the `classicube-$name-plugin`
+/// expansion comes second when the input doesn't already look canonical.
+///
+/// - `foo`                            → [(SpiralP, foo), (SpiralP, classicube-foo-plugin)]
+/// - `owner/foo`                      → [(owner, foo), (owner, classicube-foo-plugin)]
+/// - `owner/classicube-foo-plugin`    → [(owner, classicube-foo-plugin)]
+/// - `classicube-foo-plugin`          → [(SpiralP, classicube-foo-plugin)]
+fn expand_candidates(input: &str) -> Option<Vec<(String, String)>> {
+    let (owner, repo) = match input.split_once('/') {
+        Some((o, r)) => (o, r),
+        None => (DEFAULT_OWNER, input),
+    };
     if owner.is_empty()
         || repo.is_empty()
         || owner.contains(char::is_whitespace)
@@ -35,7 +51,36 @@ fn parse_owner_repo(s: &str) -> Option<(String, String)> {
     {
         return None;
     }
-    Some((owner.to_string(), repo.to_string()))
+    let owner = owner.to_string();
+    let repo = repo.to_string();
+    if is_canonical_repo_name(&repo) {
+        Some(vec![(owner, repo)])
+    } else {
+        let expanded = format!("classicube-{repo}-plugin");
+        Some(vec![(owner.clone(), repo), (owner, expanded)])
+    }
+}
+
+fn is_canonical_repo_name(repo: &str) -> bool {
+    repo.strip_prefix("classicube-")
+        .and_then(|r| r.strip_suffix("-plugin"))
+        .is_some_and(|middle| !middle.is_empty())
+}
+
+/// Find the index of the first subscription that matches any candidate,
+/// preferring earlier candidates (literal before expanded). Comparison is
+/// case-insensitive, mirroring how `handle_subscribe` checks for duplicates.
+fn find_subscription_index(config: &Config, candidates: &[(String, String)]) -> Option<usize> {
+    for (owner, repo) in candidates {
+        if let Some(idx) = config
+            .subscriptions
+            .iter()
+            .position(|s| s.owner.eq_ignore_ascii_case(owner) && s.repo.eq_ignore_ascii_case(repo))
+        {
+            return Some(idx);
+        }
+    }
+    None
 }
 
 const USAGE_LINES: &[&str] = &[
@@ -75,10 +120,11 @@ async fn print_save_error(e: &anyhow::Error) {
 }
 
 fn handle_subscribe(spec: &str) {
-    let Some((owner, repo)) = parse_owner_repo(spec) else {
+    let Some(candidates) = expand_candidates(spec) else {
         print_wrapped(format!("{}Expected owner/repo, got: {spec}", color::RED));
         return;
     };
+    let spec = spec.to_string();
 
     async_manager::spawn(async move {
         let mut config = match Config::load() {
@@ -89,21 +135,41 @@ fn handle_subscribe(spec: &str) {
             }
         };
 
-        let already = config
-            .subscriptions
-            .iter()
-            .any(|s| s.owner.eq_ignore_ascii_case(&owner) && s.repo.eq_ignore_ascii_case(&repo));
-        if already {
+        if let Some(idx) = find_subscription_index(&config, &candidates) {
+            let existing = &config.subscriptions[idx];
             print_async(format!(
                 "{}Already subscribed to {}{}/{}",
                 color::YELLOW,
                 color::LIME,
-                owner,
-                repo,
+                existing.owner,
+                existing.repo,
             ))
             .await;
             return;
         }
+
+        // Single canonical candidate: skip the network probe to preserve the
+        // fast subscribe path. Multiple candidates: probe each against the
+        // GitHub API + OS asset filter and persist the first that succeeds.
+        let (owner, repo) = if candidates.len() == 1 {
+            candidates.into_iter().next().unwrap()
+        } else {
+            match resolve_canonical(&candidates).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    print_async(format!(
+                        "{}Failed to resolve {}{}{}: {}{e}",
+                        color::RED,
+                        color::LIME,
+                        spec,
+                        color::RED,
+                        color::WHITE,
+                    ))
+                    .await;
+                    return;
+                }
+            }
+        };
 
         config.subscriptions.push(Subscription {
             owner: owner.clone(),
@@ -131,11 +197,36 @@ fn handle_subscribe(spec: &str) {
     });
 }
 
+/// Probe each candidate against the GitHub API and OS asset filter; return
+/// the first `(owner, repo)` whose latest release has a matching asset for
+/// our platform. Errors aggregate the per-candidate failure messages.
+async fn resolve_canonical(candidates: &[(String, String)]) -> anyhow::Result<(String, String)> {
+    let mut errors: Vec<String> = Vec::new();
+    for (owner, repo) in candidates {
+        match probe_release(owner, repo).await {
+            Ok(()) => return Ok((owner.clone(), repo.clone())),
+            Err(e) => errors.push(format!("{owner}/{repo}: {e}")),
+        }
+    }
+    anyhow::bail!("{}", errors.join("; "));
+}
+
+async fn probe_release(owner: &str, repo: &str) -> anyhow::Result<()> {
+    let release = github_release::get_latest_release(owner, repo).await?;
+    asset_match::pick_asset(
+        &release.assets,
+        std::env::consts::ARCH,
+        std::env::consts::DLL_SUFFIX,
+    )?;
+    Ok(())
+}
+
 fn handle_unsubscribe(spec: &str) {
-    let Some((owner, repo)) = parse_owner_repo(spec) else {
+    let Some(candidates) = expand_candidates(spec) else {
         print_wrapped(format!("{}Expected owner/repo, got: {spec}", color::RED));
         return;
     };
+    let spec = spec.to_string();
 
     async_manager::spawn(async move {
         let mut config = match Config::load() {
@@ -146,22 +237,18 @@ fn handle_unsubscribe(spec: &str) {
             }
         };
 
-        let before = config.subscriptions.len();
-        config.subscriptions.retain(|s| {
-            !(s.owner.eq_ignore_ascii_case(&owner) && s.repo.eq_ignore_ascii_case(&repo))
-        });
-        if config.subscriptions.len() == before {
+        let Some(idx) = find_subscription_index(&config, &candidates) else {
             print_async(format!(
-                "{}Not subscribed to {}{}/{}",
+                "{}Not subscribed to {}{}",
                 color::YELLOW,
                 color::LIME,
-                owner,
-                repo,
+                spec,
             ))
             .await;
             return;
-        }
+        };
 
+        let removed = config.subscriptions.remove(idx);
         if let Err(e) = config.save() {
             print_save_error(&e).await;
             return;
@@ -170,18 +257,19 @@ fn handle_unsubscribe(spec: &str) {
             "{}Unsubscribed from {}{}/{}",
             color::PINK,
             color::LIME,
-            owner,
-            repo,
+            removed.owner,
+            removed.repo,
         ))
         .await;
     });
 }
 
 fn set_disabled(spec: &str, disabled: bool) {
-    let Some((owner, repo)) = parse_owner_repo(spec) else {
+    let Some(candidates) = expand_candidates(spec) else {
         print_wrapped(format!("{}Expected owner/repo, got: {spec}", color::RED));
         return;
     };
+    let spec = spec.to_string();
 
     async_manager::spawn(async move {
         let mut config = match Config::load() {
@@ -192,35 +280,33 @@ fn set_disabled(spec: &str, disabled: bool) {
             }
         };
 
-        let Some(sub) = config
-            .subscriptions
-            .iter_mut()
-            .find(|s| s.owner.eq_ignore_ascii_case(&owner) && s.repo.eq_ignore_ascii_case(&repo))
-        else {
+        let Some(idx) = find_subscription_index(&config, &candidates) else {
             print_async(format!(
-                "{}Not subscribed to {}{}/{}",
+                "{}Not subscribed to {}{}",
                 color::YELLOW,
                 color::LIME,
-                owner,
-                repo,
+                spec,
             ))
             .await;
             return;
         };
 
+        let sub = &mut config.subscriptions[idx];
         if sub.disabled == disabled {
             let word = if disabled { "disabled" } else { "enabled" };
             print_async(format!(
                 "{}Already {word} {}{}/{}",
                 color::YELLOW,
                 color::LIME,
-                owner,
-                repo,
+                sub.owner,
+                sub.repo,
             ))
             .await;
             return;
         }
         sub.disabled = disabled;
+        let owner = sub.owner.clone();
+        let repo = sub.repo.clone();
 
         if let Err(e) = config.save() {
             print_save_error(&e).await;
@@ -289,10 +375,11 @@ fn handle_list() {
 }
 
 fn handle_update_one(spec: &str) {
-    let Some((owner, repo)) = parse_owner_repo(spec) else {
+    let Some(candidates) = expand_candidates(spec) else {
         print_wrapped(format!("{}Expected owner/repo, got: {spec}", color::RED));
         return;
     };
+    let spec = spec.to_string();
 
     async_manager::spawn(async move {
         let config = match Config::load() {
@@ -303,17 +390,12 @@ fn handle_update_one(spec: &str) {
             }
         };
 
-        let Some(sub) = config
-            .subscriptions
-            .iter()
-            .find(|s| s.owner.eq_ignore_ascii_case(&owner) && s.repo.eq_ignore_ascii_case(&repo))
-        else {
+        let Some(idx) = find_subscription_index(&config, &candidates) else {
             print_async(format!(
-                "{}Not subscribed to {}{}/{}{}; use {}subscribe{} first",
+                "{}Not subscribed to {}{}{}; use {}subscribe{} first",
                 color::YELLOW,
                 color::LIME,
-                owner,
-                repo,
+                spec,
                 color::YELLOW,
                 color::LIME,
                 color::YELLOW,
@@ -322,24 +404,25 @@ fn handle_update_one(spec: &str) {
             return;
         };
 
+        let sub = &config.subscriptions[idx];
         if sub.disabled {
             print_async(format!(
                 "{}Subscription {}{}/{} {}is disabled; use {}enable {}/{}{} first",
                 color::YELLOW,
                 color::LIME,
-                owner,
-                repo,
+                sub.owner,
+                sub.repo,
                 color::YELLOW,
                 color::LIME,
-                owner,
-                repo,
+                sub.owner,
+                sub.repo,
                 color::YELLOW,
             ))
             .await;
             return;
         }
 
-        spawn_update_task(owner, repo);
+        spawn_update_task(sub.owner.clone(), sub.repo.clone());
     });
 }
 
