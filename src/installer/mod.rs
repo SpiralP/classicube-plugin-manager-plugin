@@ -2,6 +2,7 @@
 mod tests;
 
 use std::{
+    ffi::OsStr,
     fs, io,
     path::{Path, PathBuf},
 };
@@ -10,7 +11,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
-use crate::github_release::{GitHubReleaseAsset, make_client};
+use crate::{
+    github_release::{GitHubReleaseAsset, make_client},
+    self_path::current_lib_path,
+};
 
 pub const PLUGINS_DIR: &str = "plugins";
 pub const MANAGED_DIR: &str = "plugins/managed";
@@ -23,6 +27,78 @@ pub async fn download_to_managed_dir(
         "downloading {} -> {}/{}",
         asset.browser_download_url, MANAGED_DIR, asset.name
     );
+    let bytes = download_bytes(asset).await?;
+    install_bytes_to(Path::new(MANAGED_DIR), &asset.name, &bytes, expected_digest)
+}
+
+/// Self-update install: write the new bytes over the loaded updater binary
+/// in `plugins/`. The existing `install_bytes_to` rename dance handles the
+/// loaded-and-locked file correctly:
+///
+/// - Linux: `rename` of an mmap'd file is allowed; the in-memory mapping is
+///   decoupled from the dirent.
+/// - Windows: `MoveFileExW` (under `fs::rename`) allows renaming a locked
+///   DLL even though it forbids overwriting one. The leftover `.old` can't
+///   be deleted in-session and is cleaned up on next startup.
+///
+/// The current process keeps running the old code; the user must restart to
+/// pick up the new version.
+pub async fn download_self(
+    asset: &GitHubReleaseAsset,
+    expected_digest: Option<&str>,
+) -> Result<PathBuf> {
+    let loaded = current_lib_path().context("resolving self path")?;
+    let dir = loaded
+        .parent()
+        .ok_or_else(|| anyhow!("loaded path has no parent: {}", loaded.display()))?;
+    if dir.file_name() != Some(OsStr::new("plugins")) {
+        bail!(
+            "loaded updater binary at {} is not directly under plugins/; refusing to self-update",
+            loaded.display()
+        );
+    }
+    let basename = loaded
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| anyhow!("loaded path has no UTF-8 filename: {}", loaded.display()))?;
+
+    debug!(
+        "self-updating: downloading {} -> {}",
+        asset.browser_download_url,
+        loaded.display(),
+    );
+    let bytes = download_bytes(asset).await?;
+    install_bytes_to(dir, basename, &bytes, expected_digest)
+}
+
+/// Best-effort cleanup of a `<self>.old` left behind by a previous
+/// self-update. On Linux the `.old` is removed in-session by
+/// `install_bytes_to`; on Windows the loader's lock prevents that, so we
+/// retry here at startup (when the previous loaded copy is no longer mapped
+/// by anything).
+pub fn cleanup_self_old() {
+    let loaded = match current_lib_path() {
+        Ok(p) => p,
+        Err(e) => {
+            debug!("cleanup_self_old: skipping ({e:#})");
+            return;
+        }
+    };
+    let Some(file_name) = loaded.file_name().and_then(OsStr::to_str) else {
+        return;
+    };
+    let Some(dir) = loaded.parent() else {
+        return;
+    };
+    let old_path = dir.join(format!("{file_name}.old"));
+    match fs::remove_file(&old_path) {
+        Ok(()) => debug!("removed leftover {}", old_path.display()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => debug!("could not remove {}: {e}", old_path.display()),
+    }
+}
+
+async fn download_bytes(asset: &GitHubReleaseAsset) -> Result<Vec<u8>> {
     let bytes = make_client()
         .get(&asset.browser_download_url)
         .send()
@@ -33,8 +109,7 @@ pub async fn download_to_managed_dir(
         .bytes()
         .await
         .with_context(|| format!("reading body of {}", asset.browser_download_url))?;
-
-    install_bytes_to(Path::new(MANAGED_DIR), &asset.name, &bytes, expected_digest)
+    Ok(bytes.to_vec())
 }
 
 /// Atomically write `bytes` to `dir/asset_name`. The existing file (if any)

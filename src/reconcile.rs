@@ -39,6 +39,12 @@ pub fn reconcile(config_path: &Path, managed_dir: &Path) -> Result<ReconcileRepo
     let mut claimed: HashSet<String> = HashSet::new();
 
     for sub in &mut config.subscriptions {
+        // The self subscription installs into plugins/ (not plugins/managed/),
+        // so it never participates in this reconcile pass — checking here
+        // would always flag it missing.
+        if sub.is_self() {
+            continue;
+        }
         let Some(asset) = sub.installed_asset.clone() else {
             continue;
         };

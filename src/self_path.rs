@@ -1,0 +1,76 @@
+#[cfg(test)]
+mod tests;
+
+use std::path::PathBuf;
+
+use anyhow::{Result, anyhow};
+
+/// Resolve the on-disk path of the shared library (or test binary) that
+/// contains this function. Used by the self-update path to locate the loaded
+/// updater binary so we can rename it through `install_bytes_to`.
+///
+/// Linux/macOS: `dladdr` resolves any code address to its containing object.
+/// Windows: `GetModuleHandleExW(FROM_ADDRESS, ...)` then `GetModuleFileNameW`.
+#[cfg(unix)]
+pub fn current_lib_path() -> Result<PathBuf> {
+    use std::{ffi::CStr, mem, os::raw::c_void};
+
+    let mut info: libc::Dl_info = unsafe { mem::zeroed() };
+    let addr = current_lib_path as *const c_void;
+    let rc = unsafe { libc::dladdr(addr, &mut info) };
+    if rc == 0 {
+        return Err(anyhow!("dladdr failed for current cdylib"));
+    }
+    if info.dli_fname.is_null() {
+        return Err(anyhow!("dladdr returned null dli_fname"));
+    }
+    let cstr = unsafe { CStr::from_ptr(info.dli_fname) };
+    let s = cstr
+        .to_str()
+        .map_err(|e| anyhow!("non-UTF8 dli_fname: {e}"))?;
+    Ok(PathBuf::from(s))
+}
+
+#[cfg(windows)]
+pub fn current_lib_path() -> Result<PathBuf> {
+    use std::{
+        ffi::OsString,
+        os::{raw::c_void, windows::ffi::OsStringExt},
+        ptr,
+    };
+
+    use windows_sys::Win32::{
+        Foundation::HMODULE,
+        System::LibraryLoader::{
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            GetModuleFileNameW, GetModuleHandleExW,
+        },
+    };
+
+    let mut module: HMODULE = ptr::null_mut();
+    let addr = current_lib_path as *const c_void;
+    let ok = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            addr.cast::<u16>(),
+            &mut module,
+        )
+    };
+    if ok == 0 {
+        return Err(anyhow!("GetModuleHandleExW failed"));
+    }
+
+    let mut buf: Vec<u16> = vec![0; 1024];
+    loop {
+        let n = unsafe { GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        if n == 0 {
+            return Err(anyhow!("GetModuleFileNameW failed"));
+        }
+        if n < buf.len() {
+            buf.truncate(n);
+            break;
+        }
+        buf.resize(buf.len() * 2, 0);
+    }
+    Ok(PathBuf::from(OsString::from_wide(&buf)))
+}

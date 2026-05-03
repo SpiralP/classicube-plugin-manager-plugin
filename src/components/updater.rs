@@ -18,7 +18,7 @@ use crate::{
     component::Component,
     config::{Config, Subscription, config_path},
     github_release::{GitHubRelease, get_release_for_channel, resolve_expected_digest},
-    installer::{MANAGED_DIR, download_to_managed_dir},
+    installer::{MANAGED_DIR, cleanup_self_old, download_self, download_to_managed_dir},
     loader::init_managed,
     reconcile,
 };
@@ -73,6 +73,8 @@ impl Component for Updater {
 }
 
 async fn run_initial_pass() -> Result<()> {
+    cleanup_self_old();
+    ensure_self_subscription().await;
     run_reconcile_and_warn().await;
 
     let subs = Config::load()?.subscriptions;
@@ -203,7 +205,12 @@ async fn run_initial_pass() -> Result<()> {
             }
         };
 
-        match download_to_managed_dir(asset, expected_digest.as_deref()).await {
+        let install_result = if sub.is_self() {
+            download_self(asset, expected_digest.as_deref()).await
+        } else {
+            download_to_managed_dir(asset, expected_digest.as_deref()).await
+        };
+        match install_result {
             Ok(path) => {
                 installed.push((
                     sub.owner.clone(),
@@ -212,16 +219,28 @@ async fn run_initial_pass() -> Result<()> {
                     asset.name.clone(),
                     release.published_at,
                 ));
-                print_async(format!(
-                    "{}Installed {}{} {}-> {}{}",
-                    color::PINK,
-                    color::GREEN,
-                    release.tag_name,
-                    color::PINK,
-                    color::YELLOW,
-                    path.display(),
-                ))
-                .await;
+                if sub.is_self() {
+                    print_async(format!(
+                        "{}Plugin updater updated to {}{}{} — restart ClassiCube to use the new \
+                         version",
+                        color::PINK,
+                        color::GREEN,
+                        release.tag_name,
+                        color::PINK,
+                    ))
+                    .await;
+                } else {
+                    print_async(format!(
+                        "{}Installed {}{} {}-> {}{}",
+                        color::PINK,
+                        color::GREEN,
+                        release.tag_name,
+                        color::PINK,
+                        color::YELLOW,
+                        path.display(),
+                    ))
+                    .await;
+                }
             }
             Err(e) => {
                 error!("installing {}/{}: {e:#}", sub.owner, sub.repo);
@@ -251,6 +270,24 @@ async fn run_initial_pass() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn ensure_self_subscription() {
+    let mut cfg = match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("loading config to ensure self subscription: {e:#}");
+            return;
+        }
+    };
+    if !cfg.ensure_self() {
+        return;
+    }
+    if let Err(e) = cfg.save() {
+        warn!("saving config after ensure_self: {e:#}");
+    } else {
+        debug!("auto-added self subscription to config");
+    }
 }
 
 async fn run_reconcile_and_warn() {

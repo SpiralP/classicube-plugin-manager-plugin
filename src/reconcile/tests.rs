@@ -3,7 +3,7 @@ use std::fs;
 use tempfile::tempdir;
 
 use super::*;
-use crate::config::{Channel, Subscription};
+use crate::config::{Channel, SELF_OWNER, SELF_REPO, Subscription};
 
 fn sub(owner: &str, repo: &str) -> Subscription {
     Subscription {
@@ -353,6 +353,46 @@ fn every_sub_missing_disables_all_and_reports_all() {
             .subscriptions
             .iter()
             .all(|s| s.installed_asset.is_none() && s.installed_version.is_none())
+    );
+}
+
+#[test]
+fn self_subscription_is_skipped() {
+    // The self subscription installs into plugins/, not plugins/managed/, so
+    // reconcile must not flag it as missing or clear its installed fields.
+    let dir = tempdir().unwrap();
+    let cfg_path = dir.path().join("c.toml");
+    let managed = dir.path().join("managed");
+    fs::create_dir(&managed).unwrap();
+
+    let original = Subscription {
+        installed_version: Some("v1.0.0".into()),
+        installed_asset: Some("plugin_updater.so".into()),
+        installed_at: Some(1_700_000_000),
+        ..sub(SELF_OWNER, SELF_REPO)
+    };
+    write_config(
+        &cfg_path,
+        &Config {
+            subscriptions: vec![original.clone()],
+        },
+    );
+    let mtime_before = fs::metadata(&cfg_path).unwrap().modified().unwrap();
+
+    let report = reconcile(&cfg_path, &managed).unwrap();
+
+    assert!(
+        report.missing.is_empty(),
+        "self should not be flagged missing: {:?}",
+        report.missing
+    );
+    assert!(report.orphans.is_empty());
+    let after = Config::load_from(&cfg_path).unwrap();
+    assert_eq!(after.subscriptions, vec![original]);
+    let mtime_after = fs::metadata(&cfg_path).unwrap().modified().unwrap();
+    assert_eq!(
+        mtime_before, mtime_after,
+        "config must not be rewritten when only the self sub would have triggered it"
     );
 }
 

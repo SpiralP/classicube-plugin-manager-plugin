@@ -35,6 +35,11 @@ pub fn init_managed(subs: &[Subscription]) {
         if sub.disabled {
             continue;
         }
+        // The self subscription lives in plugins/, not plugins/managed/, and
+        // is already loaded by the game — dlopen'ing it here would double-load.
+        if sub.is_self() {
+            continue;
+        }
         let Some(asset) = sub.installed_asset.as_deref() else {
             continue;
         };
