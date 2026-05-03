@@ -6,7 +6,7 @@ mod tests;
 use std::{
     cell::RefCell,
     io,
-    os::raw::c_void,
+    os::raw::{c_int, c_void},
     path::{Path, PathBuf},
 };
 
@@ -16,6 +16,7 @@ use tracing::{debug, error, warn};
 
 use crate::{
     chat::print_wrapped,
+    component::Plugin_ApiVersion,
     config::Subscription,
     installer::{MANAGED_DIR, PLUGINS_DIR},
 };
@@ -56,16 +57,46 @@ pub fn init_managed(subs: &[Subscription]) {
         let path = Path::new(MANAGED_DIR).join(asset);
         let path_str = path.to_string_lossy().into_owned();
         match plugin::try_load(&path_str) {
-            Ok((library, component)) => {
-                LOADED.with_borrow_mut(|loaded| {
-                    loaded.push(LoadedPlugin {
-                        id: id.clone(),
-                        library,
-                        component,
-                    });
-                });
-                debug!("loaded {id} from {path_str}");
-                run_init_sequence(component, &id);
+            Ok((library, component, api_version)) => {
+                match check_api_version(Plugin_ApiVersion, api_version) {
+                    ApiVersionCheck::Ok => {
+                        LOADED.with_borrow_mut(|loaded| {
+                            loaded.push(LoadedPlugin {
+                                id: id.clone(),
+                                library,
+                                component,
+                            });
+                        });
+                        debug!("loaded {id} from {path_str}");
+                        run_init_sequence(component, &id);
+                    }
+                    ApiVersionCheck::PluginOutdated => {
+                        warn!(
+                            "{id} has Plugin_ApiVersion {api_version}, host expects \
+                             {Plugin_ApiVersion}; refusing to load"
+                        );
+                        print_wrapped(format!(
+                            "{}{}{}{} plugin is outdated! Try getting a more recent version",
+                            color::RED,
+                            color::LIME,
+                            id,
+                            color::RED,
+                        ));
+                    }
+                    ApiVersionCheck::HostOutdated => {
+                        warn!(
+                            "{id} has Plugin_ApiVersion {api_version}, host expects \
+                             {Plugin_ApiVersion}; refusing to load"
+                        );
+                        print_wrapped(format!(
+                            "{}Your game is too outdated to use {}{}{} plugin! Try updating it",
+                            color::RED,
+                            color::LIME,
+                            id,
+                            color::RED,
+                        ));
+                    }
+                }
             }
             Err(e) => {
                 error!("loading {id} from {path_str}: {e:#}");
@@ -79,6 +110,23 @@ pub fn init_managed(subs: &[Subscription]) {
                 ));
             }
         }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ApiVersionCheck {
+    Ok,
+    PluginOutdated,
+    HostOutdated,
+}
+
+fn check_api_version(host: c_int, plugin: c_int) -> ApiVersionCheck {
+    if plugin < host {
+        ApiVersionCheck::PluginOutdated
+    } else if plugin > host {
+        ApiVersionCheck::HostOutdated
+    } else {
+        ApiVersionCheck::Ok
     }
 }
 

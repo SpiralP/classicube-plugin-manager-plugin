@@ -2,7 +2,7 @@ use std::fs;
 
 use tempfile::tempdir;
 
-use super::detect_collision_in;
+use super::{ApiVersionCheck, check_api_version, detect_collision_in};
 
 #[test]
 fn missing_dir_returns_none() {
@@ -38,4 +38,19 @@ fn directory_with_same_name_does_not_collide() {
     fs::create_dir(dir.path().join("plugin.so")).unwrap();
     let result = detect_collision_in(dir.path(), "plugin.so").unwrap();
     assert!(result.is_none());
+}
+
+#[test]
+fn api_version_equal_is_ok() {
+    assert_eq!(check_api_version(1, 1), ApiVersionCheck::Ok);
+}
+
+#[test]
+fn api_version_plugin_lower_is_outdated() {
+    assert_eq!(check_api_version(2, 1), ApiVersionCheck::PluginOutdated);
+}
+
+#[test]
+fn api_version_plugin_higher_means_host_outdated() {
+    assert_eq!(check_api_version(1, 2), ApiVersionCheck::HostOutdated);
 }
