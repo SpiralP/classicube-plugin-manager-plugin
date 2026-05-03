@@ -1,4 +1,7 @@
-use std::{ffi::CString, os::raw::c_void};
+use std::{
+    ffi::CString,
+    os::raw::{c_int, c_void},
+};
 
 use anyhow::{Result, bail};
 use classicube_helpers::time;
@@ -39,13 +42,15 @@ fn dll_get(library: *mut c_void, symbol_name: &str) -> Result<*mut c_void> {
     Ok(ptr)
 }
 
-pub fn try_load(path: &str) -> Result<(*mut c_void, *mut IGameComponent)> {
+pub fn try_load(path: &str) -> Result<(*mut c_void, *mut IGameComponent, c_int)> {
     let library = time!("dll_load", 5000, {
         debug!("dll_load {path}");
         dll_load(path)?
     });
+    let api_version_ptr = dll_get(library, "Plugin_ApiVersion")? as *const c_int;
+    let api_version = unsafe { *api_version_ptr };
     let plugin_component = dll_get(library, "Plugin_Component")? as *mut IGameComponent;
-    Ok((library, plugin_component))
+    Ok((library, plugin_component, api_version))
 }
 
 // classicube-sys exposes no `DynamicLib_Unload`; the library stays mapped
