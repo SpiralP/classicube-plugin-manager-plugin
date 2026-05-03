@@ -4,7 +4,7 @@ mod tests;
 use std::{fs, io, path::Path, str::FromStr};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 
 const CONFIG_PATH: &str = "plugins/plugin-updater.toml";
 
@@ -91,7 +91,7 @@ impl Serialize for Channel {
 impl<'de> Deserialize<'de> for Channel {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
-        Channel::from_str(&s).map_err(serde::de::Error::custom)
+        Channel::from_str(&s).map_err(DeError::custom)
     }
 }
 

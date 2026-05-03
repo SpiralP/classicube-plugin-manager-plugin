@@ -3,6 +3,7 @@ mod tests;
 
 use std::{
     cell::Cell,
+    env,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -12,12 +13,14 @@ use classicube_helpers::{async_manager, color};
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    asset_match,
+    asset_match::pick_asset,
     chat::print_async,
     component::Component,
-    config::{self, Config, Subscription},
-    github_release::{self, GitHubRelease},
-    installer, loader, reconcile,
+    config::{Config, Subscription, config_path},
+    github_release::{GitHubRelease, get_release_for_channel, resolve_expected_digest},
+    installer::{MANAGED_DIR, download_to_managed_dir},
+    loader::init_managed,
+    reconcile,
 };
 
 const TTL_SECS: u64 = 60 * 60;
@@ -63,7 +66,7 @@ impl Component for Updater {
                 }
             };
             async_manager::spawn_on_main_thread(async move {
-                loader::init_managed(&subs);
+                init_managed(&subs);
             });
         });
     }
@@ -126,34 +129,26 @@ async fn run_initial_pass() -> Result<()> {
 
         let release = match release_in_hand.take() {
             Some(r) => r,
-            None => {
-                match github_release::get_release_for_channel(&sub.owner, &sub.repo, &sub.channel)
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!("fetching release for {}/{}: {e:#}", sub.owner, sub.repo);
-                        print_async(format!(
-                            "{}Failed to fetch release for {}{}/{}{}: {}{e}",
-                            color::RED,
-                            color::LIME,
-                            sub.owner,
-                            sub.repo,
-                            color::RED,
-                            color::WHITE,
-                        ))
-                        .await;
-                        continue;
-                    }
+            None => match get_release_for_channel(&sub.owner, &sub.repo, &sub.channel).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("fetching release for {}/{}: {e:#}", sub.owner, sub.repo);
+                    print_async(format!(
+                        "{}Failed to fetch release for {}{}/{}{}: {}{e}",
+                        color::RED,
+                        color::LIME,
+                        sub.owner,
+                        sub.repo,
+                        color::RED,
+                        color::WHITE,
+                    ))
+                    .await;
+                    continue;
                 }
-            }
+            },
         };
 
-        let asset = match asset_match::pick_asset(
-            &release.assets,
-            std::env::consts::ARCH,
-            std::env::consts::DLL_SUFFIX,
-        ) {
+        let asset = match pick_asset(&release.assets, env::consts::ARCH, env::consts::DLL_SUFFIX) {
             Ok(a) => a,
             Err(e) => {
                 warn!("asset match {}/{}: {e:#}", sub.owner, sub.repo);
@@ -187,7 +182,7 @@ async fn run_initial_pass() -> Result<()> {
         ))
         .await;
 
-        let expected_digest = match github_release::resolve_expected_digest(asset) {
+        let expected_digest = match resolve_expected_digest(asset) {
             Ok(d) => d,
             Err(e) => {
                 warn!(
@@ -208,7 +203,7 @@ async fn run_initial_pass() -> Result<()> {
             }
         };
 
-        match installer::download_to_managed_dir(asset, expected_digest.as_deref()).await {
+        match download_to_managed_dir(asset, expected_digest.as_deref()).await {
             Ok(path) => {
                 installed.push((
                     sub.owner.clone(),
@@ -259,20 +254,19 @@ async fn run_initial_pass() -> Result<()> {
 }
 
 async fn run_reconcile_and_warn() {
-    let report =
-        match reconcile::reconcile(config::config_path(), Path::new(installer::MANAGED_DIR)) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("reconcile failed: {e:#}");
-                print_async(format!(
-                    "{}Reconcile failed: {}{e}",
-                    color::RED,
-                    color::WHITE,
-                ))
-                .await;
-                return;
-            }
-        };
+    let report = match reconcile::reconcile(config_path(), Path::new(MANAGED_DIR)) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("reconcile failed: {e:#}");
+            print_async(format!(
+                "{}Reconcile failed: {}{e}",
+                color::RED,
+                color::WHITE,
+            ))
+            .await;
+            return;
+        }
+    };
     for missing in &report.missing {
         warn!(
             "missing managed file for {}/{}: {} (sub disabled)",
@@ -292,12 +286,12 @@ async fn run_reconcile_and_warn() {
         .await;
     }
     for name in &report.orphans {
-        warn!("orphan in {}: {name}", installer::MANAGED_DIR);
+        warn!("orphan in {}: {name}", MANAGED_DIR);
         print_async(format!(
             "{}Orphan in {}{}{}: {}{}{} (no subscription claims this)",
             color::YELLOW,
             color::LIME,
-            installer::MANAGED_DIR,
+            MANAGED_DIR,
             color::YELLOW,
             color::LIME,
             name,
@@ -334,8 +328,7 @@ async fn resolve_latest_release(
         debug!("{}/{} served from cache ({tag})", sub.owner, sub.repo);
         return Ok((tag.to_owned(), pub_at, None));
     }
-    let release =
-        github_release::get_release_for_channel(&sub.owner, &sub.repo, &sub.channel).await?;
+    let release = get_release_for_channel(&sub.owner, &sub.repo, &sub.channel).await?;
     Ok((
         release.tag_name.clone(),
         release.published_at,
@@ -344,7 +337,7 @@ async fn resolve_latest_release(
 }
 
 fn persist_cache_updates(now: u64, updates: Vec<(String, String, String, u64)>) -> Result<()> {
-    persist_cache_updates_to(config::config_path(), now, updates)
+    persist_cache_updates_to(config_path(), now, updates)
 }
 
 fn persist_cache_updates_to(
@@ -374,7 +367,7 @@ pub fn persist_installed_versions(
     now: u64,
     updates: Vec<(String, String, String, String, u64)>,
 ) -> Result<()> {
-    persist_installed_versions_to(config::config_path(), now, updates)
+    persist_installed_versions_to(config_path(), now, updates)
 }
 
 pub fn persist_installed_versions_to(

@@ -1,4 +1,6 @@
-use tempfile::NamedTempFile;
+use std::io::Write;
+
+use tempfile::{NamedTempFile, tempdir};
 
 use super::*;
 
@@ -89,7 +91,7 @@ fn missing_cached_published_at_is_stale() {
 
 #[test]
 fn load_missing_file_yields_default() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let path = dir.path().join("does-not-exist.toml");
     let cfg = Config::load_from(&path).unwrap();
     assert_eq!(cfg, Config::default());
@@ -98,7 +100,7 @@ fn load_missing_file_yields_default() {
 #[test]
 fn load_malformed_file_errors() {
     let mut f = NamedTempFile::new().unwrap();
-    std::io::Write::write_all(&mut f, b"this is not = valid ::: toml [[[").unwrap();
+    f.write_all(b"this is not = valid ::: toml [[[").unwrap();
     let err = Config::load_from(f.path()).unwrap_err();
     let chain = format!("{err:#}");
     assert!(chain.contains("parsing"), "expected 'parsing' in: {chain}");
@@ -177,11 +179,8 @@ fn disabled_round_trip() {
 fn disabled_default_when_missing_from_toml() {
     // Older configs (written before this field existed) must continue to load.
     let mut f = NamedTempFile::new().unwrap();
-    std::io::Write::write_all(
-        &mut f,
-        b"[[subscriptions]]\nowner = \"octocat\"\nrepo = \"hello-world\"\n",
-    )
-    .unwrap();
+    f.write_all(b"[[subscriptions]]\nowner = \"octocat\"\nrepo = \"hello-world\"\n")
+        .unwrap();
     let loaded = Config::load_from(f.path()).unwrap();
     assert_eq!(loaded.subscriptions.len(), 1);
     assert!(!loaded.subscriptions[0].disabled);
@@ -297,11 +296,8 @@ fn channel_round_trips_complex_tag() {
 #[test]
 fn legacy_subscription_without_channel_loads_as_stable() {
     let mut f = NamedTempFile::new().unwrap();
-    std::io::Write::write_all(
-        &mut f,
-        b"[[subscriptions]]\nowner = \"octocat\"\nrepo = \"hello-world\"\n",
-    )
-    .unwrap();
+    f.write_all(b"[[subscriptions]]\nowner = \"octocat\"\nrepo = \"hello-world\"\n")
+        .unwrap();
     let loaded = Config::load_from(f.path()).unwrap();
     assert_eq!(loaded.subscriptions[0].channel, Channel::Stable);
 }
@@ -312,8 +308,7 @@ fn legacy_config_without_timestamps_loads() {
     // installed_at / cached_published_at. Loading must still succeed; the
     // missing fields default to None and trigger a reinstall on next check.
     let mut f = NamedTempFile::new().unwrap();
-    std::io::Write::write_all(
-        &mut f,
+    f.write_all(
         b"[[subscriptions]]
 owner = \"octocat\"
 repo = \"hello-world\"
