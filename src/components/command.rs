@@ -17,7 +17,7 @@ use crate::{
     chat::{print_async, print_wrapped},
     component::Component,
     components::updater::persist_installed_versions,
-    config::{Config, Subscription},
+    config::{Channel, Config, Subscription},
     github_release, installer,
 };
 
@@ -84,13 +84,56 @@ fn find_subscription_index(config: &Config, candidates: &[(String, String)]) -> 
 }
 
 const USAGE_LINES: &[&str] = &[
-    "&a/client Updater subscribe <owner>/<repo>",
+    "&a/client Updater subscribe <owner>/<repo> [stable|prerelease|tag <ref>]",
     "&a/client Updater unsubscribe <owner>/<repo>",
+    "&a/client Updater channel <owner>/<repo> stable|prerelease|tag <ref>",
     "&a/client Updater disable <owner>/<repo>",
     "&a/client Updater enable <owner>/<repo>",
     "&a/client Updater list",
     "&a/client Updater update [<owner>/<repo>]",
 ];
+
+/// Parse the trailing channel arguments after `<owner>/<repo>`.
+///
+/// Accepted forms (CLI):
+/// - `[]`            → `Channel::Stable` (default for `/subscribe`)
+/// - `["stable"]`    → `Channel::Stable`
+/// - `["prerelease"]`→ `Channel::Prerelease`
+/// - `["tag", ref]`  → `Channel::Tag(ref)` (preferred CLI form)
+/// - `["tag:ref"]`   → `Channel::Tag(ref)` (TOML form, also accepted)
+fn parse_channel_args(args: &[&str]) -> Result<Channel, String> {
+    match args {
+        [] => Ok(Channel::Stable),
+        ["tag", t] => Channel::from_tag(t),
+        [single] => single.parse(),
+        _ => Err(format!(
+            "expected stable, prerelease, or tag <ref>; got: {}",
+            args.join(" ")
+        )),
+    }
+}
+
+/// Switch a subscription to a new channel and invalidate its cached release
+/// fields. The cache lives per-subscription, so without clearing it a stale
+/// stable lookup could mask a prerelease (or vice-versa) until the TTL
+/// expires. Installed-state fields (`installed_*`) are deliberately untouched
+/// — those describe what's on disk, not what's on GitHub.
+fn apply_channel_switch(sub: &mut Subscription, new: Channel) {
+    sub.channel = new;
+    sub.cached_tag = None;
+    sub.cached_at = None;
+    sub.cached_published_at = None;
+}
+
+/// Suffix to append after `owner/repo` in chat output when the channel is
+/// non-default. Returns an empty string for `Channel::Stable`.
+fn channel_suffix(channel: &Channel) -> String {
+    if channel.is_default() {
+        String::new()
+    } else {
+        format!(" {}({})", color::PINK, channel.pretty())
+    }
+}
 
 fn print_usage() {
     print_wrapped(format!("{}Usage:", color::YELLOW));
@@ -119,7 +162,7 @@ async fn print_save_error(e: &anyhow::Error) {
     .await;
 }
 
-fn handle_subscribe(spec: &str) {
+fn handle_subscribe(spec: &str, channel: Channel) {
     let Some(candidates) = expand_candidates(spec) else {
         print_wrapped(format!("{}Expected owner/repo, got: {spec}", color::RED));
         return;
@@ -138,11 +181,15 @@ fn handle_subscribe(spec: &str) {
         if let Some(idx) = find_subscription_index(&config, &candidates) {
             let existing = &config.subscriptions[idx];
             print_async(format!(
-                "{}Already subscribed to {}{}/{}",
+                "{}Already subscribed to {}{}/{} {}(use {}/client Updater channel{} to switch \
+                 channels)",
                 color::YELLOW,
                 color::LIME,
                 existing.owner,
                 existing.repo,
+                color::YELLOW,
+                color::LIME,
+                color::YELLOW,
             ))
             .await;
             return;
@@ -154,7 +201,7 @@ fn handle_subscribe(spec: &str) {
         let (owner, repo) = if candidates.len() == 1 {
             candidates.into_iter().next().unwrap()
         } else {
-            match resolve_canonical(&candidates).await {
+            match resolve_canonical(&candidates, &channel).await {
                 Ok(pair) => pair,
                 Err(e) => {
                     print_async(format!(
@@ -174,6 +221,7 @@ fn handle_subscribe(spec: &str) {
         config.subscriptions.push(Subscription {
             owner: owner.clone(),
             repo: repo.clone(),
+            channel: channel.clone(),
             disabled: false,
             installed_version: None,
             installed_asset: None,
@@ -187,23 +235,28 @@ fn handle_subscribe(spec: &str) {
             return;
         }
         print_async(format!(
-            "{}Subscribed to {}{}/{}",
+            "{}Subscribed to {}{}/{}{}",
             color::PINK,
             color::LIME,
             owner,
             repo,
+            channel_suffix(&channel),
         ))
         .await;
     });
 }
 
 /// Probe each candidate against the GitHub API and OS asset filter; return
-/// the first `(owner, repo)` whose latest release has a matching asset for
-/// our platform. Errors aggregate the per-candidate failure messages.
-async fn resolve_canonical(candidates: &[(String, String)]) -> anyhow::Result<(String, String)> {
+/// the first `(owner, repo)` whose release for `channel` has a matching
+/// asset for our platform. Errors aggregate the per-candidate failure
+/// messages.
+async fn resolve_canonical(
+    candidates: &[(String, String)],
+    channel: &Channel,
+) -> anyhow::Result<(String, String)> {
     let mut errors: Vec<String> = Vec::new();
     for (owner, repo) in candidates {
-        match probe_release(owner, repo).await {
+        match probe_release(owner, repo, channel).await {
             Ok(()) => return Ok((owner.clone(), repo.clone())),
             Err(e) => errors.push(format!("{owner}/{repo}: {e}")),
         }
@@ -211,8 +264,8 @@ async fn resolve_canonical(candidates: &[(String, String)]) -> anyhow::Result<(S
     anyhow::bail!("{}", errors.join("; "));
 }
 
-async fn probe_release(owner: &str, repo: &str) -> anyhow::Result<()> {
-    let release = github_release::get_latest_release(owner, repo).await?;
+async fn probe_release(owner: &str, repo: &str, channel: &Channel) -> anyhow::Result<()> {
+    let release = github_release::get_release_for_channel(owner, repo, channel).await?;
     asset_match::pick_asset(
         &release.assets,
         std::env::consts::ARCH,
@@ -259,6 +312,69 @@ fn handle_unsubscribe(spec: &str) {
             color::LIME,
             removed.owner,
             removed.repo,
+        ))
+        .await;
+    });
+}
+
+fn handle_channel(spec: &str, channel: Channel) {
+    let Some(candidates) = expand_candidates(spec) else {
+        print_wrapped(format!("{}Expected owner/repo, got: {spec}", color::RED));
+        return;
+    };
+    let spec = spec.to_string();
+
+    async_manager::spawn(async move {
+        let mut config = match Config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                print_load_error(&e).await;
+                return;
+            }
+        };
+
+        let Some(idx) = find_subscription_index(&config, &candidates) else {
+            print_async(format!(
+                "{}Not subscribed to {}{}",
+                color::YELLOW,
+                color::LIME,
+                spec,
+            ))
+            .await;
+            return;
+        };
+
+        let sub = &mut config.subscriptions[idx];
+        if sub.channel == channel {
+            print_async(format!(
+                "{}{}/{} {}already on channel {}{}",
+                color::LIME,
+                sub.owner,
+                sub.repo,
+                color::YELLOW,
+                color::PINK,
+                channel.pretty(),
+            ))
+            .await;
+            return;
+        }
+        apply_channel_switch(sub, channel.clone());
+        let owner = sub.owner.clone();
+        let repo = sub.repo.clone();
+
+        if let Err(e) = config.save() {
+            print_save_error(&e).await;
+            return;
+        }
+        print_async(format!(
+            "{}Channel for {}{}/{} {}set to {}{}",
+            color::PINK,
+            color::LIME,
+            owner,
+            repo,
+            color::PINK,
+            color::YELLOW,
+            channel.pretty(),
         ))
         .await;
     });
@@ -351,24 +467,20 @@ fn handle_list() {
         ))
         .await;
         for sub in &config.subscriptions {
-            let suffix = if sub.disabled {
-                format!(" {}[disabled]", color::RED)
-            } else {
-                String::new()
-            };
-            let line = match &sub.installed_version {
-                Some(v) => format!(
-                    "  {}{}/{} {}(installed: {}{}{}){suffix}",
-                    color::LIME,
-                    sub.owner,
-                    sub.repo,
+            let mut line = format!("  {}{}/{}", color::LIME, sub.owner, sub.repo);
+            if let Some(v) = &sub.installed_version {
+                line.push_str(&format!(
+                    " {}(installed: {}{}{})",
                     color::PINK,
                     color::YELLOW,
                     v,
                     color::PINK,
-                ),
-                None => format!("  {}{}/{}{suffix}", color::LIME, sub.owner, sub.repo,),
-            };
+                ));
+            }
+            line.push_str(&channel_suffix(&sub.channel));
+            if sub.disabled {
+                line.push_str(&format!(" {}[disabled]", color::RED));
+            }
             print_async(line).await;
         }
     });
@@ -422,7 +534,7 @@ fn handle_update_one(spec: &str) {
             return;
         }
 
-        spawn_update_task(sub.owner.clone(), sub.repo.clone());
+        spawn_update_task(sub.owner.clone(), sub.repo.clone(), sub.channel.clone());
     });
 }
 
@@ -436,7 +548,7 @@ fn handle_update_all() {
             }
         };
 
-        let stale: Vec<(String, String)> = config
+        let stale: Vec<(String, String, Channel)> = config
             .subscriptions
             .iter()
             .filter(|s| !s.disabled)
@@ -444,7 +556,7 @@ fn handle_update_all() {
                 (Some(installed_at), Some(latest_pub_at)) => latest_pub_at > installed_at,
                 _ => true,
             })
-            .map(|s| (s.owner.clone(), s.repo.clone()))
+            .map(|s| (s.owner.clone(), s.repo.clone(), s.channel.clone()))
             .collect();
 
         if stale.is_empty() {
@@ -460,15 +572,15 @@ fn handle_update_all() {
             color::PINK,
         ))
         .await;
-        for (owner, repo) in stale {
-            spawn_update_task(owner, repo);
+        for (owner, repo, channel) in stale {
+            spawn_update_task(owner, repo, channel);
         }
     });
 }
 
-fn spawn_update_task(owner: String, repo: String) {
+fn spawn_update_task(owner: String, repo: String, channel: Channel) {
     async_manager::spawn(async move {
-        if let Err(e) = run_update(&owner, &repo).await {
+        if let Err(e) = run_update(&owner, &repo, &channel).await {
             error!("update {}/{}: {e:#}", owner, repo);
             print_async(format!(
                 "{}Update {}{}/{}{} failed: {}{e}",
@@ -484,7 +596,7 @@ fn spawn_update_task(owner: String, repo: String) {
     });
 }
 
-async fn run_update(owner: &str, repo: &str) -> anyhow::Result<()> {
+async fn run_update(owner: &str, repo: &str, channel: &Channel) -> anyhow::Result<()> {
     print_async(format!(
         "{}Checking {}{}/{}{} for latest release...",
         color::PINK,
@@ -495,7 +607,7 @@ async fn run_update(owner: &str, repo: &str) -> anyhow::Result<()> {
     ))
     .await;
 
-    let release = github_release::get_latest_release(owner, repo).await?;
+    let release = github_release::get_release_for_channel(owner, repo, channel).await?;
     let asset = asset_match::pick_asset(
         &release.assets,
         std::env::consts::ARCH,
@@ -561,8 +673,21 @@ extern "C" fn c_callback(args: *const cc_string, args_count: c_int) {
     let args: Vec<&str> = args.iter().map(AsRef::as_ref).collect();
 
     match args.as_slice() {
-        ["subscribe", spec] => handle_subscribe(spec),
+        ["subscribe", spec, channel_args @ ..] => match parse_channel_args(channel_args) {
+            Ok(c) => handle_subscribe(spec, c),
+            Err(e) => print_wrapped(format!("{}{e}", color::RED)),
+        },
         ["unsubscribe", spec] => handle_unsubscribe(spec),
+        ["channel", spec, channel_args @ ..] => {
+            if channel_args.is_empty() {
+                print_usage();
+            } else {
+                match parse_channel_args(channel_args) {
+                    Ok(c) => handle_channel(spec, c),
+                    Err(e) => print_wrapped(format!("{}{e}", color::RED)),
+                }
+            }
+        }
         ["disable", spec] => set_disabled(spec, true),
         ["enable", spec] => set_disabled(spec, false),
         ["list"] => handle_list(),

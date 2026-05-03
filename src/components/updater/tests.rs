@@ -46,6 +46,7 @@ fn sub(owner: &str, repo: &str) -> Subscription {
     Subscription {
         owner: owner.into(),
         repo: repo.into(),
+        channel: crate::config::Channel::default(),
         disabled: false,
         installed_version: None,
         installed_asset: None,

@@ -4,6 +4,7 @@ fn sub(owner: &str, repo: &str) -> Subscription {
     Subscription {
         owner: owner.into(),
         repo: repo.into(),
+        channel: crate::config::Channel::default(),
         disabled: false,
         installed_version: None,
         installed_asset: None,
@@ -174,6 +175,97 @@ fn find_subscription_case_insensitive() {
     };
     let candidates = vec![("spiralp".into(), "CLASSICUBE-FOO-PLUGIN".into())];
     assert_eq!(find_subscription_index(&config, &candidates), Some(0));
+}
+
+#[test]
+fn parse_channel_args_empty_is_stable() {
+    assert_eq!(parse_channel_args(&[]), Ok(Channel::Stable));
+}
+
+#[test]
+fn parse_channel_args_named_variants() {
+    assert_eq!(parse_channel_args(&["stable"]), Ok(Channel::Stable));
+    assert_eq!(parse_channel_args(&["prerelease"]), Ok(Channel::Prerelease));
+}
+
+#[test]
+fn parse_channel_args_two_arg_tag_form() {
+    assert_eq!(
+        parse_channel_args(&["tag", "v1.2.3"]),
+        Ok(Channel::Tag("v1.2.3".into())),
+    );
+}
+
+#[test]
+fn parse_channel_args_colon_tag_form() {
+    assert_eq!(
+        parse_channel_args(&["tag:v1.2.3"]),
+        Ok(Channel::Tag("v1.2.3".into())),
+    );
+}
+
+#[test]
+fn parse_channel_args_rejects_empty_tag() {
+    assert!(parse_channel_args(&["tag", ""]).is_err());
+    assert!(parse_channel_args(&["tag:"]).is_err());
+}
+
+#[test]
+fn parse_channel_args_rejects_unknown_keyword() {
+    assert!(parse_channel_args(&["nightly"]).is_err());
+}
+
+#[test]
+fn parse_channel_args_rejects_bare_tag() {
+    // A bare `tag` with no ref falls into the single-arg branch and fails to
+    // parse — it's neither "stable", "prerelease", nor a "tag:" prefix.
+    assert!(parse_channel_args(&["tag"]).is_err());
+}
+
+#[test]
+fn apply_channel_switch_clears_cache_fields() {
+    let mut s = Subscription {
+        channel: Channel::Stable,
+        cached_tag: Some("v1.0.0".into()),
+        cached_at: Some(100),
+        cached_published_at: Some(50),
+        ..sub("a", "b")
+    };
+    apply_channel_switch(&mut s, Channel::Prerelease);
+    assert_eq!(s.channel, Channel::Prerelease);
+    assert!(s.cached_tag.is_none());
+    assert!(s.cached_at.is_none());
+    assert!(s.cached_published_at.is_none());
+}
+
+#[test]
+fn apply_channel_switch_preserves_installed_state() {
+    // installed_* describes what's on disk, which doesn't change just because
+    // the user pointed the subscription at a different channel.
+    let mut s = Subscription {
+        channel: Channel::Stable,
+        installed_version: Some("v1.0.0".into()),
+        installed_asset: Some("a.so".into()),
+        installed_at: Some(500),
+        ..sub("a", "b")
+    };
+    apply_channel_switch(&mut s, Channel::Tag("v2.0.0".into()));
+    assert_eq!(s.installed_version.as_deref(), Some("v1.0.0"));
+    assert_eq!(s.installed_asset.as_deref(), Some("a.so"));
+    assert_eq!(s.installed_at, Some(500));
+}
+
+#[test]
+fn parse_channel_args_rejects_extra_args() {
+    assert!(parse_channel_args(&["stable", "extra"]).is_err());
+    assert!(parse_channel_args(&["tag", "v1", "extra"]).is_err());
+}
+
+#[test]
+fn channel_suffix_skips_default() {
+    assert_eq!(channel_suffix(&Channel::Stable), "");
+    assert!(channel_suffix(&Channel::Prerelease).contains("prerelease"));
+    assert!(channel_suffix(&Channel::Tag("v1".into())).contains("tag: v1"));
 }
 
 #[test]
