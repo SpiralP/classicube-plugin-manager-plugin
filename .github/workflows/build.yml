@@ -133,8 +133,6 @@ jobs:
           path: classicube_plugin_updater_linux_${{ matrix.config.arch }}.so
 
   mac:
-    # !!! disabled!
-    if: false
     name: Build MacOS ${{ matrix.config.arch }}
     runs-on: macos-15
     strategy:
@@ -143,8 +141,8 @@ jobs:
         config:
           - arch: aarch64
             target: aarch64-apple-darwin
-          - arch: x86_64
-            target: x86_64-apple-darwin
+          # - arch: x86_64
+          #   target: x86_64-apple-darwin
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
