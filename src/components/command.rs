@@ -143,6 +143,8 @@ const USAGE_LINES: &[&str] = &[
     "&a/client Updater channel <owner>/<repo> stable|prerelease|tag <ref>",
     "&a/client Updater disable <owner>/<repo>",
     "&a/client Updater enable <owner>/<repo>",
+    "&a/client Updater pause <owner>/<repo>",
+    "&a/client Updater unpause <owner>/<repo>",
     "&a/client Updater list",
     "&a/client Updater update [<owner>/<repo>]",
     "&a/client Updater discover [<search>]",
@@ -178,6 +180,19 @@ fn apply_channel_switch(sub: &mut Subscription, new: Channel) {
     sub.state.cached_tag = None;
     sub.state.cached_at = None;
     sub.state.cached_published_at = None;
+}
+
+/// Decide which `Channel::Tag` value to switch to when `/pause` is invoked.
+/// Returns the pinned channel on success, or a chat-ready reason for refusing
+/// (no installed version yet, or the subscription is already pinned).
+fn pause_target(sub: &Subscription) -> Result<Channel, String> {
+    if let Channel::Tag(v) = &sub.channel {
+        return Err(format!("already paused on tag: {v}"));
+    }
+    let Some(v) = sub.state.installed_version.clone() else {
+        return Err("no installed version; run /client Updater update <spec> first".into());
+    };
+    Ok(Channel::Tag(v))
 }
 
 /// Suffix to append after `owner/repo` in chat output when the channel is
@@ -482,6 +497,128 @@ fn set_disabled(spec: &str, disabled: bool) {
     });
 }
 
+fn handle_pause(spec: &str) {
+    let Some(candidates) = expand_candidates(spec) else {
+        print_wrapped(format!("{}Expected owner/repo, got: {spec}", color::RED));
+        return;
+    };
+    let spec = spec.to_string();
+
+    async_manager::spawn(async move {
+        let mut config = match Config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                print_load_error(&e).await;
+                return;
+            }
+        };
+
+        let Some((owner, repo, sub)) = find_subscription_mut(&mut config, &candidates) else {
+            print_async(format!(
+                "{}Not subscribed to {}{}",
+                color::YELLOW,
+                color::LIME,
+                spec,
+            ))
+            .await;
+            return;
+        };
+
+        let target = match pause_target(sub) {
+            Ok(c) => c,
+            Err(e) => {
+                print_async(format!(
+                    "{}Cannot pause {}{owner}/{repo}{}: {}{e}",
+                    color::YELLOW,
+                    color::LIME,
+                    color::YELLOW,
+                    color::WHITE,
+                ))
+                .await;
+                return;
+            }
+        };
+        let pinned_tag = match &target {
+            Channel::Tag(t) => t.clone(),
+            _ => unreachable!("pause_target only returns Channel::Tag"),
+        };
+        apply_channel_switch(sub, target);
+
+        if let Err(e) = config.save() {
+            print_save_error(&e).await;
+            return;
+        }
+        print_async(format!(
+            "{}Paused {}{owner}/{repo} {}on tag {}{}",
+            color::PINK,
+            color::LIME,
+            color::PINK,
+            color::YELLOW,
+            pinned_tag,
+        ))
+        .await;
+    });
+}
+
+fn handle_unpause(spec: &str) {
+    let Some(candidates) = expand_candidates(spec) else {
+        print_wrapped(format!("{}Expected owner/repo, got: {spec}", color::RED));
+        return;
+    };
+    let spec = spec.to_string();
+
+    async_manager::spawn(async move {
+        let mut config = match Config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                print_load_error(&e).await;
+                return;
+            }
+        };
+
+        let Some((owner, repo, sub)) = find_subscription_mut(&mut config, &candidates) else {
+            print_async(format!(
+                "{}Not subscribed to {}{}",
+                color::YELLOW,
+                color::LIME,
+                spec,
+            ))
+            .await;
+            return;
+        };
+
+        if !matches!(sub.channel, Channel::Tag(_)) {
+            print_async(format!(
+                "{}{owner}/{repo} {}is not paused (channel: {}{}{})",
+                color::LIME,
+                color::YELLOW,
+                color::PINK,
+                sub.channel.pretty(),
+                color::YELLOW,
+            ))
+            .await;
+            return;
+        }
+        apply_channel_switch(sub, Channel::Stable);
+
+        if let Err(e) = config.save() {
+            print_save_error(&e).await;
+            return;
+        }
+        print_async(format!(
+            "{}Resumed {}{owner}/{repo} {}on stable {}(use {}/client Updater channel{} to switch \
+             to prerelease)",
+            color::PINK,
+            color::LIME,
+            color::PINK,
+            color::YELLOW,
+            color::LIME,
+            color::YELLOW,
+        ))
+        .await;
+    });
+}
+
 fn handle_list() {
     async_manager::spawn(async move {
         let config = match Config::load() {
@@ -753,6 +890,8 @@ extern "C" fn c_callback(args: *const cc_string, args_count: c_int) {
         }
         ["disable", spec] => set_disabled(spec, true),
         ["enable", spec] => set_disabled(spec, false),
+        ["pause", spec] => handle_pause(spec),
+        ["unpause", spec] => handle_unpause(spec),
         ["list"] => handle_list(),
         ["update"] => handle_update_all(),
         ["update", spec] => handle_update_one(spec),
