@@ -9,6 +9,7 @@ fn empty_sub() -> Subscription {
     Subscription {
         channel: Channel::default(),
         disabled: false,
+        token: None,
         state: SubscriptionState::default(),
     }
 }

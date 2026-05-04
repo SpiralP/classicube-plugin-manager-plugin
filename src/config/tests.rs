@@ -416,6 +416,7 @@ fn ensure_self_is_noop_when_present() {
     let prepared = Subscription {
         channel: Channel::Prerelease,
         disabled: true,
+        token: None,
         state: SubscriptionState {
             installed_version: Some("v9.9.9".into()),
             ..SubscriptionState::default()
@@ -525,4 +526,60 @@ fn first_sub_helper_smoke() {
     let (owner, repo, _) = first_sub(&cfg);
     assert_eq!(owner, "a");
     assert_eq!(repo, "b");
+}
+
+#[test]
+fn token_round_trip() {
+    let cfg = one_sub_config(
+        "someorg",
+        "secret-plugin",
+        Subscription {
+            token: Some(Secret::new("github_pat_xyz123".into())),
+            ..sub()
+        },
+    );
+    let f = NamedTempFile::new().unwrap();
+    cfg.save_to(f.path()).unwrap();
+    let on_disk = fs::read_to_string(f.path()).unwrap();
+    assert!(
+        on_disk.contains("token = \"github_pat_xyz123\""),
+        "expected token line in: {on_disk}",
+    );
+    let loaded = Config::load_from(f.path()).unwrap();
+    assert_eq!(loaded, cfg);
+}
+
+#[test]
+fn token_skipped_when_absent() {
+    // A subscription with no token must not emit a `token = ...` line, so
+    // freshly-subscribed entries don't carry a stub field that looks like an
+    // intentional empty-string token.
+    let cfg = one_sub_config("octocat", "hello-world", sub());
+    let f = NamedTempFile::new().unwrap();
+    cfg.save_to(f.path()).unwrap();
+    let on_disk = fs::read_to_string(f.path()).unwrap();
+    assert!(
+        !on_disk.contains("token"),
+        "absent token should not render: {on_disk}",
+    );
+}
+
+#[test]
+fn debug_subscription_redacts_token() {
+    // Subscription derives Debug; the token field's `Secret` newtype must
+    // redact rather than leak the literal PAT into a `tracing` emit or a
+    // panic message somewhere in the call graph.
+    let s = Subscription {
+        token: Some(Secret::new("github_pat_supersecret".into())),
+        ..sub()
+    };
+    let dbg = format!("{s:?}");
+    assert!(
+        !dbg.contains("supersecret"),
+        "token leaked into Debug output: {dbg}",
+    );
+    assert!(
+        dbg.contains("<redacted>"),
+        "expected redaction marker in: {dbg}",
+    );
 }

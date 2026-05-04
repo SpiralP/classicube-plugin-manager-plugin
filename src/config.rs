@@ -6,6 +6,8 @@ use std::{collections::BTreeMap, fs, io, path::Path, str::FromStr};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 
+use crate::secret::Secret;
+
 const CONFIG_PATH: &str = "plugins/plugin-updater.toml";
 
 /// Owner of this plugin's own repo. Used to identify the "self" subscription
@@ -123,6 +125,11 @@ pub struct Subscription {
     pub channel: Channel,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disabled: bool,
+    /// Optional GitHub PAT used for this repo only. When set, attached as
+    /// `Authorization: Bearer …` to release-list and asset-download calls.
+    /// Wrapped in `Secret` so a stray `{:?}` doesn't leak it into logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<Secret>,
     #[serde(default, skip_serializing_if = "SubscriptionState::is_empty")]
     pub state: SubscriptionState,
 }

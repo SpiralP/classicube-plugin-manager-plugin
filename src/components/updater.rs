@@ -21,6 +21,7 @@ use crate::{
     installer::{MANAGED_DIR, cleanup_self_old, download_self, download_to_managed_dir},
     loader::init_managed,
     reconcile,
+    secret::Secret,
 };
 
 const TTL_SECS: u64 = 60 * 60;
@@ -134,7 +135,14 @@ async fn run_initial_pass() -> Result<()> {
 
             let release = match release_in_hand.take() {
                 Some(r) => r,
-                None => match get_release_for_channel(owner, repo, &sub.channel).await {
+                None => match get_release_for_channel(
+                    owner,
+                    repo,
+                    &sub.channel,
+                    sub.token.as_ref().map(Secret::expose),
+                )
+                .await
+                {
                     Ok(r) => r,
                     Err(e) => {
                         warn!("fetching release for {owner}/{repo}: {e:#}");
@@ -199,10 +207,11 @@ async fn run_initial_pass() -> Result<()> {
             };
 
             let is_self = config::is_self(owner, repo);
+            let token = sub.token.as_ref().map(Secret::expose);
             let install_result = if is_self {
-                download_self(asset, expected_digest.as_deref()).await
+                download_self(asset, expected_digest.as_deref(), token).await
             } else {
-                download_to_managed_dir(asset, expected_digest.as_deref()).await
+                download_to_managed_dir(asset, expected_digest.as_deref(), token).await
             };
             match install_result {
                 Ok(path) => {
@@ -360,7 +369,13 @@ async fn resolve_latest_release(
         debug!("{owner}/{repo} served from cache ({tag})");
         return Ok((tag.to_owned(), pub_at, None));
     }
-    let release = get_release_for_channel(owner, repo, &sub.channel).await?;
+    let release = get_release_for_channel(
+        owner,
+        repo,
+        &sub.channel,
+        sub.token.as_ref().map(Secret::expose),
+    )
+    .await?;
     Ok((
         release.tag_name.clone(),
         release.published_at,

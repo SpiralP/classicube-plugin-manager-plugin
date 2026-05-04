@@ -3,9 +3,9 @@ mod tests;
 
 use std::{env, result, time::Duration};
 
-use anyhow::{Error, Result, anyhow, bail};
+use anyhow::{Error, Result, anyhow};
 use reqwest::{
-    Client,
+    Client, StatusCode,
     header::{AUTHORIZATION, HeaderValue},
 };
 use serde::{Deserialize, Deserializer, de::Error as DeError};
@@ -55,38 +55,41 @@ pub struct GitHubReleaseAsset {
 ///   `prerelease` bit because users on this channel want the absolute newest
 ///   release on the timeline regardless of its label.
 /// - `Tag(t)` hits `/releases/tags/{t}` directly.
+///
+/// `token` is the per-subscription PAT; falls back to `GITHUB_TOKEN` env var
+/// when `None`. When neither is set the request goes anonymous (60/hr rate
+/// limit, no access to private repos).
 pub async fn get_release_for_channel(
     owner: &str,
     repo: &str,
     channel: &Channel,
+    token: Option<&str>,
 ) -> Result<GitHubRelease> {
     match channel {
         Channel::Stable => {
             let url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
-            fetch_one(&url).await
+            fetch_one(&url, token).await
         }
-        Channel::Prerelease => fetch_newest_release(owner, repo).await,
+        Channel::Prerelease => fetch_newest_release(owner, repo, token).await,
         Channel::Tag(tag) => {
             let url = format!("https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}");
-            fetch_one(&url).await
+            fetch_one(&url, token).await
         }
     }
 }
 
-async fn fetch_one(url: &str) -> Result<GitHubRelease> {
-    let bytes = send(url).await?;
-    if let Ok(error) = serde_json::from_slice::<GitHubError>(&bytes) {
-        bail!("{}", error.message);
-    }
+async fn fetch_one(url: &str, token: Option<&str>) -> Result<GitHubRelease> {
+    let bytes = send(url, token).await?;
     Ok::<_, Error>(serde_json::from_slice::<GitHubRelease>(&bytes)?)
 }
 
-async fn fetch_newest_release(owner: &str, repo: &str) -> Result<GitHubRelease> {
+async fn fetch_newest_release(
+    owner: &str,
+    repo: &str,
+    token: Option<&str>,
+) -> Result<GitHubRelease> {
     let url = format!("https://api.github.com/repos/{owner}/{repo}/releases?per_page=10");
-    let bytes = send(&url).await?;
-    if let Ok(error) = serde_json::from_slice::<GitHubError>(&bytes) {
-        bail!("{}", error.message);
-    }
+    let bytes = send(&url, token).await?;
     let releases: Vec<GitHubRelease> = serde_json::from_slice(&bytes)?;
     releases
         .into_iter()
@@ -94,14 +97,62 @@ async fn fetch_newest_release(owner: &str, repo: &str) -> Result<GitHubRelease> 
         .ok_or_else(|| anyhow!("no releases found for {owner}/{repo}"))
 }
 
-async fn send(url: &str) -> Result<Vec<u8>> {
+/// Resolve the effective auth token for a request. Per-subscription wins;
+/// `GITHUB_TOKEN` env var is a global fallback. Returns `None` when neither
+/// is set, in which case the request goes anonymous.
+pub(crate) fn resolve_auth_token(per_sub: Option<&str>) -> Option<String> {
+    per_sub
+        .map(str::to_owned)
+        .or_else(|| env::var("GITHUB_TOKEN").ok())
+}
+
+/// Send a GET request and return the body bytes for any 2xx response. Maps
+/// non-success statuses to an `anyhow::Error` whose message is shaped for
+/// chat output — including a hint when an anonymous 404 is likely a private
+/// repo, and when an authed 401/403 likely means a stale token.
+pub(crate) async fn send(url: &str, token: Option<&str>) -> Result<Vec<u8>> {
+    let token = resolve_auth_token(token);
+    let had_token = token.is_some();
+
     let mut request = make_client().get(url);
-    if let Ok(token) = env::var("GITHUB_TOKEN") {
-        let mut header_value = HeaderValue::from_str(&format!("token {token}")).unwrap();
+    if let Some(t) = &token {
+        let mut header_value = HeaderValue::from_str(&format!("Bearer {t}"))
+            .map_err(|e| anyhow!("invalid token characters: {e}"))?;
         header_value.set_sensitive(true);
         request = request.header(AUTHORIZATION, header_value);
     }
-    Ok(request.send().await?.bytes().await?.to_vec())
+
+    let resp = request.send().await?;
+    let status = resp.status();
+    let body = resp.bytes().await?.to_vec();
+
+    if status.is_success() {
+        return Ok(body);
+    }
+    Err(classify_error(status, had_token, &body))
+}
+
+/// Map a non-success GitHub response to a chat-friendly error. Extracted so
+/// it can be unit-tested without spinning up an HTTP server.
+pub(crate) fn classify_error(status: StatusCode, had_token: bool, body: &[u8]) -> Error {
+    let api_msg = serde_json::from_slice::<GitHubError>(body)
+        .ok()
+        .map(|e| e.message);
+
+    match status {
+        StatusCode::NOT_FOUND if !had_token => anyhow!(
+            "not found (if this repo is private, add `token = \"github_pat_...\"` to its entry in \
+             plugin-updater.toml)"
+        ),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN if had_token => anyhow!(
+            "auth failed (token may be expired or lack `Contents: Read` on this repo): {}",
+            api_msg.unwrap_or_else(|| status.to_string())
+        ),
+        _ => match api_msg {
+            Some(m) => anyhow!("{m}"),
+            None => anyhow!("HTTP {status}"),
+        },
+    }
 }
 
 /// Parse GitHub's release timestamp format (`YYYY-MM-DDTHH:MM:SSZ`, RFC3339
