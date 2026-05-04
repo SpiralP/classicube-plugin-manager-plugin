@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use super::*;
+use crate::config::{SELF_OWNER, SELF_REPO};
 
 fn empty_sub() -> Subscription {
     Subscription::default()
@@ -370,6 +371,38 @@ fn pause_target_refuses_when_nothing_installed() {
     };
     let err = pause_target(&sub).unwrap_err();
     assert!(err.contains("no installed version"), "got: {err}");
+}
+
+#[test]
+fn refuse_self_mutation_blocks_self_owner_repo() {
+    let msg = refuse_self_mutation(SELF_OWNER, SELF_REPO, "unsubscribe from")
+        .expect("self target should be refused");
+    assert!(msg.contains("updater plugin"), "got: {msg}");
+    assert!(msg.contains("unsubscribe from"), "got: {msg}");
+    assert!(msg.contains(SELF_OWNER), "got: {msg}");
+    assert!(msg.contains(SELF_REPO), "got: {msg}");
+}
+
+#[test]
+fn refuse_self_mutation_allows_other_repo() {
+    assert!(refuse_self_mutation("octocat", "classicube-foo-plugin", "unsubscribe from").is_none());
+    assert!(refuse_self_mutation("octocat", "classicube-foo-plugin", "disable").is_none());
+}
+
+#[test]
+fn refuse_self_mutation_is_case_sensitive() {
+    // Handlers feed in the *stored* keys returned by find_subscription_mut,
+    // so user-typed casing is normalized away before this check sees it.
+    // Only TOML-on-disk casing reaches us, and config::is_self is exact-match.
+    assert!(refuse_self_mutation("spiralp", SELF_REPO, "disable").is_none());
+}
+
+#[test]
+fn refuse_self_mutation_message_is_ascii() {
+    let msg = refuse_self_mutation(SELF_OWNER, SELF_REPO, "unsubscribe from").unwrap();
+    assert!(msg.is_ascii(), "chat output must be ASCII: {msg:?}");
+    let msg = refuse_self_mutation(SELF_OWNER, SELF_REPO, "disable").unwrap();
+    assert!(msg.is_ascii(), "chat output must be ASCII: {msg:?}");
 }
 
 #[test]
