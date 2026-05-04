@@ -224,7 +224,7 @@ async fn run_initial_pass() -> Result<()> {
                     ));
                     if is_self {
                         print_async(format!(
-                            "{}Plugin updater updated to {}{}{} — restart ClassiCube to use the \
+                            "{}Plugin updater updated to {}{}{} - restart ClassiCube to use the \
                              new version",
                             color::PINK,
                             color::GREEN,

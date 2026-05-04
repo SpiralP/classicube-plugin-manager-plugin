@@ -215,7 +215,7 @@ fn print_usage() {
 async fn print_load_error(e: &Error) {
     error!("loading config: {e:#}");
     print_async(format!(
-        "{}Refusing to modify config (load failed — fix plugins/plugin-updater.toml first): {}{e}",
+        "{}Refusing to modify config (load failed - fix plugins/plugin-updater.toml first): {}{e}",
         color::RED,
         color::WHITE,
     ))
@@ -832,7 +832,7 @@ async fn run_update(owner: &str, repo: &str, channel: &Channel, token: Option<&s
 
     if is_self {
         print_async(format!(
-            "{}Plugin updater updated to {}{}{} — restart ClassiCube to use the new version",
+            "{}Plugin updater updated to {}{}{} - restart ClassiCube to use the new version",
             color::PINK,
             color::GREEN,
             release.tag_name,
