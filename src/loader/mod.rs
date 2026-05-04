@@ -17,12 +17,13 @@ use tracing::{debug, error, warn};
 use crate::{
     chat::print_wrapped,
     component::Plugin_ApiVersion,
-    config::{self, Subscription},
+    config::{self, Subscription, config_path},
     installer::{MANAGED_DIR, PLUGINS_DIR},
 };
 
 struct LoadedPlugin {
-    id: String,
+    owner: String,
+    repo: String,
     library: *mut c_void,
     component: *mut IGameComponent,
 }
@@ -41,11 +42,31 @@ pub fn init_managed(subs: &[(String, String, Subscription)]) {
         if config::is_self(owner, repo) {
             continue;
         }
+        let id = format!("{owner}/{repo}");
+        if let Some(prev) = sub.state.in_callback.as_deref() {
+            // Last session's breadcrumb survived. Treat it as "this sub
+            // crashed inside `prev` last run", warn, clear the breadcrumb,
+            // and skip loading this session — the user can /unsubscribe,
+            // /update, or just retry on next startup.
+            warn!("{id} crashed inside {prev} last session; skipping this run");
+            print_wrapped(format!(
+                "{}Previous session crashed inside {}{id}{} {}{prev}{}. Skipped this run.",
+                color::YELLOW,
+                color::LIME,
+                color::YELLOW,
+                color::LIME,
+                color::YELLOW,
+            ));
+            if let Err(e) = config::set_in_callback_to(config_path(), owner, repo, None) {
+                warn!("clearing carry-over breadcrumb for {id}: {e:#}");
+            }
+            continue;
+        }
         let Some(asset) = sub.state.installed_asset.as_deref() else {
             continue;
         };
-        let id = format!("{owner}/{repo}");
-        let already_loaded = LOADED.with_borrow(|loaded| loaded.iter().any(|p| p.id == id));
+        let already_loaded = LOADED
+            .with_borrow(|loaded| loaded.iter().any(|p| p.owner == *owner && p.repo == *repo));
         if already_loaded {
             continue;
         }
@@ -56,19 +77,25 @@ pub fn init_managed(subs: &[(String, String, Subscription)]) {
 
         let path = Path::new(MANAGED_DIR).join(asset);
         let path_str = path.to_string_lossy().into_owned();
-        match plugin::try_load(&path_str) {
+        // Use the dlopen function name so a crash in the loaded library's
+        // static constructors (before Init even runs) is attributed to the
+        // load step rather than blamed on Init.
+        let load_result =
+            with_breadcrumb(owner, repo, "DynamicLib_Load2", || plugin::try_load(&path_str));
+        match load_result {
             Ok((library, component, api_version)) => {
                 match check_api_version(Plugin_ApiVersion, api_version) {
                     ApiVersionCheck::Ok => {
                         LOADED.with_borrow_mut(|loaded| {
                             loaded.push(LoadedPlugin {
-                                id: id.clone(),
+                                owner: owner.clone(),
+                                repo: repo.clone(),
                                 library,
                                 component,
                             });
                         });
                         debug!("loaded {id} from {path_str}");
-                        run_init_sequence(component, &id);
+                        run_init_sequence(component, owner, repo);
                     }
                     ApiVersionCheck::PluginOutdated => {
                         warn!(
@@ -130,19 +157,20 @@ fn check_api_version(host: c_int, plugin: c_int) -> ApiVersionCheck {
     }
 }
 
-fn run_init_sequence(component: *mut IGameComponent, id: &str) {
+fn run_init_sequence(component: *mut IGameComponent, owner: &str, repo: &str) {
+    let id = format!("{owner}/{repo}");
     let component = unsafe { &mut *component };
     if let Some(f) = component.Init {
         debug!("calling Init on {id}");
-        unsafe { f() };
+        with_breadcrumb(owner, repo, "Init", || unsafe { f() });
     }
     if let Some(f) = component.OnNewMap {
         debug!("calling OnNewMap on {id}");
-        unsafe { f() };
+        with_breadcrumb(owner, repo, "OnNewMap", || unsafe { f() });
     }
     if let Some(f) = component.OnNewMapLoaded {
         debug!("calling OnNewMapLoaded on {id}");
-        unsafe { f() };
+        with_breadcrumb(owner, repo, "OnNewMapLoaded", || unsafe { f() });
     }
 }
 
@@ -152,8 +180,8 @@ pub fn free() {
     for plugin in &drained {
         let component = unsafe { &mut *plugin.component };
         if let Some(f) = component.Free {
-            debug!("calling Free on {}", plugin.id);
-            unsafe { f() };
+            debug!("calling Free on {}/{}", plugin.owner, plugin.repo);
+            with_breadcrumb(&plugin.owner, &plugin.repo, "Free", || unsafe { f() });
         }
     }
     for plugin in drained {
@@ -176,15 +204,45 @@ pub fn on_new_map_loaded() {
 fn forward_callback(name: &str, pick: impl Fn(&IGameComponent) -> Option<unsafe extern "C" fn()>) {
     // Snapshot pointers under the borrow so a managed plugin's callback can
     // re-enter the host (chat, etc.) without deadlocking on LOADED.
-    let snapshot: Vec<(String, *mut IGameComponent)> =
-        LOADED.with_borrow(|loaded| loaded.iter().map(|p| (p.id.clone(), p.component)).collect());
-    for (id, component) in snapshot {
+    let snapshot: Vec<(String, String, *mut IGameComponent)> = LOADED.with_borrow(|loaded| {
+        loaded
+            .iter()
+            .map(|p| (p.owner.clone(), p.repo.clone(), p.component))
+            .collect()
+    });
+    for (owner, repo, component) in snapshot {
         let component = unsafe { &*component };
         if let Some(f) = pick(component) {
-            debug!("calling {name} on {id}");
-            unsafe { f() };
+            debug!("calling {name} on {owner}/{repo}");
+            with_breadcrumb(&owner, &repo, name, || unsafe { f() });
         }
     }
+}
+
+fn with_breadcrumb<R>(owner: &str, repo: &str, callback: &str, f: impl FnOnce() -> R) -> R {
+    with_breadcrumb_at(config_path(), owner, repo, callback, f)
+}
+
+/// Persist `in_callback = Some(name)` for `(owner, repo)`, run `f`, then
+/// clear `in_callback` and persist again. If `f` panics or the process dies
+/// mid-call, the breadcrumb survives — that's the entire point. The
+/// `let r = f(); clear; r` shape (rather than `Drop`) is deliberate so an
+/// unwind skips the clear and leaves the breadcrumb on disk.
+fn with_breadcrumb_at<R>(
+    path: &Path,
+    owner: &str,
+    repo: &str,
+    callback: &str,
+    f: impl FnOnce() -> R,
+) -> R {
+    if let Err(e) = config::set_in_callback_to(path, owner, repo, Some(callback.into())) {
+        warn!("breadcrumb set for {owner}/{repo} {callback}: {e:#}");
+    }
+    let r = f();
+    if let Err(e) = config::set_in_callback_to(path, owner, repo, None) {
+        warn!("breadcrumb clear for {owner}/{repo} {callback}: {e:#}");
+    }
+    r
 }
 
 fn warn_on_collision(asset: &str) -> io::Result<()> {

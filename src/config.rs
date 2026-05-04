@@ -1,7 +1,13 @@
 #[cfg(test)]
 mod tests;
 
-use std::{collections::BTreeMap, fs, io, path::Path, str::FromStr};
+use std::{
+    collections::BTreeMap,
+    fs::{self, OpenOptions},
+    io::{self, Write},
+    path::Path,
+    str::FromStr,
+};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
@@ -150,6 +156,13 @@ pub struct SubscriptionState {
     pub cached_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_published_at: Option<u64>,
+    /// Crash-recovery breadcrumb: the name of the managed-plugin
+    /// `IGameComponent` callback currently in flight. Set right before we
+    /// invoke a managed callback (and persisted to disk), cleared right after
+    /// it returns. If the game crashes during the callback, this field
+    /// survives the restart and tells us who to blame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_callback: Option<String>,
 }
 
 impl SubscriptionState {
@@ -160,6 +173,7 @@ impl SubscriptionState {
             && self.cached_tag.is_none()
             && self.cached_at.is_none()
             && self.cached_published_at.is_none()
+            && self.in_callback.is_none()
     }
 }
 
@@ -216,9 +230,22 @@ impl Config {
         }
     }
 
+    /// Serialize and write the config, then `fsync` so the bytes are durable
+    /// before we return. The crash-recovery breadcrumb relies on writes
+    /// surviving an immediately-following process death; `fs::write` alone
+    /// only hands the data to the kernel.
     pub fn save_to(&self, path: &Path) -> Result<()> {
         let toml_str = toml::to_string_pretty(self).context("serializing config")?;
-        fs::write(path, toml_str).with_context(|| format!("writing {}", path.display()))?;
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        f.write_all(toml_str.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync {}", path.display()))?;
         Ok(())
     }
 
@@ -242,6 +269,30 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// Set or clear the crash-recovery breadcrumb for one subscription, then
+/// persist. Re-reads the on-disk config first so a concurrent cache write
+/// from the background updater task doesn't clobber the breadcrumb (and
+/// vice-versa) — same pattern as `persist_cache_updates_to`.
+///
+/// No-op if the subscription is no longer present.
+pub fn set_in_callback_to(
+    path: &Path,
+    owner: &str,
+    repo: &str,
+    value: Option<String>,
+) -> Result<()> {
+    let mut cfg = Config::load_from(path)?;
+    if let Some(sub) = cfg
+        .subscriptions
+        .get_mut(owner)
+        .and_then(|m| m.get_mut(repo))
+    {
+        sub.state.in_callback = value;
+        cfg.save_to(path)?;
+    }
+    Ok(())
 }
 
 fn validate_segment(kind: &str, s: &str) -> Result<()> {
