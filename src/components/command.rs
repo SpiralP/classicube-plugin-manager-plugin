@@ -195,6 +195,27 @@ fn pause_target(sub: &Subscription) -> Result<Channel, String> {
     Ok(Channel::Tag(v))
 }
 
+/// Returns a chat-ready refusal message when `(owner, repo)` is the updater's
+/// own subscription. Used by mutating handlers that would otherwise leave the
+/// user in a half-state (entry removed but binary still loaded, or
+/// self-updates silently disabled). `action` is the verb shown in the message
+/// (e.g. `"unsubscribe from"`, `"disable"`).
+fn refuse_self_mutation(owner: &str, repo: &str, action: &str) -> Option<String> {
+    if !config::is_self(owner, repo) {
+        return None;
+    }
+    Some(format!(
+        "{}Refusing to {action} {}{owner}/{repo}{}: this is the updater plugin itself. Use \
+         {}/client Updater update{} to upgrade it; edit plugins/plugin-updater.toml by hand if \
+         you really need to change this entry.",
+        color::YELLOW,
+        color::LIME,
+        color::YELLOW,
+        color::LIME,
+        color::YELLOW,
+    ))
+}
+
 /// Suffix to append after `owner/repo` in chat output when the channel is
 /// non-default. Returns an empty string for `Channel::Stable`.
 fn channel_suffix(channel: &Channel) -> String {
@@ -369,6 +390,11 @@ fn handle_unsubscribe(spec: &str) {
             return;
         };
 
+        if let Some(msg) = refuse_self_mutation(&stored_owner, &stored_repo, "unsubscribe from") {
+            print_async(msg).await;
+            return;
+        }
+
         if let Some(repos) = config.subscriptions.get_mut(&stored_owner) {
             repos.remove(&stored_repo);
             if repos.is_empty() {
@@ -470,6 +496,11 @@ fn set_disabled(spec: &str, disabled: bool) {
             .await;
             return;
         };
+
+        if disabled && let Some(msg) = refuse_self_mutation(&owner, &repo, "disable") {
+            print_async(msg).await;
+            return;
+        }
 
         if sub.disabled == disabled {
             let word = if disabled { "disabled" } else { "enabled" };
