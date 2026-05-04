@@ -253,6 +253,19 @@ async fn print_save_error(e: &Error) {
     .await;
 }
 
+async fn print_not_subscribed(spec: &str) {
+    print_async(format!(
+        "{}Not subscribed to {}{}{}; use {}subscribe{} first",
+        color::YELLOW,
+        color::LIME,
+        spec,
+        color::YELLOW,
+        color::LIME,
+        color::YELLOW,
+    ))
+    .await;
+}
+
 fn handle_subscribe(spec: &str, channel: Channel) {
     let Some(candidates) = expand_candidates(spec) else {
         print_wrapped(format!("{}Expected owner/repo, got: {spec}", color::RED));
@@ -283,56 +296,72 @@ fn handle_subscribe(spec: &str, channel: Channel) {
             return;
         }
 
-        // Single canonical candidate: skip the network probe to preserve the
-        // fast subscribe path. Multiple candidates: probe each against the
-        // GitHub API + OS asset filter and persist the first that succeeds.
-        let (owner, repo) = if candidates.len() == 1 {
-            candidates.into_iter().next().unwrap()
-        } else {
-            match resolve_canonical(&candidates, &channel).await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    print_async(format!(
-                        "{}Failed to resolve {}{}{}: {}{e}",
-                        color::RED,
-                        color::LIME,
-                        spec,
-                        color::RED,
-                        color::WHITE,
-                    ))
-                    .await;
-                    return;
-                }
-            }
-        };
-
-        config
-            .subscriptions
-            .entry(owner.clone())
-            .or_default()
-            .insert(
-                repo.clone(),
-                Subscription {
-                    channel: channel.clone(),
-                    disabled: false,
-                    token: None,
-                    state: SubscriptionState::default(),
-                },
-            );
-        if let Err(e) = config.save() {
-            print_save_error(&e).await;
+        let Some((owner, repo)) = add_subscription(&spec, candidates, &channel, &mut config).await
+        else {
             return;
-        }
+        };
         print_async(format!(
-            "{}Subscribed to {}{}/{}{}",
+            "{}Subscribed to {}{owner}/{repo}{}",
             color::PINK,
             color::LIME,
-            owner,
-            repo,
             channel_suffix(&channel),
         ))
         .await;
     });
+}
+
+/// Resolve `candidates` to a canonical `(owner, repo)`, insert a fresh
+/// subscription on `channel`, and persist. Shared by explicit
+/// `/subscribe` and the implicit-subscribe paths in `/update`,
+/// `/enable`, `/channel`. Single-candidate inputs skip the probe -
+/// callers that go on to install (`run_update`) hit GitHub anyway.
+/// Returns `None` on probe-resolve failure or save failure, after
+/// printing a chat-ready error. Caller must already have verified
+/// that no subscription matches `candidates`.
+async fn add_subscription(
+    spec: &str,
+    candidates: Vec<(String, String)>,
+    channel: &Channel,
+    config: &mut Config,
+) -> Option<(String, String)> {
+    let (owner, repo) = if candidates.len() == 1 {
+        candidates.into_iter().next().unwrap()
+    } else {
+        match resolve_canonical(&candidates, channel).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                print_async(format!(
+                    "{}Failed to resolve {}{}{}: {}{e}",
+                    color::RED,
+                    color::LIME,
+                    spec,
+                    color::RED,
+                    color::WHITE,
+                ))
+                .await;
+                return None;
+            }
+        }
+    };
+
+    config
+        .subscriptions
+        .entry(owner.clone())
+        .or_default()
+        .insert(
+            repo.clone(),
+            Subscription {
+                channel: channel.clone(),
+                disabled: false,
+                token: None,
+                state: SubscriptionState::default(),
+            },
+        );
+    if let Err(e) = config.save() {
+        print_save_error(&e).await;
+        return None;
+    }
+    Some((owner, repo))
 }
 
 /// Probe each candidate against the GitHub API and OS asset filter; return
@@ -361,6 +390,31 @@ async fn probe_release(owner: &str, repo: &str, channel: &Channel) -> Result<()>
     let release = get_release_for_channel(owner, repo, channel, None).await?;
     pick_asset(&release.assets, env::consts::ARCH, env::consts::DLL_SUFFIX)?;
     Ok(())
+}
+
+/// Implicit-subscribe path for commands whose user intent reads as "I want
+/// this plugin on" (`/update`, `/enable`, `/channel`). Wraps
+/// `add_subscription` with an "(auto), installing..." chat message and
+/// hands off to the existing install path. Caller has already checked
+/// that no subscription exists for `candidates`.
+async fn auto_subscribe_and_install(
+    spec: &str,
+    candidates: Vec<(String, String)>,
+    channel: Channel,
+    config: &mut Config,
+) {
+    let Some((owner, repo)) = add_subscription(spec, candidates, &channel, config).await else {
+        return;
+    };
+    print_async(format!(
+        "{}Subscribed to {}{owner}/{repo}{} {}(auto), installing...",
+        color::PINK,
+        color::LIME,
+        channel_suffix(&channel),
+        color::PINK,
+    ))
+    .await;
+    spawn_update_task(owner, repo, channel, None);
 }
 
 fn handle_unsubscribe(spec: &str) {
@@ -430,43 +484,37 @@ fn handle_channel(spec: &str, channel: Channel) {
             }
         };
 
-        let Some((owner, repo, sub)) = find_subscription_mut(&mut config, &candidates) else {
-            print_async(format!(
-                "{}Not subscribed to {}{}",
-                color::YELLOW,
-                color::LIME,
-                spec,
-            ))
-            .await;
-            return;
-        };
+        if let Some((owner, repo, sub)) = find_subscription_mut(&mut config, &candidates) {
+            if sub.channel == channel {
+                print_async(format!(
+                    "{}{owner}/{repo} {}already on channel {}{}",
+                    color::LIME,
+                    color::YELLOW,
+                    color::PINK,
+                    channel.pretty(),
+                ))
+                .await;
+                return;
+            }
+            apply_channel_switch(sub, channel.clone());
 
-        if sub.channel == channel {
+            if let Err(e) = config.save() {
+                print_save_error(&e).await;
+                return;
+            }
             print_async(format!(
-                "{}{owner}/{repo} {}already on channel {}{}",
-                color::LIME,
-                color::YELLOW,
+                "{}Channel for {}{owner}/{repo} {}set to {}{}",
                 color::PINK,
+                color::LIME,
+                color::PINK,
+                color::YELLOW,
                 channel.pretty(),
             ))
             .await;
             return;
         }
-        apply_channel_switch(sub, channel.clone());
 
-        if let Err(e) = config.save() {
-            print_save_error(&e).await;
-            return;
-        }
-        print_async(format!(
-            "{}Channel for {}{owner}/{repo} {}set to {}{}",
-            color::PINK,
-            color::LIME,
-            color::PINK,
-            color::YELLOW,
-            channel.pretty(),
-        ))
-        .await;
+        auto_subscribe_and_install(&spec, candidates, channel, &mut config).await;
     });
 }
 
@@ -486,45 +534,47 @@ fn set_disabled(spec: &str, disabled: bool) {
             }
         };
 
-        let Some((owner, repo, sub)) = find_subscription_mut(&mut config, &candidates) else {
+        if let Some((owner, repo, sub)) = find_subscription_mut(&mut config, &candidates) {
+            if disabled && let Some(msg) = refuse_self_mutation(&owner, &repo, "disable") {
+                print_async(msg).await;
+                return;
+            }
+
+            if sub.disabled == disabled {
+                let word = if disabled { "disabled" } else { "enabled" };
+                print_async(format!(
+                    "{}Already {word} {}{owner}/{repo}",
+                    color::YELLOW,
+                    color::LIME,
+                ))
+                .await;
+                return;
+            }
+            sub.disabled = disabled;
+
+            if let Err(e) = config.save() {
+                print_save_error(&e).await;
+                return;
+            }
+            let word = if disabled { "Disabled" } else { "Enabled" };
             print_async(format!(
-                "{}Not subscribed to {}{}",
-                color::YELLOW,
+                "{}{word} {}{owner}/{repo}",
+                color::PINK,
                 color::LIME,
-                spec,
             ))
             .await;
             return;
-        };
-
-        if disabled && let Some(msg) = refuse_self_mutation(&owner, &repo, "disable") {
-            print_async(msg).await;
-            return;
         }
 
-        if sub.disabled == disabled {
-            let word = if disabled { "disabled" } else { "enabled" };
-            print_async(format!(
-                "{}Already {word} {}{owner}/{repo}",
-                color::YELLOW,
-                color::LIME,
-            ))
-            .await;
+        // /disable on an unsubscribed repo would create a sub only to
+        // immediately turn it off, which is pointless. /enable, on the
+        // other hand, reads as "I want this plugin on" - same intent as
+        // /update, so auto-subscribe + install with the default channel.
+        if disabled {
+            print_not_subscribed(&spec).await;
             return;
         }
-        sub.disabled = disabled;
-
-        if let Err(e) = config.save() {
-            print_save_error(&e).await;
-            return;
-        }
-        let word = if disabled { "Disabled" } else { "Enabled" };
-        print_async(format!(
-            "{}{word} {}{owner}/{repo}",
-            color::PINK,
-            color::LIME,
-        ))
-        .await;
+        auto_subscribe_and_install(&spec, candidates, Channel::Stable, &mut config).await;
     });
 }
 
@@ -545,13 +595,7 @@ fn handle_pause(spec: &str) {
         };
 
         let Some((owner, repo, sub)) = find_subscription_mut(&mut config, &candidates) else {
-            print_async(format!(
-                "{}Not subscribed to {}{}",
-                color::YELLOW,
-                color::LIME,
-                spec,
-            ))
-            .await;
+            print_not_subscribed(&spec).await;
             return;
         };
 
@@ -608,13 +652,7 @@ fn handle_unpause(spec: &str) {
         };
 
         let Some((owner, repo, sub)) = find_subscription_mut(&mut config, &candidates) else {
-            print_async(format!(
-                "{}Not subscribed to {}{}",
-                color::YELLOW,
-                color::LIME,
-                spec,
-            ))
-            .await;
+            print_not_subscribed(&spec).await;
             return;
         };
 
@@ -702,7 +740,7 @@ fn handle_update_one(spec: &str) {
     let spec = spec.to_string();
 
     async_manager::spawn(async move {
-        let config = match Config::load() {
+        let mut config = match Config::load() {
             Ok(c) => c,
             Err(e) => {
                 print_load_error(&e).await;
@@ -710,36 +748,27 @@ fn handle_update_one(spec: &str) {
             }
         };
 
-        let Some((owner, repo, sub)) = find_subscription(&config, &candidates) else {
-            print_async(format!(
-                "{}Not subscribed to {}{}{}; use {}subscribe{} first",
-                color::YELLOW,
-                color::LIME,
-                spec,
-                color::YELLOW,
-                color::LIME,
-                color::YELLOW,
-            ))
-            .await;
-            return;
-        };
+        if let Some((owner, repo, sub)) = find_subscription(&config, &candidates) {
+            if sub.disabled {
+                print_async(format!(
+                    "{}Subscription {}{owner}/{repo} {}is disabled; use {}enable {owner}/{repo}{} \
+                     first",
+                    color::YELLOW,
+                    color::LIME,
+                    color::YELLOW,
+                    color::LIME,
+                    color::YELLOW,
+                ))
+                .await;
+                return;
+            }
 
-        if sub.disabled {
-            print_async(format!(
-                "{}Subscription {}{owner}/{repo} {}is disabled; use {}enable {owner}/{repo}{} \
-                 first",
-                color::YELLOW,
-                color::LIME,
-                color::YELLOW,
-                color::LIME,
-                color::YELLOW,
-            ))
-            .await;
+            let token = sub.token.as_ref().map(|s| s.expose().to_owned());
+            spawn_update_task(owner, repo, sub.channel.clone(), token);
             return;
         }
 
-        let token = sub.token.as_ref().map(|s| s.expose().to_owned());
-        spawn_update_task(owner, repo, sub.channel.clone(), token);
+        auto_subscribe_and_install(&spec, candidates, Channel::Stable, &mut config).await;
     });
 }
 
