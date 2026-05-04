@@ -35,7 +35,7 @@ permissions:
 jobs:
   linux_nix:
     if: ${{ !inputs.skip-nix-build }}
-    uses: SpiralP/github-reusable-workflows/.github/workflows/build.yml@079d78d637d68fc40c438462c327accc867294d6 # main
+    uses: SpiralP/github-reusable-workflows/.github/workflows/build.yml@f4413a1168ea736612235824efef210dc7416abc # main
     with:
       flake-attribute: ${{ inputs.release && 'default' || 'debug' }}
       runs-on: self-hosted
