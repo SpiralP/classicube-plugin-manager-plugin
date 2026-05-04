@@ -8,11 +8,12 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use reqwest::header::{AUTHORIZATION, HeaderValue};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::{
-    github_release::{GitHubReleaseAsset, make_client},
+    github_release::{GitHubReleaseAsset, make_client, resolve_auth_token},
     self_path::current_lib_path,
 };
 
@@ -22,12 +23,13 @@ pub const MANAGED_DIR: &str = "plugins/managed";
 pub async fn download_to_managed_dir(
     asset: &GitHubReleaseAsset,
     expected_digest: Option<&str>,
+    token: Option<&str>,
 ) -> Result<PathBuf> {
     debug!(
         "downloading {} -> {}/{}",
         asset.browser_download_url, MANAGED_DIR, asset.name
     );
-    let bytes = download_bytes(asset).await?;
+    let bytes = download_bytes(asset, token).await?;
     install_bytes_to(Path::new(MANAGED_DIR), &asset.name, &bytes, expected_digest)
 }
 
@@ -46,6 +48,7 @@ pub async fn download_to_managed_dir(
 pub async fn download_self(
     asset: &GitHubReleaseAsset,
     expected_digest: Option<&str>,
+    token: Option<&str>,
 ) -> Result<PathBuf> {
     let loaded = current_lib_path().context("resolving self path")?;
     let dir = loaded
@@ -67,7 +70,7 @@ pub async fn download_self(
         asset.browser_download_url,
         loaded.display(),
     );
-    let bytes = download_bytes(asset).await?;
+    let bytes = download_bytes(asset, token).await?;
     install_bytes_to(dir, basename, &bytes, expected_digest)
 }
 
@@ -98,9 +101,20 @@ pub fn cleanup_self_old() {
     }
 }
 
-async fn download_bytes(asset: &GitHubReleaseAsset) -> Result<Vec<u8>> {
-    let bytes = make_client()
-        .get(&asset.browser_download_url)
+async fn download_bytes(asset: &GitHubReleaseAsset, token: Option<&str>) -> Result<Vec<u8>> {
+    // GitHub redirects the asset URL to a signed S3 URL. reqwest's default
+    // redirect policy strips `Authorization` on cross-host hops (see
+    // `reqwest::redirect::remove_sensitive_headers`), so the PAT only goes
+    // to api.github.com / objects.githubusercontent.com is excluded — the
+    // S3 host receives no auth header.
+    let mut request = make_client().get(&asset.browser_download_url);
+    if let Some(t) = resolve_auth_token(token) {
+        let mut header_value = HeaderValue::from_str(&format!("Bearer {t}"))
+            .map_err(|e| anyhow!("invalid token characters: {e}"))?;
+        header_value.set_sensitive(true);
+        request = request.header(AUTHORIZATION, header_value);
+    }
+    let bytes = request
         .send()
         .await
         .with_context(|| format!("requesting {}", asset.browser_download_url))?

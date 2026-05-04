@@ -279,6 +279,7 @@ fn handle_subscribe(spec: &str, channel: Channel) {
                 Subscription {
                     channel: channel.clone(),
                     disabled: false,
+                    token: None,
                     state: SubscriptionState::default(),
                 },
             );
@@ -317,7 +318,11 @@ async fn resolve_canonical(
 }
 
 async fn probe_release(owner: &str, repo: &str, channel: &Channel) -> Result<()> {
-    let release = get_release_for_channel(owner, repo, channel).await?;
+    // No per-sub token here: the subscription doesn't exist yet. Anonymous
+    // probe is fine for public repos; private repos surface as a 404 with
+    // the "may be private — add a token" hint, which prompts the user to
+    // edit the TOML by hand and retry.
+    let release = get_release_for_channel(owner, repo, channel, None).await?;
     pick_asset(&release.assets, env::consts::ARCH, env::consts::DLL_SUFFIX)?;
     Ok(())
 }
@@ -565,7 +570,8 @@ fn handle_update_one(spec: &str) {
             return;
         }
 
-        spawn_update_task(owner, repo, sub.channel.clone());
+        let token = sub.token.as_ref().map(|s| s.expose().to_owned());
+        spawn_update_task(owner, repo, sub.channel.clone(), token);
     });
 }
 
@@ -579,7 +585,7 @@ fn handle_update_all() {
             }
         };
 
-        let stale: Vec<(String, String, Channel)> = config
+        let stale: Vec<(String, String, Channel, Option<String>)> = config
             .subscriptions
             .iter()
             .flat_map(|(owner, repos)| {
@@ -594,7 +600,14 @@ fn handle_update_all() {
                     _ => true,
                 },
             )
-            .map(|(owner, repo, s)| (owner, repo, s.channel.clone()))
+            .map(|(owner, repo, s)| {
+                (
+                    owner,
+                    repo,
+                    s.channel.clone(),
+                    s.token.as_ref().map(|t| t.expose().to_owned()),
+                )
+            })
             .collect();
 
         if stale.is_empty() {
@@ -610,15 +623,15 @@ fn handle_update_all() {
             color::PINK,
         ))
         .await;
-        for (owner, repo, channel) in stale {
-            spawn_update_task(owner, repo, channel);
+        for (owner, repo, channel, token) in stale {
+            spawn_update_task(owner, repo, channel, token);
         }
     });
 }
 
-fn spawn_update_task(owner: String, repo: String, channel: Channel) {
+fn spawn_update_task(owner: String, repo: String, channel: Channel, token: Option<String>) {
     async_manager::spawn(async move {
-        if let Err(e) = run_update(&owner, &repo, &channel).await {
+        if let Err(e) = run_update(&owner, &repo, &channel, token.as_deref()).await {
             error!("update {}/{}: {e:#}", owner, repo);
             print_async(format!(
                 "{}Update {}{}/{}{} failed: {}{e}",
@@ -634,7 +647,7 @@ fn spawn_update_task(owner: String, repo: String, channel: Channel) {
     });
 }
 
-async fn run_update(owner: &str, repo: &str, channel: &Channel) -> Result<()> {
+async fn run_update(owner: &str, repo: &str, channel: &Channel, token: Option<&str>) -> Result<()> {
     print_async(format!(
         "{}Checking {}{}/{}{} for latest release...",
         color::PINK,
@@ -645,7 +658,7 @@ async fn run_update(owner: &str, repo: &str, channel: &Channel) -> Result<()> {
     ))
     .await;
 
-    let release = get_release_for_channel(owner, repo, channel).await?;
+    let release = get_release_for_channel(owner, repo, channel, token).await?;
     let asset = pick_asset(&release.assets, env::consts::ARCH, env::consts::DLL_SUFFIX)?;
 
     print_async(format!(
@@ -663,9 +676,9 @@ async fn run_update(owner: &str, repo: &str, channel: &Channel) -> Result<()> {
     let expected_digest = resolve_expected_digest(asset)?;
     let is_self = config::is_self(owner, repo);
     let path = if is_self {
-        download_self(asset, expected_digest.as_deref()).await?
+        download_self(asset, expected_digest.as_deref(), token).await?
     } else {
-        download_to_managed_dir(asset, expected_digest.as_deref()).await?
+        download_to_managed_dir(asset, expected_digest.as_deref(), token).await?
     };
 
     let now = unix_now();

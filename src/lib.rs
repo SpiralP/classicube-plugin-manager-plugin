@@ -8,4 +8,5 @@ mod github_release;
 mod installer;
 mod loader;
 mod reconcile;
+mod secret;
 mod self_path;

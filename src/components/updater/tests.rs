@@ -196,6 +196,7 @@ fn persist_helpers_ignore_disabled_flag() {
         Subscription {
             disabled: true,
             channel: Channel::default(),
+            token: None,
             state: SubscriptionState::default(),
         },
     )]);

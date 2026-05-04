@@ -159,6 +159,78 @@ fn iso8601_century_leap_rule() {
 }
 
 #[test]
+fn classify_anonymous_404_hints_private_repo() {
+    // The whole point of the hint: an anonymous 404 may mean "private repo",
+    // not "wrong owner/repo", and the user can't tell from the generic
+    // `message: "Not Found"` body. The hint nudges them toward the token
+    // workflow without forcing them to read the README first.
+    let body = br#"{"message":"Not Found","documentation_url":"https://docs"}"#;
+    let err = classify_error(StatusCode::NOT_FOUND, false, body);
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("private") && msg.contains("token"),
+        "expected private-repo hint in: {msg}",
+    );
+}
+
+#[test]
+fn classify_authed_404_does_not_show_private_hint() {
+    // If the user already has a token attached and it still 404s, the repo
+    // really is missing (or the token doesn't have access — but that surfaces
+    // as 401/403, not 404). Don't suggest the token workflow they're already
+    // using.
+    let body = br#"{"message":"Not Found"}"#;
+    let err = classify_error(StatusCode::NOT_FOUND, true, body);
+    let msg = format!("{err:#}");
+    assert!(
+        !msg.contains("private"),
+        "should not nag about private with a token already set: {msg}",
+    );
+    assert!(msg.contains("Not Found"), "expected api message in: {msg}");
+}
+
+#[test]
+fn classify_401_with_token_hints_expiry() {
+    let body = br#"{"message":"Bad credentials"}"#;
+    let err = classify_error(StatusCode::UNAUTHORIZED, true, body);
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("auth failed") && msg.contains("expired"),
+        "expected expiry hint in: {msg}",
+    );
+}
+
+#[test]
+fn classify_403_with_token_hints_scope() {
+    // 403 with a token usually means the PAT is valid but lacks
+    // `Contents: Read` on this specific repo. Same hint as 401 — the user's
+    // fix is to re-mint with the right scope.
+    let body = br#"{"message":"Forbidden"}"#;
+    let err = classify_error(StatusCode::FORBIDDEN, true, body);
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("auth failed"),
+        "expected auth-failed hint in: {msg}",
+    );
+}
+
+#[test]
+fn classify_falls_back_to_api_message() {
+    // For any other non-success status, prefer GitHub's `message` field over
+    // a generic "HTTP 422" — the API message is usually more actionable.
+    let body = br#"{"message":"Validation Failed"}"#;
+    let err = classify_error(StatusCode::UNPROCESSABLE_ENTITY, false, body);
+    assert_eq!(format!("{err}"), "Validation Failed");
+}
+
+#[test]
+fn classify_falls_back_to_status_for_non_json_body() {
+    let err = classify_error(StatusCode::BAD_GATEWAY, false, b"<html>nope</html>");
+    let msg = format!("{err}");
+    assert!(msg.contains("502"), "expected status in fallback: {msg}");
+}
+
+#[test]
 fn iso8601_rejects_malformed() {
     // Wrong length / missing separators / wrong tz indicator — all None.
     assert_eq!(parse_iso8601_z(""), None);
