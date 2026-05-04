@@ -32,8 +32,8 @@ fn ignores_extra_release_fields() {
         "created_at": "2026-01-01T00:00:00Z",
         "published_at": "2026-01-01T00:00:00Z",
         "assets": [
-            {"name": "plugin.so", "browser_download_url": "https://example/plugin.so"},
-            {"name": "plugin.dll", "browser_download_url": "https://example/plugin.dll"}
+            {"name": "plugin.so", "url": "https://api.example/assets/1", "browser_download_url": "https://example/plugin.so"},
+            {"name": "plugin.dll", "url": "https://api.example/assets/2", "browser_download_url": "https://example/plugin.dll"}
         ],
         "body": "Release notes here."
     }"#;
@@ -42,10 +42,7 @@ fn ignores_extra_release_fields() {
     assert_eq!(r.published_at, 1_767_225_600);
     assert_eq!(r.assets.len(), 2);
     assert_eq!(r.assets[0].name, "plugin.so");
-    assert_eq!(
-        r.assets[0].browser_download_url,
-        "https://example/plugin.so"
-    );
+    assert_eq!(r.assets[0].url, "https://api.example/assets/1");
     assert_eq!(r.assets[1].name, "plugin.dll");
 }
 
@@ -53,6 +50,7 @@ fn ignores_extra_release_fields() {
 fn parses_asset_with_digest() {
     let json = br#"{
         "name": "plugin.so",
+        "url": "https://api.example/assets/1",
         "browser_download_url": "https://example/plugin.so",
         "digest": "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
     }"#;
@@ -67,6 +65,7 @@ fn parses_asset_with_digest() {
 fn parses_asset_without_digest_field() {
     let json = br#"{
         "name": "plugin.so",
+        "url": "https://api.example/assets/1",
         "browser_download_url": "https://example/plugin.so"
     }"#;
     let a: GitHubReleaseAsset = serde_json::from_slice(json).unwrap();

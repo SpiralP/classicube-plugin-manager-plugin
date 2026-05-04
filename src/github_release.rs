@@ -41,7 +41,9 @@ pub struct GitHubRelease {
 #[derive(Debug, Clone, Deserialize)]
 pub struct GitHubReleaseAsset {
     pub name: String,
-    pub browser_download_url: String,
+    /// API URL for the asset; needed to download from private repos because
+    /// `browser_download_url` is a web route that doesn't honor Bearer tokens.
+    pub url: String,
     /// `"sha256:<hex>"` when GitHub publishes one. Older releases / older API
     /// responses omit this, so it stays optional.
     #[serde(default)]
