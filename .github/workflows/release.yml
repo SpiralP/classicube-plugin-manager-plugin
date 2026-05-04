@@ -14,10 +14,9 @@ jobs:
     if: "${{ ! startsWith(github.event.head_commit.message, 'chore(release): ') }}"
     with:
       release: true
-      skip-artifact-upload: true
 
   release:
-    uses: SpiralP/github-reusable-workflows/.github/workflows/release.yml@45d06d9ac7c97686aba508b20a0e72d7b8aee6d0 # main
+    uses: SpiralP/github-reusable-workflows/.github/workflows/release.yml@079d78d637d68fc40c438462c327accc867294d6 # main
     needs: build
     concurrency:
       group: release-${{ github.ref }}
@@ -28,6 +27,7 @@ jobs:
       replace-files: |
         Cargo.lock
         Cargo.toml
+      assets: "*.{so,dll,dylib}"
     secrets:
       app-client-id: ${{ secrets.APP_CLIENT_ID }}
       app-private-key: ${{ secrets.APP_PRIVATE_KEY }}
