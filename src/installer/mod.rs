@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use reqwest::header::{AUTHORIZATION, HeaderValue};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderValue};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
@@ -27,7 +27,7 @@ pub async fn download_to_managed_dir(
 ) -> Result<PathBuf> {
     debug!(
         "downloading {} -> {}/{}",
-        asset.browser_download_url, MANAGED_DIR, asset.name
+        asset.url, MANAGED_DIR, asset.name
     );
     let bytes = download_bytes(asset, token).await?;
     install_bytes_to(Path::new(MANAGED_DIR), &asset.name, &bytes, expected_digest)
@@ -67,7 +67,7 @@ pub async fn download_self(
 
     debug!(
         "self-updating: downloading {} -> {}",
-        asset.browser_download_url,
+        asset.url,
         loaded.display(),
     );
     let bytes = download_bytes(asset, token).await?;
@@ -102,12 +102,15 @@ pub fn cleanup_self_old() {
 }
 
 async fn download_bytes(asset: &GitHubReleaseAsset, token: Option<&str>) -> Result<Vec<u8>> {
-    // GitHub redirects the asset URL to a signed S3 URL. reqwest's default
-    // redirect policy strips `Authorization` on cross-host hops (see
-    // `reqwest::redirect::remove_sensitive_headers`), so the PAT only goes
-    // to api.github.com / objects.githubusercontent.com is excluded — the
-    // S3 host receives no auth header.
-    let mut request = make_client().get(&asset.browser_download_url);
+    // Hit the API URL with `Accept: application/octet-stream` — that's the
+    // only path that honors Bearer tokens for private-repo assets. GitHub
+    // 302s to a signed `objects.githubusercontent.com` URL; reqwest strips
+    // Authorization on the cross-host hop (see
+    // `reqwest::redirect::remove_sensitive_headers`), which is fine because
+    // the signed URL needs no auth.
+    let mut request = make_client()
+        .get(&asset.url)
+        .header(ACCEPT, HeaderValue::from_static("application/octet-stream"));
     if let Some(t) = resolve_auth_token(token) {
         let mut header_value = HeaderValue::from_str(&format!("Bearer {t}"))
             .map_err(|e| anyhow!("invalid token characters: {e}"))?;
@@ -117,12 +120,12 @@ async fn download_bytes(asset: &GitHubReleaseAsset, token: Option<&str>) -> Resu
     let bytes = request
         .send()
         .await
-        .with_context(|| format!("requesting {}", asset.browser_download_url))?
+        .with_context(|| format!("requesting {}", asset.url))?
         .error_for_status()
-        .with_context(|| format!("HTTP error for {}", asset.browser_download_url))?
+        .with_context(|| format!("HTTP error for {}", asset.url))?
         .bytes()
         .await
-        .with_context(|| format!("reading body of {}", asset.browser_download_url))?;
+        .with_context(|| format!("reading body of {}", asset.url))?;
     Ok(bytes.to_vec())
 }
 
