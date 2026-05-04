@@ -6,6 +6,7 @@ use std::mem;
 use classicube_helpers::{async_manager, chat};
 
 const WRAP_WIDTH: usize = 80;
+const CONTINUATION_PREFIX: &str = "> ";
 
 pub fn print_wrapped<S: AsRef<str>>(s: S) {
     for line in wrap_chat(s.as_ref()) {
@@ -186,8 +187,9 @@ fn flush_line(
         current.pop();
     }
     out.push(mem::take(current));
-    *visible = 0;
     *first_line = false;
+    current.push_str(CONTINUATION_PREFIX);
+    *visible = CONTINUATION_PREFIX.chars().count();
     if let Some(c) = active_color {
         current.push_str(c);
     }

@@ -21,7 +21,7 @@ fn word_boundary_wrap() {
     let w = "a".repeat(50);
     let input = format!("{w} {w}");
     // 50 + 1 + 50 = 101 > 80 → wrap before second word.
-    assert_eq!(wrap_chat(&input), vec![w.clone(), w]);
+    assert_eq!(wrap_chat(&input), vec![w.clone(), format!("> {w}")]);
 }
 
 #[test]
@@ -31,8 +31,8 @@ fn color_preserved_on_continuation() {
     let lines = wrap_chat(&input);
     assert_eq!(lines.len(), 3);
     assert!(lines[0].starts_with("&a"));
-    assert!(lines[1].starts_with("&a"));
-    assert!(lines[2].starts_with("&a"));
+    assert!(lines[1].starts_with("> &a"));
+    assert!(lines[2].starts_with("> &a"));
 }
 
 #[test]
@@ -42,17 +42,37 @@ fn most_recent_color_used_for_continuation() {
     let lines = wrap_chat(&input);
     assert_eq!(lines.len(), 2);
     assert!(lines[0].starts_with("&a"));
-    assert!(lines[1].starts_with("&c"));
+    assert!(lines[1].starts_with("> &c"));
 }
 
 #[test]
 fn hard_break_long_word() {
     let w = "z".repeat(WRAP_WIDTH * 2 + 5);
     let lines = wrap_chat(&w);
+    // 165 z's: line 1 takes 80, line 2 takes 78 (80 - "> "), line 3 takes the
+    // remaining 7 plus its own "> " prefix.
     assert_eq!(lines.len(), 3);
     assert_eq!(lines[0].chars().count(), WRAP_WIDTH);
     assert_eq!(lines[1].chars().count(), WRAP_WIDTH);
-    assert_eq!(lines[2].chars().count(), 5);
+    assert_eq!(lines[2].chars().count(), 7 + 2);
+    assert!(lines[1].starts_with("> "));
+    assert!(lines[2].starts_with("> "));
+}
+
+#[test]
+fn continuation_prefix_added_after_wrap() {
+    let w = "a".repeat(50);
+    let input = format!("{w} {w}");
+    let lines = wrap_chat(&input);
+    assert_eq!(lines.len(), 2);
+    assert!(
+        !lines[0].starts_with("> "),
+        "first line must not be prefixed"
+    );
+    assert!(
+        lines[1].starts_with("> "),
+        "continuation line must start with > "
+    );
 }
 
 #[test]
@@ -101,5 +121,5 @@ fn realistic_error_message_wraps() {
     assert!(lines.len() > 1);
     // First line carries the leading &c; later lines should re-emit &f (most recent).
     assert!(lines[0].starts_with("&c"));
-    assert!(lines.iter().skip(1).all(|l| l.starts_with("&f")));
+    assert!(lines.iter().skip(1).all(|l| l.starts_with("> &f")));
 }
