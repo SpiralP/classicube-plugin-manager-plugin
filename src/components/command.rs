@@ -32,7 +32,7 @@ thread_local!(
 
 /// Default owner used when a shorthand has no `owner/` prefix. SpiralP owns
 /// most ClassiCube plugins and follows the `classicube-$name-plugin` naming
-/// convention, so `/subscribe foo` resolves to `SpiralP/classicube-foo-plugin`.
+/// convention, so `/add foo` resolves to `SpiralP/classicube-foo-plugin`.
 const DEFAULT_OWNER: &str = "SpiralP";
 
 /// Expand user-typed shorthand into ordered `(owner, repo)` candidates to try.
@@ -47,7 +47,7 @@ fn expand_candidates(input: &str) -> Option<Vec<(String, String)>> {
     // Curated shorthand wins over the generic `classicube-$name-plugin`
     // expansion: bare input only (no slash) — owner-prefixed input always
     // means "I know what I want" and skips the curated lookup. A hit returns
-    // a single canonical candidate, so callers like `handle_subscribe` skip
+    // a single canonical candidate, so callers like `handle_add` skip
     // `resolve_canonical`'s speculative 404 probe.
     if !input.contains('/')
         && let Some(entry) = discover::lookup_shorthand(input)
@@ -84,7 +84,7 @@ fn is_canonical_repo_name(repo: &str) -> bool {
 
 /// Find the first subscription that matches any candidate, preferring
 /// earlier candidates (literal before expanded). Comparison is
-/// case-insensitive, mirroring how `handle_subscribe` checks for duplicates.
+/// case-insensitive, mirroring how `handle_add` checks for duplicates.
 /// Returns the *stored* keys (preserving the user's original case) plus a
 /// reference to the subscription, so callers can use them as map-removal /
 /// chat-display keys without re-walking.
@@ -138,8 +138,8 @@ fn find_stored_keys(config: &Config, candidates: &[(String, String)]) -> Option<
 }
 
 const USAGE_LINES: &[&str] = &[
-    "&a/client Updater subscribe <owner>/<repo> [stable|prerelease|tag <ref>]",
-    "&a/client Updater unsubscribe <owner>/<repo>",
+    "&a/client Updater add <owner>/<repo> [stable|prerelease|tag <ref>]",
+    "&a/client Updater remove <owner>/<repo>",
     "&a/client Updater channel <owner>/<repo> stable|prerelease|tag <ref>",
     "&a/client Updater disable <owner>/<repo>",
     "&a/client Updater enable <owner>/<repo>",
@@ -153,7 +153,7 @@ const USAGE_LINES: &[&str] = &[
 /// Parse the trailing channel arguments after `<owner>/<repo>`.
 ///
 /// Accepted forms (CLI):
-/// - `[]`            → `Channel::Stable` (default for `/subscribe`)
+/// - `[]`            → `Channel::Stable` (default for `/add`)
 /// - `["stable"]`    → `Channel::Stable`
 /// - `["prerelease"]`→ `Channel::Prerelease`
 /// - `["tag", ref]`  → `Channel::Tag(ref)` (preferred CLI form)
@@ -199,7 +199,7 @@ fn pause_target(sub: &Subscription) -> Result<Channel, String> {
 /// own subscription. Used by mutating handlers that would otherwise leave the
 /// user in a half-state (entry removed but binary still loaded, or
 /// self-updates silently disabled). `action` is the verb shown in the message
-/// (e.g. `"unsubscribe from"`, `"disable"`).
+/// (e.g. `"remove"`, `"disable"`).
 fn refuse_self_mutation(owner: &str, repo: &str, action: &str) -> Option<String> {
     if !config::is_self(owner, repo) {
         return None;
@@ -253,9 +253,9 @@ async fn print_save_error(e: &Error) {
     .await;
 }
 
-async fn print_not_subscribed(spec: &str) {
+async fn print_not_added(spec: &str) {
     print_async(format!(
-        "{}Not subscribed to {}{}{}; use {}subscribe{} first",
+        "{}Not added: {}{}{}; use {}add{} first",
         color::YELLOW,
         color::LIME,
         spec,
@@ -266,7 +266,7 @@ async fn print_not_subscribed(spec: &str) {
     .await;
 }
 
-fn handle_subscribe(spec: &str, channel: Channel) {
+fn handle_add(spec: &str, channel: Channel) {
     let Some(candidates) = expand_candidates(spec) else {
         print_wrapped(format!("{}Expected owner/repo, got: {spec}", color::RED));
         return;
@@ -284,8 +284,8 @@ fn handle_subscribe(spec: &str, channel: Channel) {
 
         if let Some((existing_owner, existing_repo, _)) = find_subscription(&config, &candidates) {
             print_async(format!(
-                "{}Already subscribed to {}{existing_owner}/{existing_repo} {}(use {}/client \
-                 Updater channel{} to switch channels)",
+                "{}Already added: {}{existing_owner}/{existing_repo} {}(use {}/client Updater \
+                 channel{} to switch channels)",
                 color::YELLOW,
                 color::LIME,
                 color::YELLOW,
@@ -301,7 +301,7 @@ fn handle_subscribe(spec: &str, channel: Channel) {
             return;
         };
         print_async(format!(
-            "{}Subscribed to {}{owner}/{repo}{}",
+            "{}Added {}{owner}/{repo}{}",
             color::PINK,
             color::LIME,
             channel_suffix(&channel),
@@ -312,12 +312,12 @@ fn handle_subscribe(spec: &str, channel: Channel) {
 
 /// Resolve `candidates` to a canonical `(owner, repo)`, insert a fresh
 /// subscription on `channel`, and persist. Shared by explicit
-/// `/subscribe` and the implicit-subscribe paths in `/update`,
-/// `/enable`, `/channel`. Single-candidate inputs skip the probe -
-/// callers that go on to install (`run_update`) hit GitHub anyway.
-/// Returns `None` on probe-resolve failure or save failure, after
-/// printing a chat-ready error. Caller must already have verified
-/// that no subscription matches `candidates`.
+/// `/add` and the implicit-add paths in `/update`, `/enable`,
+/// `/channel`. Single-candidate inputs skip the probe - callers
+/// that go on to install (`run_update`) hit GitHub anyway. Returns
+/// `None` on probe-resolve failure or save failure, after printing
+/// a chat-ready error. Caller must already have verified that no
+/// subscription matches `candidates`.
 async fn add_subscription(
     spec: &str,
     candidates: Vec<(String, String)>,
@@ -392,12 +392,12 @@ async fn probe_release(owner: &str, repo: &str, channel: &Channel) -> Result<()>
     Ok(())
 }
 
-/// Implicit-subscribe path for commands whose user intent reads as "I want
+/// Implicit-add path for commands whose user intent reads as "I want
 /// this plugin on" (`/update`, `/enable`, `/channel`). Wraps
 /// `add_subscription` with an "(auto), installing..." chat message and
 /// hands off to the existing install path. Caller has already checked
 /// that no subscription exists for `candidates`.
-async fn auto_subscribe_and_install(
+async fn auto_add_and_install(
     spec: &str,
     candidates: Vec<(String, String)>,
     channel: Channel,
@@ -407,7 +407,7 @@ async fn auto_subscribe_and_install(
         return;
     };
     print_async(format!(
-        "{}Subscribed to {}{owner}/{repo}{} {}(auto), installing...",
+        "{}Added {}{owner}/{repo}{} {}(auto), installing...",
         color::PINK,
         color::LIME,
         channel_suffix(&channel),
@@ -417,7 +417,7 @@ async fn auto_subscribe_and_install(
     spawn_update_task(owner, repo, channel, None);
 }
 
-fn handle_unsubscribe(spec: &str) {
+fn handle_remove(spec: &str) {
     let Some(candidates) = expand_candidates(spec) else {
         print_wrapped(format!("{}Expected owner/repo, got: {spec}", color::RED));
         return;
@@ -435,7 +435,7 @@ fn handle_unsubscribe(spec: &str) {
 
         let Some((stored_owner, stored_repo, _)) = find_subscription(&config, &candidates) else {
             print_async(format!(
-                "{}Not subscribed to {}{}",
+                "{}Not added: {}{}",
                 color::YELLOW,
                 color::LIME,
                 spec,
@@ -444,7 +444,7 @@ fn handle_unsubscribe(spec: &str) {
             return;
         };
 
-        if let Some(msg) = refuse_self_mutation(&stored_owner, &stored_repo, "unsubscribe from") {
+        if let Some(msg) = refuse_self_mutation(&stored_owner, &stored_repo, "remove") {
             print_async(msg).await;
             return;
         }
@@ -460,7 +460,7 @@ fn handle_unsubscribe(spec: &str) {
             return;
         }
         print_async(format!(
-            "{}Unsubscribed from {}{stored_owner}/{stored_repo}",
+            "{}Removed {}{stored_owner}/{stored_repo}",
             color::PINK,
             color::LIME,
         ))
@@ -514,7 +514,7 @@ fn handle_channel(spec: &str, channel: Channel) {
             return;
         }
 
-        auto_subscribe_and_install(&spec, candidates, channel, &mut config).await;
+        auto_add_and_install(&spec, candidates, channel, &mut config).await;
     });
 }
 
@@ -571,10 +571,10 @@ fn set_disabled(spec: &str, disabled: bool) {
         // other hand, reads as "I want this plugin on" - same intent as
         // /update, so auto-subscribe + install with the default channel.
         if disabled {
-            print_not_subscribed(&spec).await;
+            print_not_added(&spec).await;
             return;
         }
-        auto_subscribe_and_install(&spec, candidates, Channel::Stable, &mut config).await;
+        auto_add_and_install(&spec, candidates, Channel::Stable, &mut config).await;
     });
 }
 
@@ -595,7 +595,7 @@ fn handle_pause(spec: &str) {
         };
 
         let Some((owner, repo, sub)) = find_subscription_mut(&mut config, &candidates) else {
-            print_not_subscribed(&spec).await;
+            print_not_added(&spec).await;
             return;
         };
 
@@ -652,7 +652,7 @@ fn handle_unpause(spec: &str) {
         };
 
         let Some((owner, repo, sub)) = find_subscription_mut(&mut config, &candidates) else {
-            print_not_subscribed(&spec).await;
+            print_not_added(&spec).await;
             return;
         };
 
@@ -768,7 +768,7 @@ fn handle_update_one(spec: &str) {
             return;
         }
 
-        auto_subscribe_and_install(&spec, candidates, Channel::Stable, &mut config).await;
+        auto_add_and_install(&spec, candidates, Channel::Stable, &mut config).await;
     });
 }
 
@@ -933,11 +933,11 @@ extern "C" fn c_callback(args: *const cc_string, args_count: c_int) {
     let args: Vec<&str> = args.iter().map(AsRef::as_ref).collect();
 
     match args.as_slice() {
-        ["subscribe", spec, channel_args @ ..] => match parse_channel_args(channel_args) {
-            Ok(c) => handle_subscribe(spec, c),
+        ["add", spec, channel_args @ ..] => match parse_channel_args(channel_args) {
+            Ok(c) => handle_add(spec, c),
             Err(e) => print_wrapped(format!("{}{e}", color::RED)),
         },
-        ["unsubscribe", spec] => handle_unsubscribe(spec),
+        ["remove", spec] => handle_remove(spec),
         ["channel", spec, channel_args @ ..] => {
             if channel_args.is_empty() {
                 print_usage();

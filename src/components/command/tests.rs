@@ -375,17 +375,17 @@ fn pause_target_refuses_when_nothing_installed() {
 
 #[test]
 fn refuse_self_mutation_blocks_self_owner_repo() {
-    let msg = refuse_self_mutation(SELF_OWNER, SELF_REPO, "unsubscribe from")
+    let msg = refuse_self_mutation(SELF_OWNER, SELF_REPO, "remove")
         .expect("self target should be refused");
     assert!(msg.contains("updater plugin"), "got: {msg}");
-    assert!(msg.contains("unsubscribe from"), "got: {msg}");
+    assert!(msg.contains("remove"), "got: {msg}");
     assert!(msg.contains(SELF_OWNER), "got: {msg}");
     assert!(msg.contains(SELF_REPO), "got: {msg}");
 }
 
 #[test]
 fn refuse_self_mutation_allows_other_repo() {
-    assert!(refuse_self_mutation("octocat", "classicube-foo-plugin", "unsubscribe from").is_none());
+    assert!(refuse_self_mutation("octocat", "classicube-foo-plugin", "remove").is_none());
     assert!(refuse_self_mutation("octocat", "classicube-foo-plugin", "disable").is_none());
 }
 
@@ -399,7 +399,7 @@ fn refuse_self_mutation_is_case_sensitive() {
 
 #[test]
 fn refuse_self_mutation_message_is_ascii() {
-    let msg = refuse_self_mutation(SELF_OWNER, SELF_REPO, "unsubscribe from").unwrap();
+    let msg = refuse_self_mutation(SELF_OWNER, SELF_REPO, "remove").unwrap();
     assert!(msg.is_ascii(), "chat output must be ASCII: {msg:?}");
     let msg = refuse_self_mutation(SELF_OWNER, SELF_REPO, "disable").unwrap();
     assert!(msg.is_ascii(), "chat output must be ASCII: {msg:?}");
