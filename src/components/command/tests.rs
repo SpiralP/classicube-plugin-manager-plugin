@@ -273,6 +273,61 @@ fn parse_channel_args_rejects_extra_args() {
 }
 
 #[test]
+fn parse_add_args_empty_is_stable_no_token() {
+    assert_eq!(parse_add_args(&[]), Ok((Channel::Stable, None)));
+}
+
+#[test]
+fn parse_add_args_channel_only() {
+    assert_eq!(
+        parse_add_args(&["prerelease"]),
+        Ok((Channel::Prerelease, None))
+    );
+    assert_eq!(
+        parse_add_args(&["tag", "v1.2.3"]),
+        Ok((Channel::Tag("v1.2.3".into()), None))
+    );
+}
+
+#[test]
+fn parse_add_args_token_only() {
+    assert_eq!(
+        parse_add_args(&["token", "ghp_abc123"]),
+        Ok((Channel::Stable, Some("ghp_abc123".into())))
+    );
+}
+
+#[test]
+fn parse_add_args_channel_and_token() {
+    assert_eq!(
+        parse_add_args(&["prerelease", "token", "ghp_abc123"]),
+        Ok((Channel::Prerelease, Some("ghp_abc123".into())))
+    );
+    assert_eq!(
+        parse_add_args(&["tag", "v1.2.3", "token", "ghp_abc123"]),
+        Ok((Channel::Tag("v1.2.3".into()), Some("ghp_abc123".into())))
+    );
+}
+
+#[test]
+fn parse_add_args_rejects_bare_token() {
+    assert!(parse_add_args(&["token"]).is_err());
+    assert!(parse_add_args(&["prerelease", "token"]).is_err());
+}
+
+#[test]
+fn parse_add_args_rejects_empty_token_value() {
+    assert!(parse_add_args(&["token", ""]).is_err());
+}
+
+#[test]
+fn parse_add_args_rejects_token_before_channel() {
+    // Token must be the trailing clause; embedding it earlier leaves
+    // `parse_channel_args` with a bogus arg list and it bails.
+    assert!(parse_add_args(&["token", "ghp_abc", "prerelease"]).is_err());
+}
+
+#[test]
 fn channel_suffix_skips_default() {
     assert_eq!(channel_suffix(&Channel::Stable), "");
     assert!(channel_suffix(&Channel::Prerelease).contains("prerelease"));

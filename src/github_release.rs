@@ -143,7 +143,8 @@ pub(crate) fn classify_error(status: StatusCode, had_token: bool, body: &[u8]) -
 
     match status {
         StatusCode::NOT_FOUND if !had_token => anyhow!(
-            "not found (if this repo is private, add `token = \"github_pat_...\"` to its entry in \
+            "not found (if this repo is private, retry with `add <owner>/<repo> token \
+             github_pat_...` or add `token = \"github_pat_...\"` to its entry in \
              plugin-updater.toml)"
         ),
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN if had_token => anyhow!(

@@ -24,6 +24,7 @@ use crate::{
     discover,
     github_release::{get_release_for_channel, resolve_expected_digest},
     installer::{download_self, download_to_managed_dir},
+    secret::Secret,
 };
 
 thread_local!(
@@ -138,7 +139,7 @@ fn find_stored_keys(config: &Config, candidates: &[(String, String)]) -> Option<
 }
 
 const USAGE_LINES: &[&str] = &[
-    "&a/client Updater add <owner>/<repo> [stable|prerelease|tag <ref>]",
+    "&a/client Updater add <owner>/<repo> [stable|prerelease|tag <ref>] [token <token>]",
     "&a/client Updater remove <owner>/<repo>",
     "&a/client Updater channel <owner>/<repo> stable|prerelease|tag <ref>",
     "&a/client Updater disable <owner>/<repo>",
@@ -168,6 +169,26 @@ fn parse_channel_args(args: &[&str]) -> Result<Channel, String> {
             args.join(" ")
         )),
     }
+}
+
+/// Parse the trailing args after `<owner>/<repo>` for `/add`. Strips a
+/// trailing `["token", t]` pair if present, then defers to
+/// `parse_channel_args` for the rest. The token slot must be the last
+/// two args; embedding it between channel args is rejected by
+/// `parse_channel_args`'s strict whitelist.
+fn parse_add_args(args: &[&str]) -> Result<(Channel, Option<String>), String> {
+    let (channel_args, token) = match args {
+        [rest @ .., "token", t] => {
+            if t.is_empty() {
+                return Err("token value cannot be empty".into());
+            }
+            (rest, Some((*t).to_owned()))
+        }
+        [.., "token"] => return Err("expected token <value>, got bare token".into()),
+        _ => (args, None),
+    };
+    let channel = parse_channel_args(channel_args)?;
+    Ok((channel, token))
 }
 
 /// Switch a subscription to a new channel and invalidate its cached release
@@ -266,7 +287,7 @@ async fn print_not_added(spec: &str) {
     .await;
 }
 
-fn handle_add(spec: &str, channel: Channel) {
+fn handle_add(spec: &str, channel: Channel, token: Option<String>) {
     let Some(candidates) = expand_candidates(spec) else {
         print_wrapped(format!("{}Expected owner/repo, got: {spec}", color::RED));
         return;
@@ -283,9 +304,17 @@ fn handle_add(spec: &str, channel: Channel) {
         };
 
         if let Some((existing_owner, existing_repo, _)) = find_subscription(&config, &candidates) {
+            let token_note = if token.is_some() {
+                format!(
+                    " {}(token ignored; edit plugins/plugin-updater.toml to change it)",
+                    color::YELLOW,
+                )
+            } else {
+                String::new()
+            };
             print_async(format!(
                 "{}Already added: {}{existing_owner}/{existing_repo} {}(use {}/client Updater \
-                 channel{} to switch channels)",
+                 channel{} to switch channels){token_note}",
                 color::YELLOW,
                 color::LIME,
                 color::YELLOW,
@@ -296,7 +325,8 @@ fn handle_add(spec: &str, channel: Channel) {
             return;
         }
 
-        let Some((owner, repo)) = add_subscription(&spec, candidates, &channel, &mut config).await
+        let Some((owner, repo)) =
+            add_subscription(&spec, candidates, &channel, token, &mut config).await
         else {
             return;
         };
@@ -322,12 +352,13 @@ async fn add_subscription(
     spec: &str,
     candidates: Vec<(String, String)>,
     channel: &Channel,
+    token: Option<String>,
     config: &mut Config,
 ) -> Option<(String, String)> {
     let (owner, repo) = if candidates.len() == 1 {
         candidates.into_iter().next().unwrap()
     } else {
-        match resolve_canonical(&candidates, channel).await {
+        match resolve_canonical(&candidates, channel, token.as_deref()).await {
             Ok(pair) => pair,
             Err(e) => {
                 print_async(format!(
@@ -353,7 +384,7 @@ async fn add_subscription(
             Subscription {
                 channel: channel.clone(),
                 disabled: false,
-                token: None,
+                token: token.map(Secret::new),
                 state: SubscriptionState::default(),
             },
         );
@@ -371,10 +402,11 @@ async fn add_subscription(
 async fn resolve_canonical(
     candidates: &[(String, String)],
     channel: &Channel,
+    token: Option<&str>,
 ) -> Result<(String, String)> {
     let mut errors: Vec<String> = Vec::new();
     for (owner, repo) in candidates {
-        match probe_release(owner, repo, channel).await {
+        match probe_release(owner, repo, channel, token).await {
             Ok(()) => return Ok((owner.clone(), repo.clone())),
             Err(e) => errors.push(format!("{owner}/{repo}: {e}")),
         }
@@ -382,12 +414,16 @@ async fn resolve_canonical(
     bail!("{}", errors.join("; "));
 }
 
-async fn probe_release(owner: &str, repo: &str, channel: &Channel) -> Result<()> {
-    // No per-sub token here: the subscription doesn't exist yet. Anonymous
-    // probe is fine for public repos; private repos surface as a 404 with
-    // the "may be private — add a token" hint, which prompts the user to
-    // edit the TOML by hand and retry.
-    let release = get_release_for_channel(owner, repo, channel, None).await?;
+async fn probe_release(
+    owner: &str,
+    repo: &str,
+    channel: &Channel,
+    token: Option<&str>,
+) -> Result<()> {
+    // The subscription doesn't exist yet, but `/add` may have supplied a
+    // token inline; pass it through so private-repo probes succeed instead
+    // of failing with the "may be private - add a token" hint.
+    let release = get_release_for_channel(owner, repo, channel, token).await?;
     pick_asset(&release.assets, env::consts::ARCH, env::consts::DLL_SUFFIX)?;
     Ok(())
 }
@@ -403,7 +439,8 @@ async fn auto_add_and_install(
     channel: Channel,
     config: &mut Config,
 ) {
-    let Some((owner, repo)) = add_subscription(spec, candidates, &channel, config).await else {
+    let Some((owner, repo)) = add_subscription(spec, candidates, &channel, None, config).await
+    else {
         return;
     };
     print_async(format!(
@@ -933,8 +970,8 @@ extern "C" fn c_callback(args: *const cc_string, args_count: c_int) {
     let args: Vec<&str> = args.iter().map(AsRef::as_ref).collect();
 
     match args.as_slice() {
-        ["add", spec, channel_args @ ..] => match parse_channel_args(channel_args) {
-            Ok(c) => handle_add(spec, c),
+        ["add", spec, rest @ ..] => match parse_add_args(rest) {
+            Ok((c, t)) => handle_add(spec, c, t),
             Err(e) => print_wrapped(format!("{}{e}", color::RED)),
         },
         ["remove", spec] => handle_remove(spec),

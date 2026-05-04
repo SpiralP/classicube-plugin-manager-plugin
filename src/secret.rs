@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 pub struct Secret(String);
 
 impl Secret {
-    #[cfg(test)]
     pub fn new(s: String) -> Self {
         Self(s)
     }
