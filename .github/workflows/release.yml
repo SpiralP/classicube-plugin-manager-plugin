@@ -24,6 +24,7 @@ jobs:
     permissions: {} # none needed, uses a custom GitHub App token
     with:
       runs-on: self-hosted
+      extends: ./.github/semantic-release.json
       replace-files: |
         Cargo.lock
         Cargo.toml
