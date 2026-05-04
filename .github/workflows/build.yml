@@ -67,9 +67,13 @@ jobs:
         run: |
           cargo build --target ${{ matrix.config.target }} ${{ inputs.release && '--release' || '' }}
 
+      - uses: taiki-e/install-action@db5fb34fa772531a3ece57ca434f579eb334e0fb # v2.75.30
+        with:
+          tool: cargo-nextest
+
       - name: Test
         run: |
-          cargo test --target ${{ matrix.config.target }} ${{ inputs.release && '--release' || '' }} -- --nocapture --test-threads 1
+          cargo nextest run --target ${{ matrix.config.target }} ${{ inputs.release && '--release' || '' }} --no-capture
           Move-Item `
             -Path 'target\${{ matrix.config.target }}\${{ inputs.release && 'release' || 'debug' }}\classicube_plugin_updater_plugin.dll' `
             -Destination '.\classicube_plugin_updater_windows_${{ matrix.config.arch }}.dll'
@@ -118,9 +122,13 @@ jobs:
           cargo build --target ${{ matrix.config.target }} ${{ inputs.release && '--release' || '' }}
           file 'target/${{ matrix.config.target }}/${{ inputs.release && 'release' || 'debug' }}/libclassicube_plugin_updater_plugin.so'
 
+      - uses: taiki-e/install-action@db5fb34fa772531a3ece57ca434f579eb334e0fb # v2.75.30
+        with:
+          tool: cargo-nextest
+
       - name: Test
         run: |
-          cargo test --target ${{ matrix.config.target }} ${{ inputs.release && '--release' || '' }} -- --nocapture --test-threads 1
+          cargo nextest run --target ${{ matrix.config.target }} ${{ inputs.release && '--release' || '' }} --no-capture
           mv 'target/${{ matrix.config.target }}/${{ inputs.release && 'release' || 'debug' }}/libclassicube_plugin_updater_plugin.so' \
             './classicube_plugin_updater_linux_${{ matrix.config.arch }}.so'
 
@@ -157,9 +165,13 @@ jobs:
           cargo build --target ${{ matrix.config.target }} ${{ inputs.release && '--release' || '' }}
           file 'target/${{ matrix.config.target }}/${{ inputs.release && 'release' || 'debug' }}/libclassicube_plugin_updater_plugin.dylib'
 
+      - uses: taiki-e/install-action@db5fb34fa772531a3ece57ca434f579eb334e0fb # v2.75.30
+        with:
+          tool: cargo-nextest
+
       - name: Test
         run: |
-          cargo test --target ${{ matrix.config.target }} ${{ inputs.release && '--release' || '' }} -- --nocapture --test-threads 1
+          cargo nextest run --target ${{ matrix.config.target }} ${{ inputs.release && '--release' || '' }} --no-capture
           mv 'target/${{ matrix.config.target }}/${{ inputs.release && 'release' || 'debug' }}/libclassicube_plugin_updater_plugin.dylib' \
             'classicube_plugin_updater_macos_${{ matrix.config.arch }}.dylib'
 

@@ -17,6 +17,8 @@
               pkg-config
               rustPlatform.bindgenHook
             ];
+
+            useNextest = true;
           };
         in
         {
