@@ -29,7 +29,7 @@ pub fn pick_asset<'a>(
 
     let (tokens, reject) = arch_tokens(arch);
     if tokens.is_empty() {
-        bail!("unsupported arch `{arch}` — no known asset name tokens to match");
+        bail!("unsupported arch `{arch}` - no known asset name tokens to match");
     }
 
     let by_arch: Vec<&GitHubReleaseAsset> = by_suffix
