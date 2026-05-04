@@ -392,7 +392,7 @@ fn persist_cache_updates_to(
     now: u64,
     updates: Vec<(String, String, String, u64)>,
 ) -> Result<()> {
-    // Re-read so we don't clobber concurrent /subscribe edits made on the
+    // Re-read so we don't clobber concurrent /add edits made on the
     // game thread while HTTP was in flight.
     let mut fresh = Config::load_from(path)?;
     for (owner, repo, tag, published_at) in updates {

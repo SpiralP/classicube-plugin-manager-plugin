@@ -46,7 +46,7 @@ pub fn init_managed(subs: &[(String, String, Subscription)]) {
         if let Some(prev) = sub.state.in_callback.as_deref() {
             // Last session's breadcrumb survived. Treat it as "this sub
             // crashed inside `prev` last run", warn, clear the breadcrumb,
-            // and skip loading this session — the user can /unsubscribe,
+            // and skip loading this session — the user can /remove,
             // /update, or just retry on next startup.
             warn!("{id} crashed inside {prev} last session; skipping this run");
             print_wrapped(format!(
