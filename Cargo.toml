@@ -24,7 +24,7 @@ tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 libc = "=0.2.186"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "=0.61.2", features = [
+windows = { version = "=0.62.2", features = [
     "Win32_Foundation",
     "Win32_System_LibraryLoader",
 ] }

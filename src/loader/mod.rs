@@ -80,8 +80,9 @@ pub fn init_managed(subs: &[(String, String, Subscription)]) {
         // Use the dlopen function name so a crash in the loaded library's
         // static constructors (before Init even runs) is attributed to the
         // load step rather than blamed on Init.
-        let load_result =
-            with_breadcrumb(owner, repo, "DynamicLib_Load2", || plugin::try_load(&path_str));
+        let load_result = with_breadcrumb(owner, repo, "DynamicLib_Load2", || {
+            plugin::try_load(&path_str)
+        });
         match load_result {
             Ok((library, component, api_version)) => {
                 match check_api_version(Plugin_ApiVersion, api_version) {

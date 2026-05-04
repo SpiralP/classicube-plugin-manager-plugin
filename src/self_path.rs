@@ -36,33 +36,34 @@ pub fn current_lib_path() -> Result<PathBuf> {
     use std::{
         ffi::OsString,
         os::{raw::c_void, windows::ffi::OsStringExt},
-        ptr,
     };
 
-    use windows_sys::Win32::{
-        Foundation::HMODULE,
-        System::LibraryLoader::{
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            GetModuleFileNameW, GetModuleHandleExW,
+    use windows::{
+        Win32::{
+            Foundation::HMODULE,
+            System::LibraryLoader::{
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW,
+                GetModuleHandleExW,
+            },
         },
+        core::PCWSTR,
     };
 
-    let mut module: HMODULE = ptr::null_mut();
+    let mut module = HMODULE::default();
     let addr = current_lib_path as *const c_void;
-    let ok = unsafe {
+    unsafe {
         GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            addr.cast::<u16>(),
+            PCWSTR(addr.cast::<u16>()),
             &mut module,
         )
-    };
-    if ok == 0 {
-        return Err(anyhow!("GetModuleHandleExW failed"));
+        .map_err(|e| anyhow!("GetModuleHandleExW failed: {e}"))?;
     }
 
     let mut buf: Vec<u16> = vec![0; 1024];
     loop {
-        let n = unsafe { GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        let n = unsafe { GetModuleFileNameW(Some(module), &mut buf) } as usize;
         if n == 0 {
             return Err(anyhow!("GetModuleFileNameW failed"));
         }
