@@ -334,3 +334,55 @@ fn expand_candidates_uncurated_bare_still_expands() {
         ])
     );
 }
+
+#[test]
+fn pause_target_pins_to_installed_version_from_stable() {
+    let sub = Subscription {
+        channel: Channel::Stable,
+        state: SubscriptionState {
+            installed_version: Some("v1.2.3".into()),
+            ..SubscriptionState::default()
+        },
+        ..empty_sub()
+    };
+    assert_eq!(pause_target(&sub), Ok(Channel::Tag("v1.2.3".into())));
+}
+
+#[test]
+fn pause_target_pins_to_installed_version_from_prerelease() {
+    let sub = Subscription {
+        channel: Channel::Prerelease,
+        state: SubscriptionState {
+            installed_version: Some("v1.2.3-rc1".into()),
+            ..SubscriptionState::default()
+        },
+        ..empty_sub()
+    };
+    assert_eq!(pause_target(&sub), Ok(Channel::Tag("v1.2.3-rc1".into())));
+}
+
+#[test]
+fn pause_target_refuses_when_nothing_installed() {
+    let sub = Subscription {
+        channel: Channel::Stable,
+        state: SubscriptionState::default(),
+        ..empty_sub()
+    };
+    let err = pause_target(&sub).unwrap_err();
+    assert!(err.contains("no installed version"), "got: {err}");
+}
+
+#[test]
+fn pause_target_refuses_when_already_pinned() {
+    let sub = Subscription {
+        channel: Channel::Tag("v1.0.0".into()),
+        state: SubscriptionState {
+            installed_version: Some("v1.0.0".into()),
+            ..SubscriptionState::default()
+        },
+        ..empty_sub()
+    };
+    let err = pause_target(&sub).unwrap_err();
+    assert!(err.contains("already paused"), "got: {err}");
+    assert!(err.contains("v1.0.0"), "got: {err}");
+}
