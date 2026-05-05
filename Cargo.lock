@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "classicube-plugin-updater-plugin"
-version = "0.2.0-alpha.3"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "classicube-helpers",
