@@ -304,7 +304,19 @@ fn list_dir_files(dir: &Path) -> io::Result<HashSet<String>> {
     let mut files = HashSet::new();
     for entry in read_dir {
         let entry = entry?;
-        if entry.metadata()?.is_file()
+        // Follow symlinks: ClassiCube's `dlopen` follows them, so a symlink
+        // to a regular `.so` is a real plugin file for our purposes.
+        // `DirEntry::metadata` is `lstat`, which would mark symlinks as
+        // non-files and silently drop them from duplicate-load detection.
+        // Dangling symlinks are useless to the dynamic linker, so swallow
+        // NotFound and skip them rather than aborting the whole scan.
+        let path = entry.path();
+        let md = match fs::metadata(&path) {
+            Ok(md) => md,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if md.is_file()
             && let Some(name) = entry.file_name().to_str()
         {
             files.insert(name.to_owned());

@@ -716,6 +716,49 @@ fn find_variant_conflicts_finds_both_dirs_and_skips() {
     assert_eq!(got, vec![plugins.join("libclassicube_foo_plugin.so")]);
 }
 
+#[cfg(unix)]
+#[test]
+fn find_variant_conflicts_follows_symlinks() {
+    // Dev-loop pattern: a symlink in plugins/ pointing at a dev-build
+    // artifact. `dlopen` follows symlinks, so duplicate-load detection must
+    // too - `DirEntry::metadata` is `lstat` and would silently drop it.
+    use std::os::unix::fs::symlink;
+    let dir = tempdir().unwrap();
+    let plugins = dir.path().join("plugins");
+    let managed = dir.path().join("managed");
+    fs::create_dir(&plugins).unwrap();
+    fs::create_dir(&managed).unwrap();
+    let target = dir.path().join("real-libclassicube_foo_plugin.so");
+    fs::write(&target, b"x").unwrap();
+    symlink(&target, plugins.join("libclassicube_foo_plugin.so")).unwrap();
+
+    let got =
+        find_variant_conflicts(&plugins, &managed, "classicube-foo-plugin", ".so", &[]).unwrap();
+    assert_eq!(got, vec![plugins.join("libclassicube_foo_plugin.so")]);
+}
+
+#[cfg(unix)]
+#[test]
+fn find_variant_conflicts_skips_dangling_symlinks() {
+    // A dangling symlink can't be `dlopen`'d. Skip rather than fail the
+    // whole scan (otherwise a stale link in plugins/ would block /add).
+    use std::os::unix::fs::symlink;
+    let dir = tempdir().unwrap();
+    let plugins = dir.path().join("plugins");
+    let managed = dir.path().join("managed");
+    fs::create_dir(&plugins).unwrap();
+    fs::create_dir(&managed).unwrap();
+    symlink(
+        dir.path().join("does-not-exist.so"),
+        plugins.join("libclassicube_foo_plugin.so"),
+    )
+    .unwrap();
+
+    let got =
+        find_variant_conflicts(&plugins, &managed, "classicube-foo-plugin", ".so", &[]).unwrap();
+    assert!(got.is_empty());
+}
+
 #[test]
 fn find_variant_conflicts_handles_missing_dirs() {
     // Production may run before plugins/managed/ exists; ENOENT must be

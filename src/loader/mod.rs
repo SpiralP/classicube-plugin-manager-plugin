@@ -417,7 +417,15 @@ fn detect_plugins_dir_conflict(
     let mut hits: Vec<String> = Vec::new();
     for entry in read_dir {
         let entry = entry?;
-        if !entry.metadata()?.is_file() {
+        // Follow symlinks: `dlopen` does, so a symlink-to-`.so` is a real
+        // plugin file. `DirEntry::metadata` is `lstat` and would skip them.
+        let path = entry.path();
+        let md = match fs::metadata(&path) {
+            Ok(md) => md,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if !md.is_file() {
             continue;
         }
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {

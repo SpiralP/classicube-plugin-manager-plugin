@@ -410,8 +410,7 @@ fn resolve_self_update_target_refuses_to_overwrite_loaded_file() {
     let loaded_basename =
         versioned_managed_filename(SELF_OWNER, SELF_REPO, "v0.2.0", env::consts::DLL_SUFFIX);
     let loaded = PathBuf::from("/game/plugins").join(&loaded_basename);
-    let err =
-        resolve_self_update_target(&loaded, "v0.2.0", env::consts::DLL_SUFFIX).unwrap_err();
+    let err = resolve_self_update_target(&loaded, "v0.2.0", env::consts::DLL_SUFFIX).unwrap_err();
     let msg = format!("{err:#}");
     assert!(
         msg.contains("already loaded") && msg.contains("v0.2.0"),

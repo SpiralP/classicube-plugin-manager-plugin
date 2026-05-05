@@ -113,6 +113,37 @@ fn directory_with_matching_name_does_not_collide() {
     assert!(result.is_none());
 }
 
+#[cfg(unix)]
+#[test]
+fn symlink_to_plugin_file_is_a_conflict() {
+    // Common dev-loop pattern: `ln -s target/release/lib...so plugins/`.
+    // `dlopen` follows symlinks, so we have to flag them as conflicts;
+    // `DirEntry::metadata` is `lstat` and would silently drop them.
+    use std::os::unix::fs::symlink;
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("real-libclassicube_foo_plugin.so");
+    fs::write(&target, b"x").unwrap();
+    let link = dir.path().join("libclassicube_foo_plugin.so");
+    symlink(&target, &link).unwrap();
+    let result =
+        detect_plugins_dir_conflict(dir.path(), "classicube-foo-plugin", ".so", None).unwrap();
+    assert_eq!(result.as_deref(), Some(link.as_path()));
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_symlink_is_skipped() {
+    // A dangling symlink can't be `dlopen`'d, so it isn't a real
+    // duplicate-load hazard. Skip rather than error.
+    use std::os::unix::fs::symlink;
+    let dir = tempdir().unwrap();
+    let link = dir.path().join("libclassicube_foo_plugin.so");
+    symlink(dir.path().join("does-not-exist.so"), &link).unwrap();
+    let result =
+        detect_plugins_dir_conflict(dir.path(), "classicube-foo-plugin", ".so", None).unwrap();
+    assert!(result.is_none());
+}
+
 #[test]
 fn api_version_equal_is_ok() {
     assert_eq!(check_api_version(1, 1), ApiVersionCheck::Ok);
