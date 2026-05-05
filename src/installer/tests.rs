@@ -186,3 +186,85 @@ fn parse_sha256_digest_rejects_non_hex() {
     let bad = "sha256:gcf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
     assert!(parse_sha256_digest(bad).is_err());
 }
+
+#[test]
+fn versioned_filename_is_simple_when_inputs_are_clean() {
+    let got = versioned_managed_filename("SpiralP", "classicube-leash-plugin", "v0.3.1", ".so");
+    assert_eq!(got, "SpiralP-classicube-leash-plugin-v0.3.1.so");
+}
+
+#[test]
+fn versioned_filename_preserves_safe_chars() {
+    let got = versioned_managed_filename("o", "r", "1.2.3-rc.4_alpha", ".dll");
+    assert_eq!(got, "o-r-1.2.3-rc.4_alpha.dll");
+}
+
+#[test]
+fn versioned_filename_sanitizes_unsafe_chars() {
+    // Anything outside [A-Za-z0-9._-] maps to `_`.
+    let got = versioned_managed_filename("o", "r", "a/b c+d", ".so");
+    assert_eq!(got, "o-r-a_b_c_d.so");
+}
+
+#[test]
+fn versioned_filename_replaces_non_ascii() {
+    // Non-ASCII isn't `is_ascii_alphanumeric`, so each scalar becomes `_`.
+    let got = versioned_managed_filename("o", "r", "café", ".so");
+    assert_eq!(got, "o-r-caf_.so");
+}
+
+#[test]
+fn versioned_filename_blocks_path_traversal() {
+    // The sanitized tag is one filename component - no slashes can
+    // survive, so it can never escape MANAGED_DIR even with a malicious
+    // tag.
+    let got = versioned_managed_filename("o", "r", "../../etc/passwd", ".so");
+    assert!(!got.contains('/'));
+}
+
+#[test]
+fn versioned_filename_caps_long_tags_at_64() {
+    let long_tag = "a".repeat(200);
+    let got = versioned_managed_filename("o", "r", &long_tag, ".so");
+    // Prefix `o-r-` (4 bytes) + 64 `a`s + `.so` (3 bytes).
+    assert_eq!(got.len(), 4 + 64 + 3);
+    assert!(got.starts_with("o-r-"));
+    assert!(got.ends_with(".so"));
+}
+
+#[test]
+fn cleanup_previous_managed_noop_when_previous_is_none() {
+    // A bogus dir is fine - the helper short-circuits before touching it.
+    cleanup_previous_managed(Path::new("/__nope__"), None, "anything.so");
+}
+
+#[test]
+fn cleanup_previous_managed_noop_when_previous_equals_new() {
+    // Caller passing the same name means "no rename happened" - we'd
+    // otherwise unlink the file we just persisted as the claim.
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("same.so"), b"data").unwrap();
+
+    cleanup_previous_managed(dir.path(), Some("same.so"), "same.so");
+
+    assert!(dir.path().join("same.so").exists());
+}
+
+#[test]
+fn cleanup_previous_managed_deletes_when_different() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("old.so"), b"old").unwrap();
+    fs::write(dir.path().join("new.so"), b"new").unwrap();
+
+    cleanup_previous_managed(dir.path(), Some("old.so"), "new.so");
+
+    assert!(!dir.path().join("old.so").exists());
+    assert!(dir.path().join("new.so").exists());
+}
+
+#[test]
+fn cleanup_previous_managed_swallows_missing_file() {
+    let dir = tempdir().unwrap();
+    // Should not panic, should not error - ENOENT is the silent path.
+    cleanup_previous_managed(dir.path(), Some("never-existed.so"), "fresh.so");
+}

@@ -2,6 +2,7 @@
 mod tests;
 
 use std::{
+    env,
     ffi::OsStr,
     fs, io,
     path::{Path, PathBuf},
@@ -20,17 +21,63 @@ use crate::{
 pub const PLUGINS_DIR: &str = "plugins";
 pub const MANAGED_DIR: &str = "plugins/managed";
 
+/// Build the on-disk filename for a managed plugin binary. Including the
+/// version tag in the filename gives every release a distinct path, which is
+/// what makes in-session `/update` actually swap code: glibc's `dlopen`
+/// dedupes by realpath (and Windows by module name), so a fresh dlopen of
+/// the *same* path returns the cached handle - i.e. the old code keeps
+/// running. A fresh path forces a fresh mapping.
+///
+/// Schema: `<owner>-<repo>-<sanitized_tag><ext>`. The tag is sanitized so it
+/// can't escape the directory or produce surprising filenames - any char
+/// outside `[A-Za-z0-9._-]` becomes `_`. Sanitized tags are capped at 64
+/// chars to keep paths reasonable; tags rarely approach this.
+pub fn versioned_managed_filename(owner: &str, repo: &str, tag: &str, ext: &str) -> String {
+    let safe_tag: String = tag
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    format!("{owner}-{repo}-{safe_tag}{ext}")
+}
+
 pub async fn download_to_managed_dir(
+    owner: &str,
+    repo: &str,
+    tag: &str,
     asset: &GitHubReleaseAsset,
     expected_digest: Option<&str>,
     token: Option<&str>,
 ) -> Result<PathBuf> {
-    debug!(
-        "downloading {} -> {}/{}",
-        asset.url, MANAGED_DIR, asset.name
-    );
+    let filename = versioned_managed_filename(owner, repo, tag, env::consts::DLL_SUFFIX);
+    debug!("downloading {} -> {}/{}", asset.url, MANAGED_DIR, filename);
     let bytes = download_bytes(asset, token).await?;
-    install_bytes_to(Path::new(MANAGED_DIR), &asset.name, &bytes, expected_digest)
+    install_bytes_to(Path::new(MANAGED_DIR), &filename, &bytes, expected_digest)
+}
+
+/// Best-effort delete of the previous versioned managed file after a
+/// successful update. No-op when `previous == new` or `previous` is None.
+/// On Linux/macOS the unlink succeeds even while the library is mapped
+/// (the dirent is decoupled from the inode); on Windows the delete may
+/// fail with a sharing violation, in which case the startup orphan sweep
+/// catches the leftover next session.
+pub fn cleanup_previous_managed(managed_dir: &Path, previous: Option<&str>, new: &str) {
+    let Some(prev) = previous else { return };
+    if prev == new {
+        return;
+    }
+    let path = managed_dir.join(prev);
+    match fs::remove_file(&path) {
+        Ok(()) => debug!("removed prior managed binary {}", path.display()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => debug!("could not remove {}: {e}", path.display()),
+    }
 }
 
 /// Self-update install: write the new bytes over the loaded updater binary

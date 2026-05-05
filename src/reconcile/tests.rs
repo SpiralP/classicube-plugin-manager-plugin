@@ -730,3 +730,72 @@ fn find_variant_conflicts_handles_missing_dirs() {
     .unwrap();
     assert!(got.is_empty());
 }
+
+#[test]
+fn sweep_managed_orphans_deletes_unclaimed_files_only() {
+    let dir = tempdir().unwrap();
+    let managed = dir.path().join("managed");
+    fs::create_dir(&managed).unwrap();
+    touch(&managed, "claimed.so");
+    touch(&managed, "stranger.so");
+    touch(&managed, "old-version.so");
+
+    let mut sub = empty_sub();
+    sub.state.installed_asset = Some("claimed.so".into());
+    let cfg = config_with(vec![("a", "b", sub)]);
+
+    let deleted = sweep_managed_orphans(&managed, &cfg);
+
+    assert_eq!(deleted, vec!["old-version.so", "stranger.so"]);
+    assert!(managed.join("claimed.so").exists());
+    assert!(!managed.join("stranger.so").exists());
+    assert!(!managed.join("old-version.so").exists());
+}
+
+#[test]
+fn sweep_managed_orphans_skips_new_and_old_artifacts() {
+    // install_bytes_to leaves `.new` / `.old` mid-rename; those have their
+    // own cleanup paths and the sweep must not remove them out from under
+    // an in-flight install.
+    let dir = tempdir().unwrap();
+    let managed = dir.path().join("managed");
+    fs::create_dir(&managed).unwrap();
+    touch(&managed, "claimed.so");
+    touch(&managed, "claimed.so.new");
+    touch(&managed, "claimed.so.old");
+    touch(&managed, "garbage");
+
+    let mut sub = empty_sub();
+    sub.state.installed_asset = Some("claimed.so".into());
+    let cfg = config_with(vec![("a", "b", sub)]);
+
+    let deleted = sweep_managed_orphans(&managed, &cfg);
+
+    assert_eq!(deleted, vec!["garbage"]);
+    assert!(managed.join("claimed.so.new").exists());
+    assert!(managed.join("claimed.so.old").exists());
+}
+
+#[test]
+fn sweep_managed_orphans_handles_missing_dir() {
+    // Production may run before plugins/managed/ exists.
+    let cfg = config_with(vec![]);
+    let deleted = sweep_managed_orphans(Path::new("/__no_such_managed_dir__"), &cfg);
+    assert!(deleted.is_empty());
+}
+
+#[test]
+fn sweep_managed_orphans_empty_config_clears_dir() {
+    let dir = tempdir().unwrap();
+    let managed = dir.path().join("managed");
+    fs::create_dir(&managed).unwrap();
+    touch(&managed, "a.so");
+    touch(&managed, "b.so");
+
+    let cfg = config_with(vec![]);
+    let deleted = sweep_managed_orphans(&managed, &cfg);
+
+    assert_eq!(deleted, vec!["a.so", "b.so"]);
+    assert!(!managed.join("a.so").exists());
+    assert!(!managed.join("b.so").exists());
+}

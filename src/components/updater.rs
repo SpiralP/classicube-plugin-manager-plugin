@@ -63,21 +63,41 @@ impl Component for Updater {
             // Load fresh off-thread so we see installed_asset writes from the
             // pass, then hop to main only for the dlopen. Flatten the nested
             // map into triples so the loader keeps a simple slice signature.
-            let subs: Vec<(String, String, Subscription)> = match Config::load() {
-                Ok(cfg) => cfg
-                    .subscriptions
-                    .into_iter()
-                    .flat_map(|(owner, repos)| {
-                        repos
-                            .into_iter()
-                            .map(move |(repo, sub)| (owner.clone(), repo, sub))
-                    })
-                    .collect(),
+            let cfg = match Config::load() {
+                Ok(cfg) => cfg,
                 Err(e) => {
                     error!("loading config for managed-load: {e:#}");
                     return;
                 }
             };
+            // Drop any file in plugins/managed/ that no live subscription
+            // claims as its installed_asset. Runs AFTER the update pass (so
+            // newly written versioned files are already claimed) and BEFORE
+            // init_managed (so we don't unlink something we're about to
+            // dlopen).
+            let swept = reconcile::sweep_managed_orphans(Path::new(MANAGED_DIR), &cfg);
+            if !swept.is_empty() {
+                print_async(format!(
+                    "{}Cleaned up {}{}{} stale plugin binar{}: {}{}",
+                    color::PINK,
+                    color::YELLOW,
+                    swept.len(),
+                    color::PINK,
+                    if swept.len() == 1 { "y" } else { "ies" },
+                    color::LIME,
+                    swept.join(", "),
+                ))
+                .await;
+            }
+            let subs: Vec<(String, String, Subscription)> = cfg
+                .subscriptions
+                .into_iter()
+                .flat_map(|(owner, repos)| {
+                    repos
+                        .into_iter()
+                        .map(move |(repo, sub)| (owner.clone(), repo, sub))
+                })
+                .collect();
             async_manager::spawn_on_main_thread(async move {
                 init_managed(&subs);
             });
@@ -125,6 +145,19 @@ async fn run_initial_pass() -> Result<()> {
                 };
             if release_in_hand.is_some() {
                 new_tags.push((owner.clone(), repo.clone(), tag.clone(), published_at));
+            }
+
+            // Short-circuit when we already have this exact tag installed
+            // and the file is on disk. Same-tag re-installs don't actually
+            // swap code in-session anyway (versioned filename collides with
+            // the currently-mapped one, so dlopen returns the cached
+            // handle), and this dodges a wasted asset fetch.
+            if sub.state.installed_version.as_deref() == Some(&tag)
+                && let Some(asset_name) = sub.state.installed_asset.as_deref()
+                && Path::new(MANAGED_DIR).join(asset_name).exists()
+            {
+                debug!("{owner}/{repo} already on {tag} with asset on disk; skipping");
+                continue;
             }
 
             if !needs_install(
@@ -214,15 +247,27 @@ async fn run_initial_pass() -> Result<()> {
             let install_result = if is_self {
                 download_self(asset, expected_digest.as_deref(), token).await
             } else {
-                download_to_managed_dir(asset, expected_digest.as_deref(), token).await
+                download_to_managed_dir(
+                    owner,
+                    repo,
+                    &release.tag_name,
+                    asset,
+                    expected_digest.as_deref(),
+                    token,
+                )
+                .await
             };
             match install_result {
                 Ok(path) => {
+                    let installed_basename = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map_or_else(|| asset.name.clone(), str::to_owned);
                     installed.push((
                         owner.clone(),
                         repo.clone(),
                         release.tag_name.clone(),
-                        asset.name.clone(),
+                        installed_basename,
                         release.published_at,
                     ));
                     if is_self {
@@ -340,19 +385,12 @@ async fn run_reconcile_and_warn() {
         ))
         .await;
     }
+    // Orphans and managed-dir conflicts both end up in
+    // sweep_managed_orphans' delete list; warn for the log but skip the
+    // chat - the sweep emits a single consolidated line for whatever it
+    // actually removed.
     for name in &report.orphans {
         warn!("orphan in {}: {name}", MANAGED_DIR);
-        print_async(format!(
-            "{}Orphan in {}{}{}: {}{}{} (no subscription claims this)",
-            color::YELLOW,
-            color::LIME,
-            MANAGED_DIR,
-            color::YELLOW,
-            color::LIME,
-            name,
-            color::YELLOW,
-        ))
-        .await;
     }
     for conflict in &report.conflicts {
         let dir_label = match conflict.dir {
@@ -367,16 +405,19 @@ async fn run_reconcile_and_warn() {
             "conflict in {dir_label}: {} duplicates {}/{}{}",
             conflict.filename, conflict.owner, conflict.repo, claim,
         );
+        if matches!(conflict.dir, ConflictDir::Managed) {
+            // Stray file in managed/ - the loader only opens
+            // `installed_asset`, so it's pure clutter and the sweep will
+            // remove it.
+            continue;
+        }
         // Plugins-dir conflict: ClassiCube auto-loads the user's file in
         // plugins/, so the loader skips the managed copy to keep only one
-        // instance live. Managed-dir conflict: nothing loads the stray file
-        // (the loader only loads `installed_asset`), so it's pure clutter.
-        let consequence = match conflict.dir {
-            ConflictDir::Plugins => "skipping the managed copy",
-            ConflictDir::Managed => "no effect on what loads",
-        };
+        // instance live. The user has to intervene; we don't touch
+        // plugins/.
         print_async(format!(
-            "{}Conflict in {}{}{}: {}{}{} duplicates {}{}/{}{}{} - {}; delete one to consolidate",
+            "{}Conflict in {}{}{}: {}{}{} duplicates {}{}/{}{}{} - skipping the managed copy; \
+             delete one to consolidate",
             color::YELLOW,
             color::LIME,
             dir_label,
@@ -389,7 +430,6 @@ async fn run_reconcile_and_warn() {
             conflict.repo,
             color::YELLOW,
             claim,
-            consequence,
         ))
         .await;
     }

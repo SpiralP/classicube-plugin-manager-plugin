@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use tracing::debug;
 
 use crate::{
     asset_match,
@@ -204,6 +205,62 @@ pub fn find_variant_conflicts(
         }
     }
     Ok(out)
+}
+
+/// Best-effort delete of every regular file in `managed_dir` whose basename
+/// is not claimed by any subscription's `state.installed_asset`. Skips
+/// `.new` and `.old` artifacts left mid-rename by `install_bytes_to` (those
+/// have their own cleanup paths). Errors are swallowed individually so one
+/// failure doesn't abort the rest of the sweep; this is the safety net for
+/// orphans the in-session `cleanup_previous_managed` couldn't unlink (e.g.
+/// Windows sharing violation, panic mid-update, manual user copies).
+///
+/// Returns the basenames that were actually deleted, in sorted order, for
+/// logging and tests. Call this AFTER any per-session updates have written
+/// their new versioned files and persisted the new `installed_asset`, and
+/// BEFORE the loader dlopens anything - so we don't delete a file we're
+/// about to map.
+pub fn sweep_managed_orphans(managed_dir: &Path, config: &Config) -> Vec<String> {
+    let on_disk = match list_dir_files(managed_dir) {
+        Ok(set) => set,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            debug!(
+                "sweep_managed_orphans: listing {} failed: {e:#}",
+                managed_dir.display()
+            );
+            return Vec::new();
+        }
+    };
+
+    let claimed: HashSet<&str> = config
+        .subscriptions
+        .values()
+        .flat_map(|repos| repos.values())
+        .filter_map(|s| s.state.installed_asset.as_deref())
+        .collect();
+
+    let mut victims: Vec<String> = on_disk
+        .into_iter()
+        .filter(|name| {
+            !claimed.contains(name.as_str()) && !name.ends_with(".new") && !name.ends_with(".old")
+        })
+        .collect();
+    victims.sort();
+
+    let mut deleted = Vec::with_capacity(victims.len());
+    for name in victims {
+        let path = managed_dir.join(&name);
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                debug!("swept orphan {}", path.display());
+                deleted.push(name);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => debug!("could not sweep {}: {e}", path.display()),
+        }
+    }
+    deleted
 }
 
 fn match_repo(

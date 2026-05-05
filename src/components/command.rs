@@ -26,7 +26,10 @@ use crate::{
     config::{self, Channel, Config, Subscription, SubscriptionState},
     discover,
     github_release::{GitHubRelease, get_release_for_channel, resolve_expected_digest},
-    installer::{MANAGED_DIR, PLUGINS_DIR, download_self, download_to_managed_dir},
+    installer::{
+        self, MANAGED_DIR, PLUGINS_DIR, cleanup_previous_managed, download_self,
+        download_to_managed_dir,
+    },
     loader::{self, LoadOutcome, UnloadOutcome},
     reconcile,
     secret::Secret,
@@ -581,6 +584,8 @@ fn handle_remove(spec: &str) {
         ))
         .await;
 
+        spawn_unload_followup(stored_owner.clone(), stored_repo.clone());
+
         if let Some(name) = installed_asset {
             let path = Path::new(MANAGED_DIR).join(&name);
             match fs::remove_file(&path) {
@@ -700,6 +705,9 @@ fn set_disabled(spec: &str, disabled: bool) {
                 color::LIME,
             ))
             .await;
+            if disabled {
+                spawn_unload_followup(owner, repo);
+            }
             return;
         }
 
@@ -1067,11 +1075,64 @@ async fn run_update_with_release(
     let asset = pick_asset(&release.assets, env::consts::ARCH, env::consts::DLL_SUFFIX)?;
     let is_self = config::is_self(owner, repo);
 
-    // Skip the file we'd legitimately overwrite: for non-self, the canonical
-    // asset name we're about to write (any prior install of ours by the same
-    // name); for self, the running binary's basename. Anything else flagged
-    // would be loaded alongside our install and is the duplicate-load hazard
-    // we want to surface.
+    // Snapshot what the sub thinks it owns on disk *before* we touch
+    // anything: lets us short-circuit a same-tag re-install (and lets the
+    // post-install A-cleanup unlink the prior versioned binary). Loading
+    // off-thread is fine - the runtime is single-threaded but Config::load
+    // is blocking I/O and we want it out of the main thread regardless.
+    let (prev_version, prev_asset) = match Config::load() {
+        Ok(cfg) => cfg
+            .subscriptions
+            .get(owner)
+            .and_then(|repos| repos.get(repo))
+            .map(|s| {
+                (
+                    s.state.installed_version.clone(),
+                    s.state.installed_asset.clone(),
+                )
+            })
+            .unwrap_or((None, None)),
+        Err(_) => (None, None),
+    };
+
+    // Skip the download entirely when we're already on this exact tag and
+    // the file is on disk. Same-tag re-installs don't actually swap code in
+    // the running process anyway (versioned filename collides with the
+    // currently-mapped one, so dlopen returns the cached handle), so
+    // there's no behavior to deliver.
+    if !is_self
+        && prev_version.as_deref() == Some(&release.tag_name)
+        && let Some(name) = prev_asset.as_deref()
+        && Path::new(MANAGED_DIR).join(name).exists()
+    {
+        print_async(format!(
+            "{}{}/{} {}is already on {}{}{}; nothing to do",
+            color::LIME,
+            owner,
+            repo,
+            color::PINK,
+            color::GREEN,
+            release.tag_name,
+            color::PINK,
+        ))
+        .await;
+        return Ok(());
+    }
+
+    // Skip the file we'd legitimately overwrite: for non-self, the
+    // versioned managed filename we're about to write (matches the prior
+    // install of the same tag, if any); for self, the running binary's
+    // basename. Anything else flagged would load as a duplicate.
+    let new_managed_name = if is_self {
+        None
+    } else {
+        Some(installer::versioned_managed_filename(
+            owner,
+            repo,
+            &release.tag_name,
+            env::consts::DLL_SUFFIX,
+        ))
+    };
     let self_basename = if is_self {
         current_lib_path()
             .ok()
@@ -1082,7 +1143,7 @@ async fn run_update_with_release(
     let skip: Vec<&str> = if is_self {
         self_basename.as_deref().into_iter().collect()
     } else {
-        vec![asset.name.as_str()]
+        new_managed_name.as_deref().into_iter().collect()
     };
     let conflicts = find_install_conflicts(repo, &skip);
     if !conflicts.is_empty() {
@@ -1114,8 +1175,21 @@ async fn run_update_with_release(
     let path = if is_self {
         download_self(asset, expected_digest.as_deref(), token).await?
     } else {
-        download_to_managed_dir(asset, expected_digest.as_deref(), token).await?
+        download_to_managed_dir(
+            owner,
+            repo,
+            &release.tag_name,
+            asset,
+            expected_digest.as_deref(),
+            token,
+        )
+        .await?
     };
+
+    let installed_basename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map_or_else(|| asset.name.clone(), str::to_owned);
 
     let now = unix_now();
     persist_installed_versions(
@@ -1124,7 +1198,7 @@ async fn run_update_with_release(
             owner.to_owned(),
             repo.to_owned(),
             release.tag_name.clone(),
-            asset.name.clone(),
+            installed_basename.clone(),
             release.published_at,
         )],
     )?;
@@ -1138,25 +1212,134 @@ async fn run_update_with_release(
             color::PINK,
         ))
         .await;
-    } else {
-        print_async(format!(
-            "{}Installed {}{} {}for {}{}/{} {}-> {}{}{} (restart to load)",
-            color::PINK,
-            color::GREEN,
-            release.tag_name,
-            color::PINK,
-            color::LIME,
-            owner,
-            repo,
-            color::PINK,
-            color::YELLOW,
-            path.display(),
-            color::PINK,
-        ))
-        .await;
+        return Ok(());
+    }
+
+    // A-cleanup: best-effort unlink of the prior versioned binary now that
+    // the new one is on disk and persisted. Linux/macOS unlinks even while
+    // the old library is still mapped; Windows may fail with sharing
+    // violation, in which case the startup orphan sweep mops it up next
+    // session. cleanup_previous_managed is a no-op when prev == new (e.g.
+    // ad-hoc tag like `nightly` re-uploaded under the same name, though we
+    // already short-circuited that above when installed_version matches).
+    cleanup_previous_managed(
+        Path::new(MANAGED_DIR),
+        prev_asset.as_deref(),
+        &installed_basename,
+    );
+
+    print_async(format!(
+        "{}Installed {}{} {}for {}{}/{} {}-> {}{}",
+        color::PINK,
+        color::GREEN,
+        release.tag_name,
+        color::PINK,
+        color::LIME,
+        owner,
+        repo,
+        color::PINK,
+        color::YELLOW,
+        path.display(),
+    ))
+    .await;
+
+    // In-session swap. If the plugin is already loaded, drop the LOADED
+    // entry and dlopen the new versioned path - fresh path, fresh mapping,
+    // new code runs immediately. The old library stays mapped (we don't
+    // dlclose; see src/loader/mod.rs module comment about TLS destructors).
+    // If the plugin isn't loaded yet (fresh install via /add, or user had
+    // /unloaded it), dlopen the new path so /update doesn't require a
+    // separate /load.
+    let owner_s = owner.to_owned();
+    let repo_s = repo.to_owned();
+    let sub_for_load = Config::load().ok().and_then(|c| {
+        c.subscriptions
+            .get(&owner_s)
+            .and_then(|r| r.get(&repo_s))
+            .cloned()
+    });
+    if let Some(sub) = sub_for_load {
+        async_manager::spawn_on_main_thread(async move {
+            let id = format!("{owner_s}/{repo_s}");
+            let was_loaded = loader::is_loaded(&owner_s, &repo_s);
+            if was_loaded {
+                loader::unload_one(&owner_s, &repo_s);
+            }
+            let outcome = loader::load_one(&owner_s, &repo_s, &sub);
+            chat_post_update_load_outcome(&id, was_loaded, &outcome);
+        });
     }
 
     Ok(())
+}
+
+/// Chat for the in-session reload that follows a successful `/update`.
+/// Distinct from `handle_load`'s messages because the user wasn't asking to
+/// load - we're reporting the side-effect of the install.
+fn chat_post_update_load_outcome(id: &str, was_loaded: bool, outcome: &LoadOutcome) {
+    match outcome {
+        LoadOutcome::Loaded => {
+            let verb = if was_loaded { "Reloaded" } else { "Loaded" };
+            print_wrapped(format!("{}{verb} {}{id}", color::PINK, color::LIME));
+        }
+        LoadOutcome::Disabled
+        | LoadOutcome::IsSelf
+        | LoadOutcome::NotInstalled
+        | LoadOutcome::AlreadyLoaded => {
+            // Disabled: user opted out; don't auto-load. IsSelf: never reached
+            // (caller skips the swap for self). NotInstalled / AlreadyLoaded:
+            // shouldn't happen post-install; stay silent.
+        }
+        LoadOutcome::CrashCarryover { previous } => print_wrapped(format!(
+            "{}{id} crashed inside {}{previous}{} last session; cleared the breadcrumb. Try again.",
+            color::YELLOW,
+            color::LIME,
+            color::YELLOW,
+        )),
+        LoadOutcome::PluginsDirConflict { path } => print_wrapped(format!(
+            "{}Installed but not loaded: {}{}{} would load as a duplicate; delete one",
+            color::YELLOW,
+            color::LIME,
+            path.display(),
+            color::YELLOW,
+        )),
+        LoadOutcome::LoadError(e) => print_wrapped(format!(
+            "{}Installed but failed to load {}{id}{}: {}{e}",
+            color::RED,
+            color::LIME,
+            color::RED,
+            color::WHITE,
+        )),
+        LoadOutcome::PluginOutdated { plugin, host } => print_wrapped(format!(
+            "{}{id}{} plugin is outdated (api {plugin}, host expects {host})",
+            color::LIME,
+            color::RED,
+        )),
+        LoadOutcome::HostOutdated { plugin, host } => print_wrapped(format!(
+            "{}Game is too outdated for {}{id}{} (api {plugin}, host expects {host})",
+            color::RED,
+            color::LIME,
+            color::RED,
+        )),
+    }
+}
+
+/// Drop a plugin's LOADED entry on the main thread, used as a follow-up to
+/// `/remove` and `/disable` so the in-process state matches the
+/// just-persisted config. Silent when nothing was loaded; the caller has
+/// already chatted about the primary action ("Removed", "Disabled").
+fn spawn_unload_followup(owner: String, repo: String) {
+    async_manager::spawn_on_main_thread(async move {
+        let id = format!("{owner}/{repo}");
+        match loader::unload_one(&owner, &repo) {
+            UnloadOutcome::Unloaded => {
+                print_wrapped(format!("{}Unloaded {}{id}", color::PINK, color::LIME));
+            }
+            // NotLoaded: nothing to do, no chat. IsSelf: never reached -
+            // both callers refuse_self_mutation before invoking us.
+            UnloadOutcome::NotLoaded | UnloadOutcome::IsSelf => {}
+        }
+    });
 }
 
 fn unix_now() -> u64 {
