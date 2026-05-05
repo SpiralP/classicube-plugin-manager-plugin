@@ -1,16 +1,24 @@
 #[cfg(test)]
 mod tests;
 
-use std::{collections::HashSet, fs, io, path::Path};
+use std::{
+    collections::HashSet,
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 
-use crate::config::{self, Config};
+use crate::{
+    asset_match,
+    config::{self, Config},
+};
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ReconcileReport {
     pub missing: Vec<MissingFile>,
     pub orphans: Vec<String>,
+    pub conflicts: Vec<Conflict>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -20,20 +28,74 @@ pub struct MissingFile {
     pub asset: String,
 }
 
-/// Scan `managed_dir` and reconcile it against the subscriptions in
-/// `config_path`.
+/// A file that looks like a build artifact for a known subscription's repo
+/// (per `asset_match::matches_repo`) but isn't claimed by the subscription's
+/// `installed_asset`. Most often a rust-cdylib variant filename
+/// (`libclassicube_foo_plugin.so`) sitting next to a managed canonical asset
+/// (`classicube-foo-plugin.so`); ClassiCube would `dlopen` both as duplicates.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Conflict {
+    pub dir: ConflictDir,
+    pub filename: String,
+    pub owner: String,
+    pub repo: String,
+    /// What the matching subscription thinks it owns on disk, if anything.
+    /// Surfaced in chat so the user can see the canonical-vs-variant pair
+    /// at a glance.
+    pub installed_asset: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ConflictDir {
+    Plugins,
+    Managed,
+}
+
+/// Scan `managed_dir` and `plugins_dir` and reconcile them against the
+/// subscriptions in `config_path`.
 ///
-/// - If a subscription's `installed_asset` filename isn't on disk, the sub is
-///   disabled and its installed fields cleared. Manual deletion is treated as
-///   intent to stop running the plugin, not a redownload trigger.
+/// - If a subscription's `installed_asset` filename isn't on disk in
+///   `managed_dir`, the sub is disabled and its installed fields cleared.
+///   Manual deletion is treated as intent to stop running the plugin, not a
+///   redownload trigger.
 /// - Files in `managed_dir` not claimed by any subscription's
-///   `installed_asset` are reported as orphans but never touched.
+///   `installed_asset` are reported as orphans. Any orphan whose filename
+///   looks like a build artifact for a known subscription's repo is demoted
+///   from `orphans` to `conflicts`.
+/// - Files in `plugins_dir` whose filename looks like a build artifact for a
+///   known subscription's repo are reported as conflicts. Other files in
+///   `plugins_dir` are ignored; the game's plugins dir is shared with the
+///   user's own files and unmanaged plugins.
+/// - The running updater binary's basename (`self_running_basename`) is
+///   excluded from the `plugins_dir` scan so we don't flag ourselves.
 ///
 /// The config is rewritten only when at least one subscription was disabled.
-pub fn reconcile(config_path: &Path, managed_dir: &Path) -> Result<ReconcileReport> {
+pub fn reconcile(
+    config_path: &Path,
+    plugins_dir: &Path,
+    managed_dir: &Path,
+    dll_suffix: &str,
+    self_running_basename: Option<&str>,
+) -> Result<ReconcileReport> {
     let mut config = Config::load_from(config_path)?;
-    let on_disk = list_managed_files(managed_dir)
+    let managed_on_disk = list_dir_files(managed_dir)
         .with_context(|| format!("listing {}", managed_dir.display()))?;
+    let plugins_on_disk = list_dir_files(plugins_dir)
+        .with_context(|| format!("listing {}", plugins_dir.display()))?;
+
+    // Snapshot (owner, repo, installed_asset) up front: the missing-clearing
+    // pass below mutates `installed_asset` to None for missing subs, but the
+    // conflict warning reads better with the *original* claim ("sub thought
+    // it owned X, but Y looks similar - is one of them the build you meant?").
+    let subs: Vec<(String, String, Option<String>)> = config
+        .subscriptions
+        .iter()
+        .flat_map(|(o, repos)| {
+            repos
+                .iter()
+                .map(move |(r, s)| (o.clone(), r.clone(), s.state.installed_asset.clone()))
+        })
+        .collect();
 
     let mut report = ReconcileReport::default();
     let mut claimed: HashSet<String> = HashSet::new();
@@ -41,15 +103,17 @@ pub fn reconcile(config_path: &Path, managed_dir: &Path) -> Result<ReconcileRepo
     for (owner, repos) in &mut config.subscriptions {
         for (repo, sub) in repos {
             // The self subscription installs into plugins/ (not plugins/managed/),
-            // so it never participates in this reconcile pass — checking here
-            // would always flag it missing.
+            // so it never participates in this reconcile pass - checking here
+            // would always flag it missing. Self-vs-variant conflicts are
+            // handled in the conflict-classification pass below, which scans
+            // plugins/ too.
             if config::is_self(owner, repo) {
                 continue;
             }
             let Some(asset) = sub.state.installed_asset.clone() else {
                 continue;
             };
-            if on_disk.contains(&asset) {
+            if managed_on_disk.contains(&asset) {
                 claimed.insert(asset);
             } else {
                 report.missing.push(MissingFile {
@@ -65,12 +129,42 @@ pub fn reconcile(config_path: &Path, managed_dir: &Path) -> Result<ReconcileRepo
         }
     }
 
-    for filename in on_disk {
-        if !claimed.contains(&filename) {
+    let mut managed_orphan_names: Vec<String> = managed_on_disk
+        .iter()
+        .filter(|n| !claimed.contains(*n))
+        .cloned()
+        .collect();
+    managed_orphan_names.sort();
+    for filename in managed_orphan_names {
+        if let Some((owner, repo, installed_asset)) = match_repo(&subs, &filename, dll_suffix) {
+            report.conflicts.push(Conflict {
+                dir: ConflictDir::Managed,
+                filename,
+                owner,
+                repo,
+                installed_asset,
+            });
+        } else {
             report.orphans.push(filename);
         }
     }
-    report.orphans.sort();
+
+    let mut plugins_files: Vec<String> = plugins_on_disk.into_iter().collect();
+    plugins_files.sort();
+    for filename in plugins_files {
+        if Some(filename.as_str()) == self_running_basename {
+            continue;
+        }
+        if let Some((owner, repo, installed_asset)) = match_repo(&subs, &filename, dll_suffix) {
+            report.conflicts.push(Conflict {
+                dir: ConflictDir::Plugins,
+                filename,
+                owner,
+                repo,
+                installed_asset,
+            });
+        }
+    }
 
     if !report.missing.is_empty() {
         config
@@ -81,7 +175,56 @@ pub fn reconcile(config_path: &Path, managed_dir: &Path) -> Result<ReconcileRepo
     Ok(report)
 }
 
-fn list_managed_files(dir: &Path) -> io::Result<HashSet<String>> {
+/// Find all files in `plugins_dir` and `managed_dir` that look like build
+/// artifacts for `repo` (per `asset_match::matches_repo`), excluding any whose
+/// basename is in `skip_basenames`. Used by `/add` and `/update` to refuse
+/// installs that would create a second-loaded copy of a plugin already on
+/// disk under a different naming convention.
+///
+/// Returns paths in deterministic order (plugins/ entries before managed/,
+/// each sorted by filename).
+pub fn find_variant_conflicts(
+    plugins_dir: &Path,
+    managed_dir: &Path,
+    repo: &str,
+    dll_suffix: &str,
+    skip_basenames: &[&str],
+) -> io::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for dir in [plugins_dir, managed_dir] {
+        let mut names: Vec<String> = list_dir_files(dir)?.into_iter().collect();
+        names.sort();
+        for name in names {
+            if skip_basenames.contains(&name.as_str()) {
+                continue;
+            }
+            if asset_match::matches_repo(&name, repo, dll_suffix) {
+                out.push(dir.join(&name));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn match_repo(
+    subs: &[(String, String, Option<String>)],
+    filename: &str,
+    dll_suffix: &str,
+) -> Option<(String, String, Option<String>)> {
+    // Match by the repo's name shape (canonical or rust-cdylib variant) OR
+    // by exact filename equality with the sub's `installed_asset`. The
+    // exact-name path catches release assets named after the build target
+    // (e.g. `classicube_foo_linux_x86_64.so`) where the filename shape
+    // doesn't match the repo name on its own.
+    subs.iter()
+        .find(|(_, repo, installed_asset)| {
+            asset_match::matches_repo(filename, repo, dll_suffix)
+                || installed_asset.as_deref() == Some(filename)
+        })
+        .cloned()
+}
+
+fn list_dir_files(dir: &Path) -> io::Result<HashSet<String>> {
     let read_dir = match fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(HashSet::new()),

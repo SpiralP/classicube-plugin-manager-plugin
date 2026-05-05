@@ -2,42 +2,111 @@ use std::{collections::BTreeMap, fs, panic};
 
 use tempfile::{NamedTempFile, tempdir};
 
-use super::{ApiVersionCheck, check_api_version, detect_collision_in, with_breadcrumb_at};
+use super::{ApiVersionCheck, check_api_version, detect_plugins_dir_conflict, with_breadcrumb_at};
 use crate::config::{Config, Subscription};
 
 #[test]
 fn missing_dir_returns_none() {
     let dir = tempdir().unwrap();
     let nonexistent = dir.path().join("does-not-exist");
-    let result = detect_collision_in(&nonexistent, "plugin.so").unwrap();
+    let result =
+        detect_plugins_dir_conflict(&nonexistent, "classicube-foo-plugin", ".so", None).unwrap();
     assert!(result.is_none());
 }
 
 #[test]
-fn missing_file_returns_none() {
+fn empty_dir_returns_none() {
     let dir = tempdir().unwrap();
-    let result = detect_collision_in(dir.path(), "plugin.so").unwrap();
+    let result =
+        detect_plugins_dir_conflict(dir.path(), "classicube-foo-plugin", ".so", None).unwrap();
     assert!(result.is_none());
 }
 
 #[test]
-fn existing_file_returns_path() {
+fn canonical_named_file_is_a_conflict() {
+    // ClassiCube would load this file directly out of plugins/; if we then
+    // also load the managed copy, the plugin runs twice.
     let dir = tempdir().unwrap();
-    fs::write(dir.path().join("plugin.so"), b"x").unwrap();
-    let result = detect_collision_in(dir.path(), "plugin.so").unwrap();
+    fs::write(dir.path().join("classicube-foo-plugin.so"), b"x").unwrap();
+    let result =
+        detect_plugins_dir_conflict(dir.path(), "classicube-foo-plugin", ".so", None).unwrap();
     assert_eq!(
         result.as_deref(),
-        Some(dir.path().join("plugin.so").as_path())
+        Some(dir.path().join("classicube-foo-plugin.so").as_path())
     );
 }
 
 #[test]
-fn directory_with_same_name_does_not_collide() {
+fn variant_named_file_is_a_conflict() {
+    // rust-cdylib output: lib prefix + underscores. ClassiCube loads it the
+    // same way as the canonical filename, so it's also a duplicate-load
+    // hazard.
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("libclassicube_foo_plugin.so"), b"x").unwrap();
+    let result =
+        detect_plugins_dir_conflict(dir.path(), "classicube-foo-plugin", ".so", None).unwrap();
+    assert_eq!(
+        result.as_deref(),
+        Some(dir.path().join("libclassicube_foo_plugin.so").as_path())
+    );
+}
+
+#[test]
+fn matches_installed_asset_filename_exactly() {
+    // Release-asset names like `classicube_foo_linux_x86_64.so` don't match
+    // the repo via shape normalization. If the user puts a copy of that
+    // exact filename in plugins/ alongside our managed copy, ClassiCube
+    // would load both. The installed_asset hint catches it.
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("classicube_foo_linux_x86_64.so"), b"x").unwrap();
+    let result = detect_plugins_dir_conflict(
+        dir.path(),
+        "classicube-foo-plugin",
+        ".so",
+        Some("classicube_foo_linux_x86_64.so"),
+    )
+    .unwrap();
+    assert_eq!(
+        result.as_deref(),
+        Some(dir.path().join("classicube_foo_linux_x86_64.so").as_path())
+    );
+}
+
+#[test]
+fn installed_asset_hint_does_not_match_unrelated_files() {
+    // Without a name-shape match and without an installed_asset equality, a
+    // file like the asset hint that's *not* on disk shouldn't surface as a
+    // conflict.
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("something-else.so"), b"x").unwrap();
+    let result = detect_plugins_dir_conflict(
+        dir.path(),
+        "classicube-foo-plugin",
+        ".so",
+        Some("classicube_foo_linux_x86_64.so"),
+    )
+    .unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
+fn unrelated_files_are_not_conflicts() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("classicube-bar-plugin.so"), b"x").unwrap();
+    fs::write(dir.path().join("README.md"), b"x").unwrap();
+    let result =
+        detect_plugins_dir_conflict(dir.path(), "classicube-foo-plugin", ".so", None).unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
+fn directory_with_matching_name_does_not_collide() {
     // ClassiCube loads files, not directories, so a directory of the same
     // name shouldn't trigger a double-load warning.
     let dir = tempdir().unwrap();
-    fs::create_dir(dir.path().join("plugin.so")).unwrap();
-    let result = detect_collision_in(dir.path(), "plugin.so").unwrap();
+    fs::create_dir(dir.path().join("classicube-foo-plugin.so")).unwrap();
+    let result =
+        detect_plugins_dir_conflict(dir.path(), "classicube-foo-plugin", ".so", None).unwrap();
     assert!(result.is_none());
 }
 

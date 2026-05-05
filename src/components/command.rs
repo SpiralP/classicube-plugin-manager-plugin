@@ -6,6 +6,7 @@ use std::{
     collections::BTreeMap,
     env,
     os::raw::c_int,
+    path::{Path, PathBuf},
     slice,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -13,7 +14,7 @@ use std::{
 use anyhow::{Error, Result, bail};
 use classicube_helpers::{async_manager, color};
 use classicube_sys::{OwnedChatCommand, cc_string};
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::{
     asset_match::pick_asset,
@@ -25,8 +26,10 @@ use crate::{
     config::{self, Channel, Config, Subscription, SubscriptionState},
     discover,
     github_release::{GitHubRelease, get_release_for_channel, resolve_expected_digest},
-    installer::{download_self, download_to_managed_dir},
+    installer::{MANAGED_DIR, PLUGINS_DIR, download_self, download_to_managed_dir},
+    reconcile,
     secret::Secret,
+    self_path::current_lib_path,
 };
 
 thread_local!(
@@ -276,6 +279,54 @@ async fn print_save_error(e: &Error) {
     .await;
 }
 
+/// Look in `plugins/` and `plugins/managed/` for files that look like a build
+/// artifact for `repo` but aren't basenames we'd write to ourselves. Returns
+/// `Ok(Vec::new())` when there's no conflict.
+///
+/// `skip_basenames` should include any files we're allowed to overwrite or
+/// already manage: the canonical asset name we're about to install, the sub's
+/// existing `installed_asset`, or (for self-update) the running binary's
+/// basename. Anything else matching the repo's name shape is a duplicate-load
+/// hazard.
+fn find_install_conflicts(repo: &str, skip_basenames: &[&str]) -> Vec<PathBuf> {
+    match reconcile::find_variant_conflicts(
+        Path::new(PLUGINS_DIR),
+        Path::new(MANAGED_DIR),
+        repo,
+        env::consts::DLL_SUFFIX,
+        skip_basenames,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            // Scan failure is non-fatal: we proceed without the safety net
+            // rather than blocking the user on transient I/O.
+            warn!("scanning for variant conflicts of {repo}: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
+/// Chat-format a conflict refusal. The caller has already decided to abort
+/// the install/add; this prints the user-facing reason.
+async fn print_install_conflict(spec: &str, action: &str, conflicts: &[PathBuf]) {
+    let listed = conflicts
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    print_async(format!(
+        "{}Refusing to {action} {}{spec}{}: existing file(s) would load as a duplicate of this \
+         plugin: {}{}{} - delete one to avoid loading both",
+        color::YELLOW,
+        color::LIME,
+        color::YELLOW,
+        color::LIME,
+        listed,
+        color::YELLOW,
+    ))
+    .await;
+}
+
 async fn print_not_added(spec: &str) {
     print_async(format!(
         "{}Not added: {}{}{}; use {}add{} first",
@@ -376,6 +427,23 @@ async fn add_subscription(
             }
         }
     };
+
+    // For the self repo the running binary's filename is a legitimate match
+    // and must be skipped; everything else flagged here would create a
+    // double-load.
+    let self_basename = if config::is_self(&owner, &repo) {
+        current_lib_path()
+            .ok()
+            .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
+    } else {
+        None
+    };
+    let skip: Vec<&str> = self_basename.as_deref().into_iter().collect();
+    let conflicts = find_install_conflicts(&repo, &skip);
+    if !conflicts.is_empty() {
+        print_install_conflict(spec, "add", &conflicts).await;
+        return None;
+    }
 
     config
         .subscriptions
@@ -967,6 +1035,38 @@ async fn run_update_with_release(
     release: GitHubRelease,
 ) -> Result<()> {
     let asset = pick_asset(&release.assets, env::consts::ARCH, env::consts::DLL_SUFFIX)?;
+    let is_self = config::is_self(owner, repo);
+
+    // Skip the file we'd legitimately overwrite: for non-self, the canonical
+    // asset name we're about to write (any prior install of ours by the same
+    // name); for self, the running binary's basename. Anything else flagged
+    // would be loaded alongside our install and is the duplicate-load hazard
+    // we want to surface.
+    let self_basename = if is_self {
+        current_lib_path()
+            .ok()
+            .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
+    } else {
+        None
+    };
+    let skip: Vec<&str> = if is_self {
+        self_basename.as_deref().into_iter().collect()
+    } else {
+        vec![asset.name.as_str()]
+    };
+    let conflicts = find_install_conflicts(repo, &skip);
+    if !conflicts.is_empty() {
+        let spec = format!("{owner}/{repo}");
+        print_install_conflict(&spec, "update", &conflicts).await;
+        bail!(
+            "refusing to install: existing file(s) would load as a duplicate; delete one of: {}",
+            conflicts
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     print_async(format!(
         "{}Downloading {}{} {}({}{}{}) ...",
@@ -981,7 +1081,6 @@ async fn run_update_with_release(
     .await;
 
     let expected_digest = resolve_expected_digest(asset)?;
-    let is_self = config::is_self(owner, repo);
     let path = if is_self {
         download_self(asset, expected_digest.as_deref(), token).await?
     } else {

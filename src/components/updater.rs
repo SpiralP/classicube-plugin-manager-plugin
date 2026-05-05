@@ -18,10 +18,13 @@ use crate::{
     component::Component,
     config::{self, Config, Subscription, config_path},
     github_release::{GitHubRelease, get_release_for_channel, resolve_expected_digest},
-    installer::{MANAGED_DIR, cleanup_self_old, download_self, download_to_managed_dir},
+    installer::{
+        MANAGED_DIR, PLUGINS_DIR, cleanup_self_old, download_self, download_to_managed_dir,
+    },
     loader::init_managed,
-    reconcile,
+    reconcile::{self, ConflictDir},
     secret::Secret,
+    self_path::current_lib_path,
 };
 
 const TTL_SECS: u64 = 60 * 60;
@@ -293,7 +296,20 @@ async fn ensure_self_subscription() {
 }
 
 async fn run_reconcile_and_warn() {
-    let report = match reconcile::reconcile(config_path(), Path::new(MANAGED_DIR)) {
+    // Skip the running self binary in the plugins/ scan so we don't flag
+    // ourselves as a conflict for the self subscription. Failure to resolve
+    // the self path is non-fatal; in the rare case we can't, the worst
+    // outcome is one extra warning the user can ignore.
+    let self_basename = current_lib_path()
+        .ok()
+        .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()));
+    let report = match reconcile::reconcile(
+        config_path(),
+        Path::new(PLUGINS_DIR),
+        Path::new(MANAGED_DIR),
+        env::consts::DLL_SUFFIX,
+        self_basename.as_deref(),
+    ) {
         Ok(r) => r,
         Err(e) => {
             warn!("reconcile failed: {e:#}");
@@ -335,6 +351,45 @@ async fn run_reconcile_and_warn() {
             color::LIME,
             name,
             color::YELLOW,
+        ))
+        .await;
+    }
+    for conflict in &report.conflicts {
+        let dir_label = match conflict.dir {
+            ConflictDir::Plugins => PLUGINS_DIR,
+            ConflictDir::Managed => MANAGED_DIR,
+        };
+        let claim = match &conflict.installed_asset {
+            Some(a) => format!(" (managed file: {a})"),
+            None => String::new(),
+        };
+        warn!(
+            "conflict in {dir_label}: {} duplicates {}/{}{}",
+            conflict.filename, conflict.owner, conflict.repo, claim,
+        );
+        // Plugins-dir conflict: ClassiCube auto-loads the user's file in
+        // plugins/, so the loader skips the managed copy to keep only one
+        // instance live. Managed-dir conflict: nothing loads the stray file
+        // (the loader only loads `installed_asset`), so it's pure clutter.
+        let consequence = match conflict.dir {
+            ConflictDir::Plugins => "skipping the managed copy",
+            ConflictDir::Managed => "no effect on what loads",
+        };
+        print_async(format!(
+            "{}Conflict in {}{}{}: {}{}{} duplicates {}{}/{}{}{} - {}; delete one to consolidate",
+            color::YELLOW,
+            color::LIME,
+            dir_label,
+            color::YELLOW,
+            color::LIME,
+            conflict.filename,
+            color::YELLOW,
+            color::LIME,
+            conflict.owner,
+            conflict.repo,
+            color::YELLOW,
+            claim,
+            consequence,
         ))
         .await;
     }

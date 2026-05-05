@@ -5,7 +5,7 @@ mod tests;
 
 use std::{
     cell::RefCell,
-    io,
+    env, fs, io,
     os::raw::{c_int, c_void},
     path::{Path, PathBuf},
 };
@@ -15,6 +15,7 @@ use classicube_sys::IGameComponent;
 use tracing::{debug, error, warn};
 
 use crate::{
+    asset_match,
     chat::print_wrapped,
     component::Plugin_ApiVersion,
     config::{self, Subscription, config_path},
@@ -71,8 +72,24 @@ pub fn init_managed(subs: &[(String, String, Subscription)]) {
             continue;
         }
 
-        if let Err(e) = warn_on_collision(asset) {
-            warn!("collision check for {id}: {e:#}");
+        // Reconcile already printed a chat warning for any plugins/ conflict
+        // covering this sub, so skip silently here - a second message would
+        // just duplicate the first.
+        match detect_plugins_dir_conflict(
+            Path::new(PLUGINS_DIR),
+            repo,
+            env::consts::DLL_SUFFIX,
+            Some(asset),
+        ) {
+            Ok(Some(collision)) => {
+                warn!(
+                    "{id} not loaded: {} would load as a duplicate",
+                    collision.display()
+                );
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => warn!("collision check for {id}: {e:#}"),
         }
 
         let path = Path::new(MANAGED_DIR).join(asset);
@@ -246,33 +263,42 @@ fn with_breadcrumb_at<R>(
     r
 }
 
-fn warn_on_collision(asset: &str) -> io::Result<()> {
-    let Some(collision) = detect_collision_in(Path::new(PLUGINS_DIR), asset)? else {
-        return Ok(());
+/// Returns the path of a regular file under `plugins_dir` (the game-loaded
+/// `plugins/`) that ClassiCube would already `dlopen` as part of `repo`'s
+/// plugin. A file is considered a conflict if it either matches the repo's
+/// canonical or rust-cdylib variant naming (per `asset_match::matches_repo`),
+/// or has the same filename as `installed_asset` - the latter catches custom
+/// release-asset naming like `classicube_foo_linux_x86_64.so` where the
+/// shape doesn't match the repo name. When present, the loader skips loading
+/// the managed copy to avoid running the plugin twice. Directories are
+/// ignored - ClassiCube only loads files.
+fn detect_plugins_dir_conflict(
+    plugins_dir: &Path,
+    repo: &str,
+    dll_suffix: &str,
+    installed_asset: Option<&str>,
+) -> io::Result<Option<PathBuf>> {
+    let read_dir = match fs::read_dir(plugins_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
     };
-    warn!(
-        "{} also exists; remove it to avoid loading two copies",
-        collision.display()
-    );
-    print_wrapped(format!(
-        "{}Found {}{}{}: remove it to avoid loading two copies of the plugin",
-        color::YELLOW,
-        color::LIME,
-        collision.display(),
-        color::YELLOW,
-    ));
-    Ok(())
-}
-
-/// Returns the path of a same-named regular file under `plugins_dir` (the
-/// game-loaded `plugins/`), if any. A directory of the same name is ignored
-/// — only a file would actually be loaded by ClassiCube.
-fn detect_collision_in(plugins_dir: &Path, asset: &str) -> io::Result<Option<PathBuf>> {
-    let path = plugins_dir.join(asset);
-    match path.metadata() {
-        Ok(m) if m.is_file() => Ok(Some(path)),
-        Ok(_) => Ok(None),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+    let mut hits: Vec<String> = Vec::new();
+    for entry in read_dir {
+        let entry = entry?;
+        if !entry.metadata()?.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if asset_match::matches_repo(&name, repo, dll_suffix)
+            || Some(name.as_str()) == installed_asset
+        {
+            hits.push(name);
+        }
     }
+    // Sort for deterministic output regardless of readdir order.
+    hits.sort();
+    Ok(hits.into_iter().next().map(|n| plugins_dir.join(n)))
 }

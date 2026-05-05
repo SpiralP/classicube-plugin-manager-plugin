@@ -145,3 +145,113 @@ fn arm_token_does_not_partial_match_armv8() {
     let err = pick_asset(&assets, "arm", ".so").unwrap_err();
     assert!(format!("{err}").contains("arch"));
 }
+
+#[test]
+fn matches_repo_canonical_so() {
+    assert!(matches_repo(
+        "classicube-foo-plugin.so",
+        "classicube-foo-plugin",
+        ".so"
+    ));
+}
+
+#[test]
+fn matches_repo_unix_cdylib_variant() {
+    // `cargo build` default output for a crate named `classicube-foo-plugin`
+    // on Linux: `lib` prefix + underscores instead of hyphens.
+    assert!(matches_repo(
+        "libclassicube_foo_plugin.so",
+        "classicube-foo-plugin",
+        ".so"
+    ));
+}
+
+#[test]
+fn matches_repo_macos_cdylib_variant() {
+    assert!(matches_repo(
+        "libclassicube_foo_plugin.dylib",
+        "classicube-foo-plugin",
+        ".dylib"
+    ));
+}
+
+#[test]
+fn matches_repo_windows_cdylib_variant() {
+    // No `lib` prefix on Windows, but underscores instead of hyphens.
+    assert!(matches_repo(
+        "classicube_foo_plugin.dll",
+        "classicube-foo-plugin",
+        ".dll"
+    ));
+}
+
+#[test]
+fn matches_repo_canonical_dll() {
+    assert!(matches_repo(
+        "classicube-foo-plugin.dll",
+        "classicube-foo-plugin",
+        ".dll"
+    ));
+}
+
+#[test]
+fn matches_repo_is_case_insensitive() {
+    assert!(matches_repo(
+        "LibClassicube_Foo_Plugin.SO",
+        "classicube-foo-plugin",
+        ".so"
+    ));
+    assert!(matches_repo(
+        "classicube-foo-plugin.so",
+        "Classicube-Foo-Plugin",
+        ".so"
+    ));
+}
+
+#[test]
+fn matches_repo_rejects_wrong_suffix() {
+    assert!(!matches_repo(
+        "classicube-foo-plugin.dll",
+        "classicube-foo-plugin",
+        ".so"
+    ));
+    assert!(!matches_repo(
+        "classicube-foo-plugin",
+        "classicube-foo-plugin",
+        ".so"
+    ));
+}
+
+#[test]
+fn matches_repo_rejects_non_library_files() {
+    assert!(!matches_repo(
+        "classicube-foo-plugin.txt",
+        "classicube-foo-plugin",
+        ".so"
+    ));
+    assert!(!matches_repo("README.md", "classicube-foo-plugin", ".so"));
+}
+
+#[test]
+fn matches_repo_rejects_other_repos() {
+    assert!(!matches_repo(
+        "classicube-bar-plugin.so",
+        "classicube-foo-plugin",
+        ".so"
+    ));
+    assert!(!matches_repo(
+        "libclassicube_bar_plugin.so",
+        "classicube-foo-plugin",
+        ".so"
+    ));
+}
+
+#[test]
+fn matches_repo_handles_non_canonical_repo_names() {
+    // A repo name that isn't `classicube-*-plugin` shape should still match
+    // its own variants — the predicate is purely string normalization, no
+    // canonical-name expansion baked in.
+    assert!(matches_repo("cef.so", "cef", ".so"));
+    assert!(matches_repo("libcef.so", "cef", ".so"));
+    assert!(!matches_repo("cef.so", "classicube-cef-plugin", ".so"));
+}

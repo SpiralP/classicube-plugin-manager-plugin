@@ -82,6 +82,33 @@ fn arch_tokens(arch: &str) -> (&'static [&'static str], &'static [&'static str])
     }
 }
 
+/// Whether `filename` looks like a build artifact for `repo` on this platform.
+///
+/// Recognizes both the canonical asset name (`classicube-foo-plugin.so`) and
+/// the rust-cdylib output that `cargo build` produces by default for a crate
+/// named `classicube-foo-plugin`:
+///
+/// - Linux:   `libclassicube_foo_plugin.so`
+/// - macOS:   `libclassicube_foo_plugin.dylib`
+/// - Windows: `classicube_foo_plugin.dll` (no `lib` prefix)
+///
+/// Used for duplicate-load detection: a variant-named file in `plugins/` next
+/// to a managed canonical asset would cause ClassiCube to `dlopen` both.
+///
+/// Normalization on the filename is: lowercase, strip `dll_suffix`, strip any
+/// leading `lib` prefix, replace `_` with `-`. The result is compared to the
+/// repo name lowercased.
+pub fn matches_repo(filename: &str, repo: &str, dll_suffix: &str) -> bool {
+    let suffix_lc = dll_suffix.to_ascii_lowercase();
+    let name_lc = filename.to_ascii_lowercase();
+    let Some(stem) = name_lc.strip_suffix(&suffix_lc) else {
+        return false;
+    };
+    let stem = stem.strip_prefix("lib").unwrap_or(stem);
+    let normalized = stem.replace('_', "-");
+    normalized == repo.to_ascii_lowercase()
+}
+
 fn contains_word(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
