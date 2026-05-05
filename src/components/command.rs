@@ -4,7 +4,7 @@ mod tests;
 use std::{
     cell::RefCell,
     collections::BTreeMap,
-    env,
+    env, fs, io,
     os::raw::c_int,
     path::{Path, PathBuf},
     slice,
@@ -14,7 +14,7 @@ use std::{
 use anyhow::{Error, Result, bail};
 use classicube_helpers::{async_manager, color};
 use classicube_sys::{OwnedChatCommand, cc_string};
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::{
     asset_match::pick_asset,
@@ -540,7 +540,7 @@ fn handle_remove(spec: &str) {
             }
         };
 
-        let Some((stored_owner, stored_repo, _)) = find_subscription(&config, &candidates) else {
+        let Some((stored_owner, stored_repo, sub)) = find_subscription(&config, &candidates) else {
             print_async(format!(
                 "{}Not added: {}{}",
                 color::YELLOW,
@@ -555,6 +555,8 @@ fn handle_remove(spec: &str) {
             print_async(msg).await;
             return;
         }
+
+        let installed_asset = sub.state.installed_asset.clone();
 
         if let Some(repos) = config.subscriptions.get_mut(&stored_owner) {
             repos.remove(&stored_repo);
@@ -572,6 +574,28 @@ fn handle_remove(spec: &str) {
             color::LIME,
         ))
         .await;
+
+        if let Some(name) = installed_asset {
+            let path = Path::new(MANAGED_DIR).join(&name);
+            match fs::remove_file(&path) {
+                Ok(()) => debug!("removed managed binary {}", path.display()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!("could not remove {}: {e}", path.display());
+                    print_async(format!(
+                        "{}Could not delete {}{}{}: {}{}{}; remove it by hand.",
+                        color::YELLOW,
+                        color::LIME,
+                        path.display(),
+                        color::YELLOW,
+                        color::LIME,
+                        e,
+                        color::YELLOW,
+                    ))
+                    .await;
+                }
+            }
+        }
     });
 }
 
