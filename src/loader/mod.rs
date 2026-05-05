@@ -121,10 +121,11 @@ fn classify_early(owner: &str, repo: &str, sub: &Subscription) -> Option<LoadOut
 }
 
 /// Load one subscription's managed binary into the running process, mirroring
-/// what `init_managed` does at startup. Pure-ish: returns an outcome rather
-/// than printing chat, but does mutate `LOADED` and (for the carry-over case)
-/// the on-disk config. Caller is responsible for chat output via
-/// `report_init_outcome` (auto-load) or its own mapping (`/load`).
+/// what `init_managed` does at startup. Mutates `LOADED` and (for the
+/// carry-over case) the on-disk config. Chats "Loading {id}" right before
+/// the dlopen so a crash in the loaded library leaves a visible trail; the
+/// returned `LoadOutcome` is the caller's hook for outcome chat
+/// (`report_init_outcome` for auto-load, custom mapping for `/load`).
 pub fn load_one(owner: &str, repo: &str, sub: &Subscription) -> LoadOutcome {
     if let Some(o) = classify_early(owner, repo, sub) {
         return o;
@@ -160,6 +161,7 @@ pub fn load_one(owner: &str, repo: &str, sub: &Subscription) -> LoadOutcome {
 
     let path = Path::new(MANAGED_DIR).join(asset);
     let path_str = path.to_string_lossy().into_owned();
+    print_wrapped(format!("{}Loading {}{id}", color::PINK, color::LIME));
     // Use the dlopen function name so a crash in the loaded library's static
     // constructors (before Init even runs) is attributed to the load step
     // rather than blamed on Init.
@@ -200,7 +202,8 @@ pub fn load_one(owner: &str, repo: &str, sub: &Subscription) -> LoadOutcome {
 /// host-side state. The library stays mapped - see module comment about
 /// thread-local destructors. The LOADED borrow is released before `Free`
 /// runs so a managed callback can re-enter the host (chat, etc.) without
-/// deadlocking.
+/// deadlocking. Chats "Unloading {id}" right before the `Free` call (and
+/// only when there's actually a `Free` to invoke).
 pub fn unload_one(owner: &str, repo: &str) -> UnloadOutcome {
     if config::is_self(owner, repo) {
         return UnloadOutcome::IsSelf;
@@ -214,9 +217,11 @@ pub fn unload_one(owner: &str, repo: &str) -> UnloadOutcome {
     let Some(plugin) = plugin else {
         return UnloadOutcome::NotLoaded;
     };
+    let id = format!("{}/{}", plugin.owner, plugin.repo);
     let component = unsafe { &mut *plugin.component };
     if let Some(f) = component.Free {
-        debug!("calling Free on {}/{}", plugin.owner, plugin.repo);
+        debug!("calling Free on {id}");
+        print_wrapped(format!("{}Unloading {}{id}", color::PINK, color::LIME));
         with_breadcrumb(&plugin.owner, &plugin.repo, "Free", || unsafe { f() });
     }
     UnloadOutcome::Unloaded

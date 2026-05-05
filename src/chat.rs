@@ -3,13 +3,15 @@ mod tests;
 
 use std::mem;
 
-use classicube_helpers::{async_manager, chat};
+use classicube_helpers::{async_manager, chat, tab_list::remove_color};
+use tracing::info;
 
 const WRAP_WIDTH: usize = 80;
 const CONTINUATION_PREFIX: &str = "> ";
 
 pub fn print_wrapped<S: AsRef<str>>(s: S) {
     for line in wrap_chat(s.as_ref()) {
+        info!("{}", remove_color(&line));
         chat::print(line);
     }
 }

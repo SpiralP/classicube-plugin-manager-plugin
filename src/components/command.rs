@@ -1338,12 +1338,11 @@ async fn run_update_with_release(
     if let Some(sub) = sub_for_load {
         async_manager::run_on_main_thread(async move {
             let id = format!("{owner_s}/{repo_s}");
-            let was_loaded = loader::is_loaded(&owner_s, &repo_s);
-            if was_loaded {
+            if loader::is_loaded(&owner_s, &repo_s) {
                 loader::unload_one(&owner_s, &repo_s);
             }
             let outcome = loader::load_one(&owner_s, &repo_s, &sub);
-            chat_post_update_load_outcome(&id, was_loaded, &outcome);
+            chat_post_update_load_outcome(&id, &outcome);
         })
         .await;
     }
@@ -1352,14 +1351,12 @@ async fn run_update_with_release(
 }
 
 /// Chat for the in-session reload that follows a successful `/update`.
-/// Distinct from `handle_load`'s messages because the user wasn't asking to
-/// load - we're reporting the side-effect of the install.
-fn chat_post_update_load_outcome(id: &str, was_loaded: bool, outcome: &LoadOutcome) {
+/// `loader::load_one` already chats "Loading X" before the dlopen, so the
+/// success arm is silent here; this only surfaces failure modes and odd
+/// edge cases distinct from `handle_load`'s messages.
+fn chat_post_update_load_outcome(id: &str, outcome: &LoadOutcome) {
     match outcome {
-        LoadOutcome::Loaded => {
-            let verb = if was_loaded { "Reloaded" } else { "Loaded" };
-            print_wrapped(format!("{}{verb} {}{id}", color::PINK, color::LIME));
-        }
+        LoadOutcome::Loaded => {}
         LoadOutcome::Disabled
         | LoadOutcome::IsSelf
         | LoadOutcome::NotInstalled
@@ -1408,15 +1405,7 @@ fn chat_post_update_load_outcome(id: &str, was_loaded: bool, outcome: &LoadOutco
 /// already chatted about the primary action ("Removed", "Disabled").
 async fn run_unload_followup(owner: String, repo: String) {
     async_manager::run_on_main_thread(async move {
-        let id = format!("{owner}/{repo}");
-        match loader::unload_one(&owner, &repo) {
-            UnloadOutcome::Unloaded => {
-                print_wrapped(format!("{}Unloaded {}{id}", color::PINK, color::LIME));
-            }
-            // NotLoaded: nothing to do, no chat. IsSelf: never reached -
-            // both callers refuse_self_mutation before invoking us.
-            UnloadOutcome::NotLoaded | UnloadOutcome::IsSelf => {}
-        }
+        loader::unload_one(&owner, &repo);
     })
     .await;
 }
@@ -1491,9 +1480,7 @@ fn handle_load(spec: &str) {
             let id = format!("{}/{}", owner, repo);
             let outcome = loader::load_one(&owner, &repo, &sub);
             match outcome {
-                LoadOutcome::Loaded => {
-                    print_wrapped(format!("{}Loaded {}{id}", color::PINK, color::LIME,))
-                }
+                LoadOutcome::Loaded => {}
                 LoadOutcome::Disabled => print_wrapped(format!(
                     "{}{id} {}is disabled; use {}/client Manager enable {id}{} first",
                     color::LIME,
@@ -1585,9 +1572,7 @@ fn handle_unload(spec: &str) {
         async_manager::run_on_main_thread(async move {
             let id = format!("{}/{}", owner, repo);
             match loader::unload_one(&owner, &repo) {
-                UnloadOutcome::Unloaded => {
-                    print_wrapped(format!("{}Unloaded {}{id}", color::PINK, color::LIME,))
-                }
+                UnloadOutcome::Unloaded => {}
                 UnloadOutcome::NotLoaded => print_wrapped(format!(
                     "{}{id} {}is not loaded",
                     color::LIME,
