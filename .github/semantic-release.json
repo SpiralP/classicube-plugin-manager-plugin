@@ -1,9 +1,4 @@
 {
-  "branches": [
-    "release",
-    { "name": "main", "prerelease": "alpha" },
-    { "name": "master", "prerelease": "alpha" }
-  ],
   "plugins": [
     [
       "@semantic-release/commit-analyzer",
@@ -13,6 +8,12 @@
           { "breaking": true, "release": "minor" },
           { "type": "feat", "release": "patch" }
         ]
+      }
+    ],
+    [
+      "@semantic-release/exec",
+      {
+        "successCmd": "gh release edit ${nextRelease.gitTag} --prerelease"
       }
     ]
   ]
