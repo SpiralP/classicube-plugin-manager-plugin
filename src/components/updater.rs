@@ -93,9 +93,10 @@ impl Component for Updater {
                         .map(move |(repo, sub)| (owner.clone(), repo, sub))
                 })
                 .collect();
-            async_manager::spawn_on_main_thread(async move {
+            async_manager::run_on_main_thread(async move {
                 init_managed(&subs);
-            });
+            })
+            .await;
         });
     }
 }

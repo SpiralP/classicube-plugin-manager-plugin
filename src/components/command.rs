@@ -409,7 +409,7 @@ fn handle_add(spec: &str, channel: Channel, token: Option<String>) {
             color::PINK,
         ))
         .await;
-        spawn_update_task(owner, repo, channel, install_token);
+        run_update_task(owner, repo, channel, install_token).await;
     });
 }
 
@@ -541,7 +541,7 @@ async fn auto_add_and_install(
         color::PINK,
     ))
     .await;
-    spawn_update_task(owner, repo, channel, None);
+    run_update_task(owner, repo, channel, None).await;
 }
 
 fn handle_remove(spec: &str) {
@@ -595,7 +595,7 @@ fn handle_remove(spec: &str) {
         ))
         .await;
 
-        spawn_unload_followup(stored_owner.clone(), stored_repo.clone());
+        run_unload_followup(stored_owner.clone(), stored_repo.clone()).await;
 
         if let Some(name) = installed_asset {
             let path = Path::new(MANAGED_DIR).join(&name);
@@ -687,7 +687,7 @@ fn handle_channel(spec: &str, channel: Channel) {
             // "Checking..." / "already on ..." chat noise on top of the
             // "Channel set to ..." line we just printed.
             if !channel_matches_installed(&channel, installed_version.as_deref()) {
-                spawn_update_task(owner, repo, channel, token);
+                run_update_task(owner, repo, channel, token).await;
             }
             return;
         }
@@ -742,7 +742,7 @@ fn set_disabled(spec: &str, disabled: bool) {
             ))
             .await;
             if disabled {
-                spawn_unload_followup(owner, repo);
+                run_unload_followup(owner, repo).await;
             }
             return;
         }
@@ -945,7 +945,7 @@ fn handle_update_one(spec: &str) {
             }
 
             let token = sub.token.as_ref().map(|s| s.expose().to_owned());
-            spawn_update_task(owner, repo, sub.channel.clone(), token);
+            run_update_task(owner, repo, sub.channel.clone(), token).await;
             return;
         }
 
@@ -1041,50 +1041,46 @@ fn handle_update_all() {
         ))
         .await;
         for (owner, repo, token, release) in stale {
-            spawn_update_task_with_release(owner, repo, token, release);
+            run_update_task_with_release(owner, repo, token, release).await;
         }
     });
 }
 
-fn spawn_update_task(owner: String, repo: String, channel: Channel, token: Option<String>) {
-    async_manager::spawn(async move {
-        if let Err(e) = run_update(&owner, &repo, &channel, token.as_deref()).await {
-            error!("update {}/{}: {e:#}", owner, repo);
-            print_async(format!(
-                "{}Update {}{}/{}{} failed: {}{e}",
-                color::RED,
-                color::LIME,
-                owner,
-                repo,
-                color::RED,
-                color::WHITE,
-            ))
-            .await;
-        }
-    });
+async fn run_update_task(owner: String, repo: String, channel: Channel, token: Option<String>) {
+    if let Err(e) = run_update(&owner, &repo, &channel, token.as_deref()).await {
+        error!("update {}/{}: {e:#}", owner, repo);
+        print_async(format!(
+            "{}Update {}{}/{}{} failed: {}{e}",
+            color::RED,
+            color::LIME,
+            owner,
+            repo,
+            color::RED,
+            color::WHITE,
+        ))
+        .await;
+    }
 }
 
-fn spawn_update_task_with_release(
+async fn run_update_task_with_release(
     owner: String,
     repo: String,
     token: Option<String>,
     release: GitHubRelease,
 ) {
-    async_manager::spawn(async move {
-        if let Err(e) = run_update_with_release(&owner, &repo, token.as_deref(), release).await {
-            error!("update {}/{}: {e:#}", owner, repo);
-            print_async(format!(
-                "{}Update {}{}/{}{} failed: {}{e}",
-                color::RED,
-                color::LIME,
-                owner,
-                repo,
-                color::RED,
-                color::WHITE,
-            ))
-            .await;
-        }
-    });
+    if let Err(e) = run_update_with_release(&owner, &repo, token.as_deref(), release).await {
+        error!("update {}/{}: {e:#}", owner, repo);
+        print_async(format!(
+            "{}Update {}{}/{}{} failed: {}{e}",
+            color::RED,
+            color::LIME,
+            owner,
+            repo,
+            color::RED,
+            color::WHITE,
+        ))
+        .await;
+    }
 }
 
 async fn run_update(owner: &str, repo: &str, channel: &Channel, token: Option<&str>) -> Result<()> {
@@ -1295,7 +1291,7 @@ async fn run_update_with_release(
             .cloned()
     });
     if let Some(sub) = sub_for_load {
-        async_manager::spawn_on_main_thread(async move {
+        async_manager::run_on_main_thread(async move {
             let id = format!("{owner_s}/{repo_s}");
             let was_loaded = loader::is_loaded(&owner_s, &repo_s);
             if was_loaded {
@@ -1303,7 +1299,8 @@ async fn run_update_with_release(
             }
             let outcome = loader::load_one(&owner_s, &repo_s, &sub);
             chat_post_update_load_outcome(&id, was_loaded, &outcome);
-        });
+        })
+        .await;
     }
 
     Ok(())
@@ -1364,8 +1361,8 @@ fn chat_post_update_load_outcome(id: &str, was_loaded: bool, outcome: &LoadOutco
 /// `/remove` and `/disable` so the in-process state matches the
 /// just-persisted config. Silent when nothing was loaded; the caller has
 /// already chatted about the primary action ("Removed", "Disabled").
-fn spawn_unload_followup(owner: String, repo: String) {
-    async_manager::spawn_on_main_thread(async move {
+async fn run_unload_followup(owner: String, repo: String) {
+    async_manager::run_on_main_thread(async move {
         let id = format!("{owner}/{repo}");
         match loader::unload_one(&owner, &repo) {
             UnloadOutcome::Unloaded => {
@@ -1375,7 +1372,8 @@ fn spawn_unload_followup(owner: String, repo: String) {
             // both callers refuse_self_mutation before invoking us.
             UnloadOutcome::NotLoaded | UnloadOutcome::IsSelf => {}
         }
-    });
+    })
+    .await;
 }
 
 fn unix_now() -> u64 {
@@ -1444,7 +1442,7 @@ fn handle_load(spec: &str) {
             return;
         };
 
-        async_manager::spawn_on_main_thread(async move {
+        async_manager::run_on_main_thread(async move {
             let id = format!("{}/{}", owner, repo);
             let outcome = loader::load_one(&owner, &repo, &sub);
             match outcome {
@@ -1513,7 +1511,8 @@ fn handle_load(spec: &str) {
                     color::RED,
                 )),
             }
-        });
+        })
+        .await;
     });
 }
 
@@ -1538,7 +1537,7 @@ fn handle_unload(spec: &str) {
             return;
         };
 
-        async_manager::spawn_on_main_thread(async move {
+        async_manager::run_on_main_thread(async move {
             let id = format!("{}/{}", owner, repo);
             match loader::unload_one(&owner, &repo) {
                 UnloadOutcome::Unloaded => {
@@ -1556,7 +1555,8 @@ fn handle_unload(spec: &str) {
                     color::YELLOW,
                 )),
             }
-        });
+        })
+        .await;
     });
 }
 
