@@ -1,17 +1,83 @@
 [[plugins]]
 owner = "SpiralP"
+repo = "classicube-plugin-updater-plugin"
+shorthand = "updater"
+description = "This plugin: keeps subscribed plugins up to date from GitHub releases."
+
+[[plugins]]
+owner = "SpiralP"
 repo = "classicube-cef-loader-plugin"
 shorthand = "cef"
 description = "Embed Chromium-rendered web content (videos, sites) in-game."
 
 [[plugins]]
 owner = "SpiralP"
-repo = "classicube-deno-plugin"
-shorthand = "deno"
-description = "JavaScript scripting engine for ClassiCube."
+repo = "classicube-chatsounds-plugin"
+shorthand = "chatsounds"
+description = "Chatsounds plugin."
 
 [[plugins]]
 owner = "SpiralP"
-repo = "classicube-plugin-updater-plugin"
-shorthand = "updater"
-description = "This plugin: keeps subscribed plugins up to date from GitHub releases."
+repo = "classicube-mention-flash-plugin"
+shorthand = "mention"
+description = "Flashes the taskbar when someone says your name in chat."
+
+[[plugins]]
+owner = "SpiralP"
+repo = "classicube-chat-bubbles-plugin"
+shorthand = "chat-bubbles"
+description = "Chat bubbles plugin."
+
+[[plugins]]
+owner = "SpiralP"
+repo = "classicube-leash-plugin"
+shorthand = "leash"
+description = "(private) Leash plugin."
+
+[[plugins]]
+owner = "SpiralP"
+repo = "classicube-bhop-plugin"
+shorthand = "bhop"
+description = "(private) Bhop plugin."
+
+[[plugins]]
+owner = "SpiralP"
+repo = "classicube-toolgun-plugin"
+shorthand = "toolgun"
+description = "Toolgun plugin."
+
+[[plugins]]
+owner = "SpiralP"
+repo = "classicube-held-block-info-plugin"
+shorthand = "held-block-info"
+description = "Held block info plugin."
+
+[[plugins]]
+owner = "SpiralP"
+repo = "classicube-map-saver-plugin"
+shorthand = "map-saver"
+description = "Map saver plugin."
+
+[[plugins]]
+owner = "SpiralP"
+repo = "classicube-anti-afk-plugin"
+shorthand = "anti-afk"
+description = "Anti afk plugin."
+
+[[plugins]]
+owner = "SpiralP"
+repo = "classicube-auto-sprint-plugin"
+shorthand = "auto-sprint"
+description = "Auto sprint plugin."
+
+[[plugins]]
+owner = "SpiralP"
+repo = "classicube-deno-plugin"
+shorthand = "deno"
+description = "(private) JavaScript scripting engine for ClassiCube."
+
+[[plugins]]
+owner = "SpiralP"
+repo = "classicube-csharp-loader-plugin"
+shorthand = "csharp"
+description = "Csharp loader plugin."
