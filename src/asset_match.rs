@@ -84,13 +84,20 @@ fn arch_tokens(arch: &str) -> (&'static [&'static str], &'static [&'static str])
 
 /// Whether `filename` looks like a build artifact for `repo` on this platform.
 ///
-/// Recognizes both the canonical asset name (`classicube-foo-plugin.so`) and
-/// the rust-cdylib output that `cargo build` produces by default for a crate
-/// named `classicube-foo-plugin`:
+/// Recognizes three shapes:
 ///
-/// - Linux:   `libclassicube_foo_plugin.so`
-/// - macOS:   `libclassicube_foo_plugin.dylib`
-/// - Windows: `classicube_foo_plugin.dll` (no `lib` prefix)
+/// - Canonical: `classicube-foo-plugin.so`
+/// - Rust-cdylib output for crate `classicube-foo-plugin`:
+///   - Linux:   `libclassicube_foo_plugin.so`
+///   - macOS:   `libclassicube_foo_plugin.dylib`
+///   - Windows: `classicube_foo_plugin.dll` (no `lib` prefix)
+/// - Target-tuple: `classicube_foo_<os>_<arch>.so` and similar - the trailing
+///   `-plugin` is dropped from the repo and OS+arch tokens take its place
+///   (e.g. `classicube_cef_loader_linux_x86_64.so` for
+///   `classicube-cef-loader-plugin`). Requires `repo` to end in `-plugin`
+///   and the part after the repo's short prefix to begin with a known OS or
+///   arch token, so an asset belonging to `classicube-cef-loader-plugin`
+///   doesn't false-match `classicube-cef-plugin`.
 ///
 /// Used for duplicate-load detection: a variant-named file in `plugins/` next
 /// to a managed canonical asset would cause ClassiCube to `dlopen` both.
@@ -106,7 +113,35 @@ pub fn matches_repo(filename: &str, repo: &str, dll_suffix: &str) -> bool {
     };
     let stem = stem.strip_prefix("lib").unwrap_or(stem);
     let normalized = stem.replace('_', "-");
-    normalized == repo.to_ascii_lowercase()
+    let repo_lc = repo.to_ascii_lowercase();
+    if normalized == repo_lc {
+        return true;
+    }
+    let Some(repo_short) = repo_lc.strip_suffix("-plugin") else {
+        return false;
+    };
+    let Some(rest) = normalized
+        .strip_prefix(repo_short)
+        .and_then(|r| r.strip_prefix('-'))
+    else {
+        return false;
+    };
+    starts_with_platform_token(rest)
+}
+
+/// True if `s` starts with a known OS or arch token followed by `-` or end of
+/// string. Tokens are post-normalization (`_`->`-`), so `x86_64` is matched
+/// as `x86-64`. All architectures are accepted, not just the running one:
+/// duplicate-load detection should flag a wrong-arch leftover too.
+fn starts_with_platform_token(s: &str) -> bool {
+    const OS_TOKENS: &[&str] = &["linux", "windows", "macos", "darwin"];
+    const ARCH_TOKENS: &[&str] = &[
+        "x86-64", "amd64", "aarch64", "arm64", "armv8", "armv7", "i686", "i386", "x86", "arm",
+    ];
+    OS_TOKENS.iter().chain(ARCH_TOKENS).any(|tok| {
+        s.strip_prefix(tok)
+            .is_some_and(|r| r.is_empty() || r.starts_with('-'))
+    })
 }
 
 fn contains_word(haystack: &str, needle: &str) -> bool {

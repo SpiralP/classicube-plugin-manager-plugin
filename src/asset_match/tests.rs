@@ -255,3 +255,216 @@ fn matches_repo_handles_non_canonical_repo_names() {
     assert!(matches_repo("libcef.so", "cef", ".so"));
     assert!(!matches_repo("cef.so", "classicube-cef-plugin", ".so"));
 }
+
+#[test]
+fn matches_repo_target_tuple_linux() {
+    // Release-asset shape used by cef-loader and friends:
+    // `<repo without -plugin>_<os>_<arch>.<ext>`.
+    assert!(matches_repo(
+        "classicube_cef_loader_linux_x86_64.so",
+        "classicube-cef-loader-plugin",
+        ".so",
+    ));
+}
+
+#[test]
+fn matches_repo_target_tuple_windows() {
+    assert!(matches_repo(
+        "classicube_cef_loader_windows_x86_64.dll",
+        "classicube-cef-loader-plugin",
+        ".dll",
+    ));
+}
+
+#[test]
+fn matches_repo_target_tuple_macos() {
+    // Mirrors `picks_self_update_naming` - this is the exact filename our
+    // own CI publishes for the mac job.
+    assert!(matches_repo(
+        "classicube_plugin_updater_macos_aarch64.dylib",
+        "classicube-plugin-updater-plugin",
+        ".dylib",
+    ));
+}
+
+#[test]
+fn matches_repo_target_tuple_arch_only() {
+    // Some release schemes drop the OS token (the suffix already implies it).
+    assert!(matches_repo(
+        "classicube_foo_x86_64.so",
+        "classicube-foo-plugin",
+        ".so",
+    ));
+}
+
+#[test]
+fn matches_repo_target_tuple_no_false_match_shorter_sibling() {
+    // `classicube-cef-plugin` (short = `classicube-cef`) must NOT match a
+    // cef-loader asset. The part after `classicube-cef-` is `loader-...`,
+    // which is not a known OS/arch token, so the boundary check rejects it.
+    assert!(!matches_repo(
+        "classicube_cef_loader_linux_x86_64.so",
+        "classicube-cef-plugin",
+        ".so",
+    ));
+}
+
+#[test]
+fn matches_repo_target_tuple_requires_plugin_suffix() {
+    // Repos without `-plugin` skip the target-tuple branch and only use the
+    // existing equality check.
+    assert!(!matches_repo(
+        "classicube_cef_linux_x86_64.so",
+        "classicube-cef",
+        ".so",
+    ));
+}
+
+#[test]
+fn matches_repo_target_tuple_is_case_insensitive() {
+    assert!(matches_repo(
+        "Classicube_Cef_Loader_Linux_X86_64.SO",
+        "classicube-cef-loader-plugin",
+        ".so",
+    ));
+    assert!(matches_repo(
+        "classicube_cef_loader_linux_x86_64.so",
+        "Classicube-Cef-Loader-Plugin",
+        ".so",
+    ));
+}
+
+#[test]
+fn matches_repo_target_tuple_rejects_wrong_suffix() {
+    // Suffix mismatch shortcuts before the target-tuple branch even runs.
+    assert!(!matches_repo(
+        "classicube_cef_loader_linux_x86_64.dll",
+        "classicube-cef-loader-plugin",
+        ".so",
+    ));
+}
+
+#[test]
+fn matches_repo_target_tuple_rejects_no_token_boundary() {
+    // After the repo's short prefix, the next segment must be exactly an
+    // OS/arch token followed by `-` or end-of-string. `linuxfoo` has no
+    // boundary so it isn't a recognized platform token.
+    assert!(!matches_repo(
+        "classicube_foo_linuxfoo.so",
+        "classicube-foo-plugin",
+        ".so",
+    ));
+}
+
+#[test]
+fn matches_repo_target_tuple_rejects_extra_segment_before_token() {
+    // `classicube-foo-extra-linux-x86-64` doesn't belong to
+    // `classicube-foo-plugin` - the segment after the short prefix is
+    // `extra`, not an OS/arch token.
+    assert!(!matches_repo(
+        "classicube_foo_extra_linux_x86_64.so",
+        "classicube-foo-plugin",
+        ".so",
+    ));
+}
+
+#[test]
+fn matches_repo_target_tuple_os_only() {
+    // Some schemes drop the arch token and let the suffix carry the OS.
+    // `_<os>` alone after the short prefix should still be enough.
+    assert!(matches_repo(
+        "classicube_foo_linux.so",
+        "classicube-foo-plugin",
+        ".so",
+    ));
+}
+
+#[test]
+fn matches_repo_target_tuple_amd64_alias() {
+    // `amd64` is a recognized alias of `x86_64` in arch-token form.
+    assert!(matches_repo(
+        "classicube_foo_linux_amd64.so",
+        "classicube-foo-plugin",
+        ".so",
+    ));
+}
+
+#[test]
+fn matches_repo_target_tuple_unknown_arch_does_not_match() {
+    // We only know about a fixed set of arches; an unfamiliar one (here
+    // `armv5`) shouldn't false-match. If it ever shows up in real releases,
+    // extend `starts_with_platform_token`.
+    assert!(!matches_repo(
+        "classicube_foo_armv5.so",
+        "classicube-foo-plugin",
+        ".so",
+    ));
+}
+
+#[test]
+fn matches_repo_target_tuple_repo_dash_plugin_only() {
+    // Pathological-but-legal: a repo literally named `-plugin` strips to
+    // empty short. We don't need to support it, but the code should not
+    // panic and should not match arbitrary `<token>.so` files.
+    assert!(!matches_repo("linux_x86_64.so", "-plugin", ".so"));
+}
+
+#[test]
+fn starts_with_platform_token_empty_is_false() {
+    assert!(!starts_with_platform_token(""));
+}
+
+#[test]
+fn starts_with_platform_token_bare_os_tokens() {
+    for os in ["linux", "windows", "macos", "darwin"] {
+        assert!(starts_with_platform_token(os), "bare {os} should match");
+    }
+}
+
+#[test]
+fn starts_with_platform_token_bare_arch_tokens() {
+    // Tokens are post-normalization (`_`->`-`), so the x86_64 alias is `x86-64`.
+    for arch in [
+        "x86-64", "amd64", "aarch64", "arm64", "armv8", "armv7", "i686", "i386", "x86", "arm",
+    ] {
+        assert!(starts_with_platform_token(arch), "bare {arch} should match");
+    }
+}
+
+#[test]
+fn starts_with_platform_token_with_separator_and_more() {
+    assert!(starts_with_platform_token("linux-x86-64"));
+    assert!(starts_with_platform_token("darwin-arm64"));
+    assert!(starts_with_platform_token("x86-64-debug"));
+    assert!(starts_with_platform_token("arm-anything"));
+}
+
+#[test]
+fn starts_with_platform_token_requires_word_boundary() {
+    // Token must be followed by `-` or end of string. Alphanumeric
+    // continuation means no match.
+    assert!(!starts_with_platform_token("linuxfoo"));
+    assert!(!starts_with_platform_token("armfoo"));
+    assert!(!starts_with_platform_token("x86debug"));
+    // x86-64 starts with `x86`, but the `-` after `x86` is the boundary, so
+    // `x86` matches and `-64` is the remainder. Confirm explicitly.
+    assert!(starts_with_platform_token("x86-debug"));
+}
+
+#[test]
+fn starts_with_platform_token_arm_word_boundary_does_not_partial_match() {
+    // `arm` should not partial-match `armv5` (no `-` after `arm`, and
+    // `armv5` itself isn't in our list).
+    assert!(!starts_with_platform_token("armv5"));
+    // But `armv7` and `armv8` are explicitly listed.
+    assert!(starts_with_platform_token("armv7"));
+    assert!(starts_with_platform_token("armv8"));
+}
+
+#[test]
+fn starts_with_platform_token_rejects_non_token_prefix() {
+    assert!(!starts_with_platform_token("loader-linux-x86-64"));
+    assert!(!starts_with_platform_token("plugin-darwin-arm64"));
+    assert!(!starts_with_platform_token("foo"));
+    assert!(!starts_with_platform_token("-linux"));
+}
