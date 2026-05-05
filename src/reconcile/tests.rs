@@ -753,10 +753,12 @@ fn sweep_managed_orphans_deletes_unclaimed_files_only() {
 }
 
 #[test]
-fn sweep_managed_orphans_skips_new_and_old_artifacts() {
-    // install_bytes_to leaves `.new` / `.old` mid-rename; those have their
-    // own cleanup paths and the sweep must not remove them out from under
-    // an in-flight install.
+fn sweep_managed_orphans_skips_new_keeps_reaping_old() {
+    // `.new` files belong to an in-flight `install_bytes_to` and must not be
+    // pulled out from under it. `.old` is "marked for deletion" - the
+    // previous session's mapping is gone, so we always reap it, even if the
+    // base name is still claimed (the live binary lives under the base
+    // path, not the `.old`).
     let dir = tempdir().unwrap();
     let managed = dir.path().join("managed");
     fs::create_dir(&managed).unwrap();
@@ -771,9 +773,26 @@ fn sweep_managed_orphans_skips_new_and_old_artifacts() {
 
     let deleted = sweep_managed_orphans(&managed, &cfg);
 
-    assert_eq!(deleted, vec!["garbage"]);
+    assert_eq!(deleted, vec!["claimed.so.old", "garbage"]);
+    assert!(managed.join("claimed.so").exists());
     assert!(managed.join("claimed.so.new").exists());
-    assert!(managed.join("claimed.so.old").exists());
+    assert!(!managed.join("claimed.so.old").exists());
+}
+
+#[test]
+fn sweep_managed_orphans_reaps_old_when_base_unclaimed() {
+    // `.old` left behind by a prior `/remove` rename-aside, with no
+    // matching subscription. Should still be reaped.
+    let dir = tempdir().unwrap();
+    let managed = dir.path().join("managed");
+    fs::create_dir(&managed).unwrap();
+    touch(&managed, "gone.so.old");
+
+    let cfg = config_with(vec![]);
+    let deleted = sweep_managed_orphans(&managed, &cfg);
+
+    assert_eq!(deleted, vec!["gone.so.old"]);
+    assert!(!managed.join("gone.so.old").exists());
 }
 
 #[test]

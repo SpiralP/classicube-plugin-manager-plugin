@@ -604,17 +604,32 @@ fn handle_remove(spec: &str) {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => {
                     warn!("could not remove {}: {e}", path.display());
-                    print_async(format!(
-                        "{}Could not delete {}{}{}: {}{}{}; remove it by hand.",
-                        color::YELLOW,
-                        color::LIME,
-                        path.display(),
-                        color::YELLOW,
-                        color::LIME,
-                        e,
-                        color::YELLOW,
-                    ))
-                    .await;
+                    // Windows holds a sharing lock on the mapped DLL: telling
+                    // the user to delete it by hand is wrong (Explorer hits
+                    // the same violation). `fs::rename` (MoveFileExW) succeeds
+                    // against a locked DLL even though `DeleteFile` doesn't,
+                    // so move it aside to `<name>.old` (matching the
+                    // `install_bytes_to` convention) and let the startup
+                    // sweep reap it next session.
+                    let aside = path.with_file_name(format!("{name}.old"));
+                    match fs::rename(&path, &aside) {
+                        Ok(()) => debug!("renamed locked {} -> .old", path.display()),
+                        Err(e2) => {
+                            warn!("could not rename {}: {e2}", path.display());
+                            print_async(format!(
+                                "{}Could not delete {}{}{}: {}{}{}; still in use, will be cleaned \
+                                 up on next restart.",
+                                color::YELLOW,
+                                color::LIME,
+                                path.display(),
+                                color::YELLOW,
+                                color::LIME,
+                                e,
+                                color::YELLOW,
+                            ))
+                            .await;
+                        }
+                    }
                 }
             }
         }

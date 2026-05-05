@@ -77,17 +77,12 @@ impl Component for Updater {
             // dlopen).
             let swept = reconcile::sweep_managed_orphans(Path::new(MANAGED_DIR), &cfg);
             if !swept.is_empty() {
-                print_async(format!(
-                    "{}Cleaned up {}{}{} stale plugin binar{}: {}{}",
-                    color::PINK,
-                    color::YELLOW,
+                info!(
+                    "cleaned up {} stale plugin binar{}: {}",
                     swept.len(),
-                    color::PINK,
                     if swept.len() == 1 { "y" } else { "ies" },
-                    color::LIME,
                     swept.join(", "),
-                ))
-                .await;
+                );
             }
             let subs: Vec<(String, String, Subscription)> = cfg
                 .subscriptions
