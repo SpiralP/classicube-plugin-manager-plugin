@@ -267,6 +267,48 @@ fn apply_channel_switch_preserves_installed_state() {
 }
 
 #[test]
+fn channel_matches_installed_tag_equal_skips() {
+    assert!(channel_matches_installed(
+        &Channel::Tag("v1.0.0".into()),
+        Some("v1.0.0"),
+    ));
+}
+
+#[test]
+fn channel_matches_installed_tag_different_runs() {
+    assert!(!channel_matches_installed(
+        &Channel::Tag("v2.0.0".into()),
+        Some("v1.0.0"),
+    ));
+}
+
+#[test]
+fn channel_matches_installed_tag_no_installed_runs() {
+    assert!(!channel_matches_installed(
+        &Channel::Tag("v1.0.0".into()),
+        None,
+    ));
+}
+
+#[test]
+fn channel_matches_installed_stable_never_matches() {
+    // Non-tag channels never short-circuit at the call site; the same-tag
+    // skip in run_update_with_release handles the case where the resolved
+    // release happens to equal installed_version.
+    assert!(!channel_matches_installed(&Channel::Stable, Some("v1.0.0")));
+    assert!(!channel_matches_installed(&Channel::Stable, None));
+}
+
+#[test]
+fn channel_matches_installed_prerelease_never_matches() {
+    assert!(!channel_matches_installed(
+        &Channel::Prerelease,
+        Some("v1.0.0"),
+    ));
+    assert!(!channel_matches_installed(&Channel::Prerelease, None));
+}
+
+#[test]
 fn parse_channel_args_rejects_extra_args() {
     assert!(parse_channel_args(&["stable", "extra"]).is_err());
     assert!(parse_channel_args(&["tag", "v1", "extra"]).is_err());

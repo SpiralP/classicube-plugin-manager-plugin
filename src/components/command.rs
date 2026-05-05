@@ -214,6 +214,17 @@ fn apply_channel_switch(sub: &mut Subscription, new: Channel) {
     sub.state.cached_published_at = None;
 }
 
+/// True when the new channel is a tag pin matching the already-installed
+/// version. Used by `/channel` to skip the post-switch auto-update for the
+/// pause-to-current-tag case: switching to the tag we already have should
+/// not "Check for latest release..." then chat "is already on ...".
+/// Non-tag channels (`Stable`, `Prerelease`) always return false; their
+/// resolved release might happen to equal `installed_version`, but
+/// `run_update_with_release` already short-circuits that downstream.
+fn channel_matches_installed(channel: &Channel, installed: Option<&str>) -> bool {
+    matches!(channel, Channel::Tag(v) if installed == Some(v.as_str()))
+}
+
 /// Decide which `Channel::Tag` value to switch to when `/pause` is invoked.
 /// Returns the pinned channel on success, or a chat-ready reason for refusing
 /// (no installed version yet, or the subscription is already pinned).
@@ -638,6 +649,8 @@ fn handle_channel(spec: &str, channel: Channel) {
                 .await;
                 return;
             }
+            let token = sub.token.as_ref().map(|s| s.expose().to_owned());
+            let installed_version = sub.state.installed_version.clone();
             apply_channel_switch(sub, channel.clone());
 
             if let Err(e) = config.save() {
@@ -653,6 +666,14 @@ fn handle_channel(spec: &str, channel: Channel) {
                 channel.pretty(),
             ))
             .await;
+
+            // Pulling the new channel's binary is the whole point of the
+            // switch; skip only the pause-to-current-tag case to avoid the
+            // "Checking..." / "already on ..." chat noise on top of the
+            // "Channel set to ..." line we just printed.
+            if !channel_matches_installed(&channel, installed_version.as_deref()) {
+                spawn_update_task(owner, repo, channel, token);
+            }
             return;
         }
 
