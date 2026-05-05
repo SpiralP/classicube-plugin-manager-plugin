@@ -2,8 +2,11 @@ use std::{collections::BTreeMap, fs, panic};
 
 use tempfile::{NamedTempFile, tempdir};
 
-use super::{ApiVersionCheck, check_api_version, detect_plugins_dir_conflict, with_breadcrumb_at};
-use crate::config::{Config, Subscription};
+use super::{
+    ApiVersionCheck, LoadOutcome, check_api_version, classify_early, detect_plugins_dir_conflict,
+    with_breadcrumb_at,
+};
+use crate::config::{self, Config, Subscription};
 
 #[test]
 fn missing_dir_returns_none() {
@@ -184,4 +187,54 @@ fn breadcrumb_returns_closure_value() {
     config_with_one_sub(f.path(), "octocat", "hello-world");
     let n = with_breadcrumb_at(f.path(), "octocat", "hello-world", "Reset", || 42);
     assert_eq!(n, 42);
+}
+
+// `classify_early` exercises the FFI-free, side-effect-free branches of
+// `load_one`. The success and dlopen-error paths need a real plugin binary
+// and are out of scope for unit tests. The `unload_one` branches exposed to
+// tests are similarly the ones that don't reach the platform unload call.
+
+#[test]
+fn classify_early_disabled_returns_disabled() {
+    let sub = Subscription {
+        disabled: true,
+        ..Subscription::default()
+    };
+    assert!(matches!(
+        classify_early("octocat", "hello-world", &sub),
+        Some(LoadOutcome::Disabled)
+    ));
+}
+
+#[test]
+fn classify_early_self_returns_is_self() {
+    // Even if the user's config has the self sub enabled and "installed", we
+    // never dlopen it - the game already owns its handle.
+    let sub = Subscription::default();
+    assert!(matches!(
+        classify_early(config::SELF_OWNER, config::SELF_REPO, &sub),
+        Some(LoadOutcome::IsSelf)
+    ));
+}
+
+#[test]
+fn classify_early_disabled_takes_precedence_over_self() {
+    // If the user disables the self sub by hand and then we also short-circuit
+    // on is_self, both reasons apply; report Disabled because the disabled
+    // flag is the user's explicit intent and the more actionable hint.
+    let sub = Subscription {
+        disabled: true,
+        ..Subscription::default()
+    };
+    assert!(matches!(
+        classify_early(config::SELF_OWNER, config::SELF_REPO, &sub),
+        Some(LoadOutcome::Disabled)
+    ));
+}
+
+#[test]
+fn classify_early_normal_sub_returns_none() {
+    // Falls through to the FFI/LOADED/filesystem checks in the full load_one.
+    let sub = Subscription::default();
+    assert!(classify_early("octocat", "hello-world", &sub).is_none());
 }

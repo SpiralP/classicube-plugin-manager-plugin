@@ -27,6 +27,7 @@ use crate::{
     discover,
     github_release::{GitHubRelease, get_release_for_channel, resolve_expected_digest},
     installer::{MANAGED_DIR, PLUGINS_DIR, download_self, download_to_managed_dir},
+    loader::{self, LoadOutcome, UnloadOutcome},
     reconcile,
     secret::Secret,
     self_path::current_lib_path,
@@ -153,6 +154,8 @@ const USAGE_LINES: &[&str] = &[
     "&a/client Updater unpause <owner>/<repo>",
     "&a/client Updater list",
     "&a/client Updater update [<owner>/<repo>]",
+    "&a/client Updater load <owner>/<repo>",
+    "&a/client Updater unload <owner>/<repo>",
     "&a/client Updater discover [<search>]",
 ];
 
@@ -1191,10 +1194,151 @@ extern "C" fn c_callback(args: *const cc_string, args_count: c_int) {
         ["list"] => handle_list(),
         ["update"] => handle_update_all(),
         ["update", spec] => handle_update_one(spec),
+        ["load", spec] => handle_load(spec),
+        ["unload", spec] => handle_unload(spec),
         ["discover"] => handle_discover(None),
         ["discover", term] => handle_discover(Some(term)),
         _ => print_usage(),
     }
+}
+
+fn handle_load(spec: &str) {
+    let Some(candidates) = expand_candidates(spec) else {
+        print_wrapped(format!("{}Expected owner/repo, got: {spec}", color::RED));
+        return;
+    };
+    let spec = spec.to_string();
+
+    async_manager::spawn(async move {
+        let config = match Config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                print_load_error(&e).await;
+                return;
+            }
+        };
+
+        let Some((owner, repo, sub)) =
+            find_subscription(&config, &candidates).map(|(o, r, s)| (o, r, s.clone()))
+        else {
+            print_not_added(&spec).await;
+            return;
+        };
+
+        async_manager::spawn_on_main_thread(async move {
+            let id = format!("{}/{}", owner, repo);
+            let outcome = loader::load_one(&owner, &repo, &sub);
+            match outcome {
+                LoadOutcome::Loaded => {
+                    print_wrapped(format!("{}Loaded {}{id}", color::PINK, color::LIME,))
+                }
+                LoadOutcome::Disabled => print_wrapped(format!(
+                    "{}{id} {}is disabled; use {}/client Updater enable {id}{} first",
+                    color::LIME,
+                    color::YELLOW,
+                    color::LIME,
+                    color::YELLOW,
+                )),
+                LoadOutcome::IsSelf => print_wrapped(format!(
+                    "{}Refusing to load {}{id}{}: this is the updater plugin itself.",
+                    color::YELLOW,
+                    color::LIME,
+                    color::YELLOW,
+                )),
+                LoadOutcome::CrashCarryover { previous } => print_wrapped(format!(
+                    "{}{id} crashed inside {}{previous}{} last session; cleared the breadcrumb. \
+                     Try again.",
+                    color::YELLOW,
+                    color::LIME,
+                    color::YELLOW,
+                )),
+                LoadOutcome::NotInstalled => print_wrapped(format!(
+                    "{}{id} {}has no installed binary; use {}/client Updater update {id}{} first",
+                    color::LIME,
+                    color::YELLOW,
+                    color::LIME,
+                    color::YELLOW,
+                )),
+                LoadOutcome::AlreadyLoaded => print_wrapped(format!(
+                    "{}{id} {}is already loaded",
+                    color::LIME,
+                    color::YELLOW,
+                )),
+                LoadOutcome::PluginsDirConflict { path } => print_wrapped(format!(
+                    "{}Refusing to load {}{id}{}: {}{}{} would load as a duplicate; delete one",
+                    color::YELLOW,
+                    color::LIME,
+                    color::YELLOW,
+                    color::LIME,
+                    path.display(),
+                    color::YELLOW,
+                )),
+                LoadOutcome::LoadError(e) => print_wrapped(format!(
+                    "{}Failed to load {}{id}{}: {}{e}",
+                    color::RED,
+                    color::LIME,
+                    color::RED,
+                    color::WHITE,
+                )),
+                LoadOutcome::PluginOutdated { plugin, host } => print_wrapped(format!(
+                    "{}{id}{} plugin is outdated (api {plugin}, host expects {host}); update the \
+                     plugin",
+                    color::LIME,
+                    color::RED,
+                )),
+                LoadOutcome::HostOutdated { plugin, host } => print_wrapped(format!(
+                    "{}Game is too outdated for {}{id}{} (api {plugin}, host expects {host}); \
+                     update the game",
+                    color::RED,
+                    color::LIME,
+                    color::RED,
+                )),
+            }
+        });
+    });
+}
+
+fn handle_unload(spec: &str) {
+    let Some(candidates) = expand_candidates(spec) else {
+        print_wrapped(format!("{}Expected owner/repo, got: {spec}", color::RED));
+        return;
+    };
+    let spec = spec.to_string();
+
+    async_manager::spawn(async move {
+        let config = match Config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                print_load_error(&e).await;
+                return;
+            }
+        };
+
+        let Some((owner, repo, _)) = find_subscription(&config, &candidates) else {
+            print_not_added(&spec).await;
+            return;
+        };
+
+        async_manager::spawn_on_main_thread(async move {
+            let id = format!("{}/{}", owner, repo);
+            match loader::unload_one(&owner, &repo) {
+                UnloadOutcome::Unloaded => {
+                    print_wrapped(format!("{}Unloaded {}{id}", color::PINK, color::LIME,))
+                }
+                UnloadOutcome::NotLoaded => print_wrapped(format!(
+                    "{}{id} {}is not loaded",
+                    color::LIME,
+                    color::YELLOW,
+                )),
+                UnloadOutcome::IsSelf => print_wrapped(format!(
+                    "{}Refusing to unload {}{id}{}: this is the updater plugin itself.",
+                    color::YELLOW,
+                    color::LIME,
+                    color::YELLOW,
+                )),
+            }
+        });
+    });
 }
 
 fn handle_discover(term: Option<&str>) {

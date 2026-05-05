@@ -35,125 +35,234 @@ thread_local!(
 
 pub fn init_managed(subs: &[(String, String, Subscription)]) {
     for (owner, repo, sub) in subs {
-        if sub.disabled {
-            continue;
+        let outcome = load_one(owner, repo, sub);
+        report_init_outcome(owner, repo, &outcome);
+    }
+}
+
+/// Outcome of attempting to load one subscription's managed binary. Variants
+/// are pure values — the caller decides how (and whether) to surface each one
+/// to the user. `init_managed` keeps its existing mostly-silent behavior;
+/// `/load` chats every variant.
+pub enum LoadOutcome {
+    /// dlopen + Init/OnNewMap/OnNewMapLoaded all succeeded; the entry is in `LOADED`.
+    Loaded,
+    /// `sub.disabled = true`. Auto-load skips silently; `/load` refuses.
+    Disabled,
+    /// `(owner, repo)` is the updater itself - the game already owns its handle.
+    IsSelf,
+    /// Previous session left an `in_callback` breadcrumb on this sub. The
+    /// breadcrumb has been cleared on disk so the next `/load` (or next
+    /// startup) can try again; the carry-over name is returned for chat.
+    CrashCarryover { previous: String },
+    /// `sub.state.installed_asset` is None - nothing to dlopen yet.
+    NotInstalled,
+    /// An entry for `(owner, repo)` was already in `LOADED`.
+    AlreadyLoaded,
+    /// A file in `plugins/` would auto-load as a duplicate of this sub.
+    PluginsDirConflict { path: PathBuf },
+    /// `dlopen` (or one of the symbol lookups) failed.
+    LoadError(anyhow::Error),
+    /// Plugin's `Plugin_ApiVersion` is older than the host expects.
+    PluginOutdated { plugin: c_int, host: c_int },
+    /// Plugin's `Plugin_ApiVersion` is newer than the host can run.
+    HostOutdated { plugin: c_int, host: c_int },
+}
+
+/// Outcome of `unload_one`. `/unload` is the only caller; values map directly
+/// to chat replies.
+pub enum UnloadOutcome {
+    /// Component's `Free` ran (best-effort) and `dlclose`/`FreeLibrary` was called.
+    Unloaded,
+    /// No `LOADED` entry for `(owner, repo)`.
+    NotLoaded,
+    /// `(owner, repo)` is the updater itself - refuse, the game owns the handle.
+    IsSelf,
+}
+
+/// Pure pre-flight checks for `load_one`. Returns `Some(_)` for outcomes
+/// decidable from `sub` alone (no FFI, no `LOADED` access, no filesystem,
+/// no config write). Extracted so tests can exercise these branches without
+/// pulling `plugin::try_load` (and its `DynamicLib_*` symbols) into the
+/// test-binary link graph - the host provides those symbols at runtime, not
+/// at `cargo test` link time.
+fn classify_early(owner: &str, repo: &str, sub: &Subscription) -> Option<LoadOutcome> {
+    if sub.disabled {
+        return Some(LoadOutcome::Disabled);
+    }
+    if config::is_self(owner, repo) {
+        return Some(LoadOutcome::IsSelf);
+    }
+    None
+}
+
+/// Load one subscription's managed binary into the running process, mirroring
+/// what `init_managed` does at startup. Pure-ish: returns an outcome rather
+/// than printing chat, but does mutate `LOADED` and (for the carry-over case)
+/// the on-disk config. Caller is responsible for chat output via
+/// `report_init_outcome` (auto-load) or its own mapping (`/load`).
+pub fn load_one(owner: &str, repo: &str, sub: &Subscription) -> LoadOutcome {
+    if let Some(o) = classify_early(owner, repo, sub) {
+        return o;
+    }
+    let id = format!("{owner}/{repo}");
+    if let Some(prev) = sub.state.in_callback.as_deref() {
+        // Last session's breadcrumb survived. Treat it as "this sub crashed
+        // inside `prev` last run". Clear the breadcrumb on disk so retries
+        // aren't blocked forever, then return the carry-over name for chat.
+        let previous = prev.to_owned();
+        if let Err(e) = config::set_in_callback_to(config_path(), owner, repo, None) {
+            warn!("clearing carry-over breadcrumb for {id}: {e:#}");
         }
-        // The self subscription lives in plugins/, not plugins/managed/, and
-        // is already loaded by the game — dlopen'ing it here would double-load.
-        if config::is_self(owner, repo) {
-            continue;
+        return LoadOutcome::CrashCarryover { previous };
+    }
+    let Some(asset) = sub.state.installed_asset.as_deref() else {
+        return LoadOutcome::NotInstalled;
+    };
+    if is_loaded(owner, repo) {
+        return LoadOutcome::AlreadyLoaded;
+    }
+
+    match detect_plugins_dir_conflict(
+        Path::new(PLUGINS_DIR),
+        repo,
+        env::consts::DLL_SUFFIX,
+        Some(asset),
+    ) {
+        Ok(Some(path)) => return LoadOutcome::PluginsDirConflict { path },
+        Ok(None) => {}
+        Err(e) => warn!("collision check for {id}: {e:#}"),
+    }
+
+    let path = Path::new(MANAGED_DIR).join(asset);
+    let path_str = path.to_string_lossy().into_owned();
+    // Use the dlopen function name so a crash in the loaded library's static
+    // constructors (before Init even runs) is attributed to the load step
+    // rather than blamed on Init.
+    let load_result = with_breadcrumb(owner, repo, "DynamicLib_Load2", || {
+        plugin::try_load(&path_str)
+    });
+    let (library, component, api_version) = match load_result {
+        Ok(t) => t,
+        Err(e) => return LoadOutcome::LoadError(e),
+    };
+    match check_api_version(Plugin_ApiVersion, api_version) {
+        ApiVersionCheck::Ok => {
+            LOADED.with_borrow_mut(|loaded| {
+                loaded.push(LoadedPlugin {
+                    owner: owner.to_owned(),
+                    repo: repo.to_owned(),
+                    library,
+                    component,
+                });
+            });
+            debug!("loaded {id} from {path_str}");
+            run_init_sequence(component, owner, repo);
+            LoadOutcome::Loaded
         }
-        let id = format!("{owner}/{repo}");
-        if let Some(prev) = sub.state.in_callback.as_deref() {
-            // Last session's breadcrumb survived. Treat it as "this sub
-            // crashed inside `prev` last run", warn, clear the breadcrumb,
-            // and skip loading this session — the user can /remove,
-            // /update, or just retry on next startup.
-            warn!("{id} crashed inside {prev} last session; skipping this run");
+        ApiVersionCheck::PluginOutdated => LoadOutcome::PluginOutdated {
+            plugin: api_version,
+            host: Plugin_ApiVersion,
+        },
+        ApiVersionCheck::HostOutdated => LoadOutcome::HostOutdated {
+            plugin: api_version,
+            host: Plugin_ApiVersion,
+        },
+    }
+}
+
+/// Unload the running copy of `(owner, repo)`: drop it from `LOADED`, call
+/// the component's `Free` wrapped in a breadcrumb, then `dlclose` /
+/// `FreeLibrary`. The LOADED borrow is released before `Free` runs so a
+/// managed callback can re-enter the host (chat, etc.) without deadlocking.
+pub fn unload_one(owner: &str, repo: &str) -> UnloadOutcome {
+    if config::is_self(owner, repo) {
+        return UnloadOutcome::IsSelf;
+    }
+    let plugin = LOADED.with_borrow_mut(|loaded| {
+        loaded
+            .iter()
+            .position(|p| p.owner == owner && p.repo == repo)
+            .map(|i| loaded.remove(i))
+    });
+    let Some(plugin) = plugin else {
+        return UnloadOutcome::NotLoaded;
+    };
+    let component = unsafe { &mut *plugin.component };
+    if let Some(f) = component.Free {
+        debug!("calling Free on {}/{}", plugin.owner, plugin.repo);
+        with_breadcrumb(&plugin.owner, &plugin.repo, "Free", || unsafe { f() });
+    }
+    plugin::unload(plugin.library);
+    UnloadOutcome::Unloaded
+}
+
+/// Whether `(owner, repo)` currently has an entry in `LOADED`.
+pub fn is_loaded(owner: &str, repo: &str) -> bool {
+    LOADED.with_borrow(|loaded| loaded.iter().any(|p| p.owner == owner && p.repo == repo))
+}
+
+/// Map `LoadOutcome` to startup-style logging + chat. Mirrors the behavior
+/// the inlined `init_managed` loop used to have: silent on the routine
+/// skips (Disabled / IsSelf / NotInstalled / AlreadyLoaded), warn-only for
+/// plugins-dir conflicts (reconcile already chatted), full chat for actual
+/// errors and api-version mismatches. `/load` does NOT use this mapping -
+/// it chats every variant.
+fn report_init_outcome(owner: &str, repo: &str, outcome: &LoadOutcome) {
+    let id = format!("{owner}/{repo}");
+    match outcome {
+        LoadOutcome::Loaded
+        | LoadOutcome::Disabled
+        | LoadOutcome::IsSelf
+        | LoadOutcome::NotInstalled
+        | LoadOutcome::AlreadyLoaded => {}
+        LoadOutcome::CrashCarryover { previous } => {
+            warn!("{id} crashed inside {previous} last session; skipping this run");
             print_wrapped(format!(
-                "{}Previous session crashed inside {}{id}{} {}{prev}{}. Skipped this run.",
+                "{}Previous session crashed inside {}{id}{} {}{previous}{}. Skipped this run.",
                 color::YELLOW,
                 color::LIME,
                 color::YELLOW,
                 color::LIME,
                 color::YELLOW,
             ));
-            if let Err(e) = config::set_in_callback_to(config_path(), owner, repo, None) {
-                warn!("clearing carry-over breadcrumb for {id}: {e:#}");
-            }
-            continue;
         }
-        let Some(asset) = sub.state.installed_asset.as_deref() else {
-            continue;
-        };
-        let already_loaded = LOADED
-            .with_borrow(|loaded| loaded.iter().any(|p| p.owner == *owner && p.repo == *repo));
-        if already_loaded {
-            continue;
+        LoadOutcome::PluginsDirConflict { path } => {
+            warn!(
+                "{id} not loaded: {} would load as a duplicate",
+                path.display()
+            );
         }
-
-        // Reconcile already printed a chat warning for any plugins/ conflict
-        // covering this sub, so skip silently here - a second message would
-        // just duplicate the first.
-        match detect_plugins_dir_conflict(
-            Path::new(PLUGINS_DIR),
-            repo,
-            env::consts::DLL_SUFFIX,
-            Some(asset),
-        ) {
-            Ok(Some(collision)) => {
-                warn!(
-                    "{id} not loaded: {} would load as a duplicate",
-                    collision.display()
-                );
-                continue;
-            }
-            Ok(None) => {}
-            Err(e) => warn!("collision check for {id}: {e:#}"),
+        LoadOutcome::LoadError(e) => {
+            error!("loading {id}: {e:#}");
+            print_wrapped(format!(
+                "{}Failed to load {}{}{}: {}{e}",
+                color::RED,
+                color::LIME,
+                id,
+                color::RED,
+                color::WHITE,
+            ));
         }
-
-        let path = Path::new(MANAGED_DIR).join(asset);
-        let path_str = path.to_string_lossy().into_owned();
-        // Use the dlopen function name so a crash in the loaded library's
-        // static constructors (before Init even runs) is attributed to the
-        // load step rather than blamed on Init.
-        let load_result = with_breadcrumb(owner, repo, "DynamicLib_Load2", || {
-            plugin::try_load(&path_str)
-        });
-        match load_result {
-            Ok((library, component, api_version)) => {
-                match check_api_version(Plugin_ApiVersion, api_version) {
-                    ApiVersionCheck::Ok => {
-                        LOADED.with_borrow_mut(|loaded| {
-                            loaded.push(LoadedPlugin {
-                                owner: owner.clone(),
-                                repo: repo.clone(),
-                                library,
-                                component,
-                            });
-                        });
-                        debug!("loaded {id} from {path_str}");
-                        run_init_sequence(component, owner, repo);
-                    }
-                    ApiVersionCheck::PluginOutdated => {
-                        warn!(
-                            "{id} has Plugin_ApiVersion {api_version}, host expects \
-                             {Plugin_ApiVersion}; refusing to load"
-                        );
-                        print_wrapped(format!(
-                            "{}{}{}{} plugin is outdated! Try getting a more recent version",
-                            color::RED,
-                            color::LIME,
-                            id,
-                            color::RED,
-                        ));
-                    }
-                    ApiVersionCheck::HostOutdated => {
-                        warn!(
-                            "{id} has Plugin_ApiVersion {api_version}, host expects \
-                             {Plugin_ApiVersion}; refusing to load"
-                        );
-                        print_wrapped(format!(
-                            "{}Your game is too outdated to use {}{}{} plugin! Try updating it",
-                            color::RED,
-                            color::LIME,
-                            id,
-                            color::RED,
-                        ));
-                    }
-                }
-            }
-            Err(e) => {
-                error!("loading {id} from {path_str}: {e:#}");
-                print_wrapped(format!(
-                    "{}Failed to load {}{}{}: {}{e}",
-                    color::RED,
-                    color::LIME,
-                    id,
-                    color::RED,
-                    color::WHITE,
-                ));
-            }
+        LoadOutcome::PluginOutdated { plugin, host } => {
+            warn!("{id} has Plugin_ApiVersion {plugin}, host expects {host}; refusing to load");
+            print_wrapped(format!(
+                "{}{}{}{} plugin is outdated! Try getting a more recent version",
+                color::RED,
+                color::LIME,
+                id,
+                color::RED,
+            ));
+        }
+        LoadOutcome::HostOutdated { plugin, host } => {
+            warn!("{id} has Plugin_ApiVersion {plugin}, host expects {host}; refusing to load");
+            print_wrapped(format!(
+                "{}Your game is too outdated to use {}{}{} plugin! Try updating it",
+                color::RED,
+                color::LIME,
+                id,
+                color::RED,
+            ));
         }
     }
 }
