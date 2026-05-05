@@ -22,9 +22,32 @@ use crate::{
     installer::{MANAGED_DIR, PLUGINS_DIR},
 };
 
+// Why we don't `dlclose` / `FreeLibrary` managed plugins on unload:
+// managed plugins typically use Rust's `thread_local!`, which registers
+// per-thread destructors via `__cxa_thread_atexit_impl` (glibc) or pthread
+// TSD. Those destructor function pointers live inside the plugin's mapped
+// pages. The ClassiCube game thread doesn't exit until the process exits,
+// so unmapping the library while a `thread_local!` cell is still
+// initialized leaves a dangling destructor that fires at process shutdown
+// against unmapped memory.
+//
+// glibc since ~2.18 quietly neutralizes this by refcounting the DSO when
+// `__cxa_thread_atexit_impl` is used, so `dlclose` becomes a no-op there
+// anyway - we lose nothing on glibc. musl has no such protection (hard
+// crash); Windows `FreeLibrary` similarly drops TLS state aggressively.
+//
+// So `/unload` calls the plugin's `Free` (to deregister event handlers,
+// chat commands, scheduled tasks) and removes the entry from `LOADED`,
+// but the library stays mapped for the rest of the process lifetime.
+// Real reload of a freshly-updated binary requires a game restart,
+// matching the rest of the codebase (self-update, deferred-load).
 struct LoadedPlugin {
     owner: String,
     repo: String,
+    #[expect(
+        dead_code,
+        reason = "library handle is intentionally leaked; see module comment about TLS destructors"
+    )]
     library: *mut c_void,
     component: *mut IGameComponent,
 }
@@ -72,7 +95,8 @@ pub enum LoadOutcome {
 /// Outcome of `unload_one`. `/unload` is the only caller; values map directly
 /// to chat replies.
 pub enum UnloadOutcome {
-    /// Component's `Free` ran (best-effort) and `dlclose`/`FreeLibrary` was called.
+    /// Component's `Free` ran (best-effort). The library stays mapped -
+    /// see module comment about thread-local destructors.
     Unloaded,
     /// No `LOADED` entry for `(owner, repo)`.
     NotLoaded,
@@ -171,10 +195,12 @@ pub fn load_one(owner: &str, repo: &str, sub: &Subscription) -> LoadOutcome {
     }
 }
 
-/// Unload the running copy of `(owner, repo)`: drop it from `LOADED`, call
-/// the component's `Free` wrapped in a breadcrumb, then `dlclose` /
-/// `FreeLibrary`. The LOADED borrow is released before `Free` runs so a
-/// managed callback can re-enter the host (chat, etc.) without deadlocking.
+/// Unload the running copy of `(owner, repo)`: drop it from `LOADED` and
+/// call the component's `Free` wrapped in a breadcrumb so it deregisters
+/// host-side state. The library stays mapped - see module comment about
+/// thread-local destructors. The LOADED borrow is released before `Free`
+/// runs so a managed callback can re-enter the host (chat, etc.) without
+/// deadlocking.
 pub fn unload_one(owner: &str, repo: &str) -> UnloadOutcome {
     if config::is_self(owner, repo) {
         return UnloadOutcome::IsSelf;
@@ -193,7 +219,6 @@ pub fn unload_one(owner: &str, repo: &str) -> UnloadOutcome {
         debug!("calling Free on {}/{}", plugin.owner, plugin.repo);
         with_breadcrumb(&plugin.owner, &plugin.repo, "Free", || unsafe { f() });
     }
-    plugin::unload(plugin.library);
     UnloadOutcome::Unloaded
 }
 
@@ -310,9 +335,6 @@ pub fn free() {
             debug!("calling Free on {}/{}", plugin.owner, plugin.repo);
             with_breadcrumb(&plugin.owner, &plugin.repo, "Free", || unsafe { f() });
         }
-    }
-    for plugin in drained {
-        plugin::unload(plugin.library);
     }
 }
 
