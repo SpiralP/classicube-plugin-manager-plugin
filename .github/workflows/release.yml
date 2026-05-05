@@ -16,7 +16,7 @@ jobs:
       release: true
 
   release:
-    uses: SpiralP/github-reusable-workflows/.github/workflows/release.yml@079d78d637d68fc40c438462c327accc867294d6 # main
+    uses: SpiralP/github-reusable-workflows/.github/workflows/release.yml@338cc4a77d16b2a36bbdab9f0d19f2d3e8cf183f # main
     needs: build
     concurrency:
       group: release-${{ github.ref }}
