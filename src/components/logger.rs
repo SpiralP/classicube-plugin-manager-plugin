@@ -12,7 +12,7 @@ impl Component for Logger {
     }
 
     fn init(&mut self) {
-        let debug = cfg!(debug_assertions);
+        let debug = /* cfg!(debug_assertions) */ true;
         let other_crates = false;
 
         let level = if debug { "debug" } else { "info" };
