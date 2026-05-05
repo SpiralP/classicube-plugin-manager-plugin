@@ -16,6 +16,12 @@ use crate::secret::Secret;
 
 const CONFIG_PATH: &str = "plugins/plugin-updater.toml";
 
+/// Comment line written between the user-editable region (every `[owner.repo]`
+/// table) and the plugin-managed region (every `[owner.repo.state]` table) on
+/// `save_to`. Comments are stripped on parse, so this is regenerated from
+/// scratch on every write.
+const STATE_DIVIDER: &str = "# ---- managed by plugin-updater (do not edit below) ----";
+
 /// Owner of this plugin's own repo. Used to identify the "self" subscription
 /// so the auto-update path can install over the loaded binary instead of
 /// going through the managed-plugin pipeline.
@@ -141,21 +147,17 @@ pub struct Subscription {
 }
 
 /// Plugin-managed state for a subscription. Renders as a `[owner.repo.state]`
-/// subtable in TOML, omitted entirely when every field is `None`.
+/// subtable in TOML, omitted entirely when every field is `None`. Fields are
+/// declared in A-Z order so `toml::to_string_pretty` writes them in
+/// alphabetical order on disk.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionState {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub installed_version: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub installed_asset: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub installed_at: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cached_tag: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_published_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tag: Option<String>,
     /// Crash-recovery breadcrumb: the name of the managed-plugin
     /// `IGameComponent` callback currently in flight. Set right before we
     /// invoke a managed callback (and persisted to disk), cleared right after
@@ -163,17 +165,23 @@ pub struct SubscriptionState {
     /// survives the restart and tells us who to blame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_callback: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_asset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
 }
 
 impl SubscriptionState {
     pub fn is_empty(&self) -> bool {
-        self.installed_version.is_none()
+        self.cached_at.is_none()
+            && self.cached_published_at.is_none()
+            && self.cached_tag.is_none()
+            && self.in_callback.is_none()
             && self.installed_asset.is_none()
             && self.installed_at.is_none()
-            && self.cached_tag.is_none()
-            && self.cached_at.is_none()
-            && self.cached_published_at.is_none()
-            && self.in_callback.is_none()
+            && self.installed_version.is_none()
     }
 }
 
@@ -192,6 +200,29 @@ impl Subscription {
         }
     }
 }
+
+/// Serialize-only mirror of the user-editable half of `Subscription`. Renders
+/// the same `[owner.repo]` body as a full `Subscription` would, but with no
+/// nested `state` field, so the user region of the file contains nothing
+/// machine-managed. Fields are A-Z so `to_string_pretty` writes them in
+/// alphabetical order. Values are owned (cloned from source) because serde's
+/// `skip_serializing_if` predicates expect `fn(&FieldType) -> bool`, which
+/// the stdlib helpers like `Channel::is_default` and `std::ops::Not::not`
+/// only satisfy when the field is held by value.
+#[derive(Serialize)]
+struct UserView {
+    #[serde(skip_serializing_if = "Channel::is_default")]
+    channel: Channel,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    disabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<Secret>,
+}
+
+/// Single-key wrapper that adds a literal `state` segment to the table path
+/// during the state-region serialize, so a `BTreeMap<owner, BTreeMap<repo,
+/// StateLeaf>>` renders as `[owner.repo.state]` headers.
+type StateLeaf<'a> = BTreeMap<&'static str, &'a SubscriptionState>;
 
 impl Config {
     /// Ensure a subscription for this plugin's own repo exists so the
@@ -234,15 +265,51 @@ impl Config {
     /// before we return. The crash-recovery breadcrumb relies on writes
     /// surviving an immediately-following process death; `fs::write` alone
     /// only hands the data to the kernel.
+    ///
+    /// The output is split into two regions: every `[owner.repo]` table comes
+    /// first, then a single `STATE_DIVIDER` comment, then every
+    /// `[owner.repo.state]` table. Each region is produced by its own
+    /// `toml::to_string_pretty` call over a flat `BTreeMap` view of `self`,
+    /// so concatenation is the only string work this function does.
     pub fn save_to(&self, path: &Path) -> Result<()> {
-        let toml_str = toml::to_string_pretty(self).context("serializing config")?;
+        let mut user_map: BTreeMap<&str, BTreeMap<&str, UserView>> = BTreeMap::new();
+        let mut state_map: BTreeMap<&str, BTreeMap<&str, StateLeaf<'_>>> = BTreeMap::new();
+        for (owner, repos) in &self.subscriptions {
+            for (repo, sub) in repos {
+                user_map.entry(owner).or_default().insert(
+                    repo,
+                    UserView {
+                        channel: sub.channel.clone(),
+                        disabled: sub.disabled,
+                        token: sub.token.clone(),
+                    },
+                );
+                if !sub.state.is_empty() {
+                    let mut leaf = StateLeaf::new();
+                    leaf.insert("state", &sub.state);
+                    state_map.entry(owner).or_default().insert(repo, leaf);
+                }
+            }
+        }
+
+        let mut out = toml::to_string_pretty(&user_map).context("serializing user view")?;
+        if !state_map.is_empty() {
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push('\n');
+            out.push_str(STATE_DIVIDER);
+            out.push_str("\n\n");
+            out.push_str(&toml::to_string_pretty(&state_map).context("serializing state view")?);
+        }
+
         let mut f = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(path)
             .with_context(|| format!("opening {}", path.display()))?;
-        f.write_all(toml_str.as_bytes())
+        f.write_all(out.as_bytes())
             .with_context(|| format!("writing {}", path.display()))?;
         f.sync_all()
             .with_context(|| format!("fsync {}", path.display()))?;

@@ -704,3 +704,270 @@ fn debug_subscription_redacts_token() {
         "expected redaction marker in: {dbg}",
     );
 }
+
+#[test]
+fn divider_groups_user_then_state_blocks() {
+    // Two subs, both with state: every user [owner.repo] header must appear
+    // above the single divider line, and every [owner.repo.state] header
+    // below it.
+    let mut repos = BTreeMap::new();
+    repos.insert(
+        "alpha".into(),
+        Subscription {
+            channel: Channel::Prerelease,
+            state: SubscriptionState {
+                installed_version: Some("v1".into()),
+                ..SubscriptionState::default()
+            },
+            ..sub()
+        },
+    );
+    repos.insert(
+        "beta".into(),
+        Subscription {
+            disabled: true,
+            state: SubscriptionState {
+                installed_version: Some("v2".into()),
+                ..SubscriptionState::default()
+            },
+            ..sub()
+        },
+    );
+    let mut subscriptions = BTreeMap::new();
+    subscriptions.insert("owner".into(), repos);
+    let cfg = Config { subscriptions };
+
+    let f = NamedTempFile::new().unwrap();
+    cfg.save_to(f.path()).unwrap();
+    let on_disk = fs::read_to_string(f.path()).unwrap();
+
+    let divider = on_disk.find(STATE_DIVIDER).unwrap_or_else(|| {
+        panic!("expected divider in: {on_disk}");
+    });
+    assert_eq!(
+        on_disk.matches(STATE_DIVIDER).count(),
+        1,
+        "divider should appear exactly once: {on_disk}",
+    );
+
+    let user_alpha = on_disk.find("[owner.alpha]").unwrap();
+    let user_beta = on_disk.find("[owner.beta]").unwrap();
+    let state_alpha = on_disk.find("[owner.alpha.state]").unwrap();
+    let state_beta = on_disk.find("[owner.beta.state]").unwrap();
+
+    assert!(user_alpha < divider, "user [owner.alpha] above divider");
+    assert!(user_beta < divider, "user [owner.beta] above divider");
+    assert!(
+        state_alpha > divider,
+        "state [owner.alpha.state] below divider"
+    );
+    assert!(
+        state_beta > divider,
+        "state [owner.beta.state] below divider"
+    );
+
+    let loaded = Config::load_from(f.path()).unwrap();
+    assert_eq!(loaded, cfg);
+}
+
+#[test]
+fn divider_with_mixed_state_and_no_state_subs() {
+    // One sub has state, one does not. The state-less sub still appears in
+    // the user region; only the state-bearing sub contributes a state block.
+    let mut repos = BTreeMap::new();
+    repos.insert("plain".into(), sub());
+    repos.insert(
+        "stateful".into(),
+        Subscription {
+            state: SubscriptionState {
+                installed_version: Some("v1".into()),
+                ..SubscriptionState::default()
+            },
+            ..sub()
+        },
+    );
+    let mut subscriptions = BTreeMap::new();
+    subscriptions.insert("owner".into(), repos);
+    let cfg = Config { subscriptions };
+
+    let f = NamedTempFile::new().unwrap();
+    cfg.save_to(f.path()).unwrap();
+    let on_disk = fs::read_to_string(f.path()).unwrap();
+
+    let divider = on_disk.find(STATE_DIVIDER).expect("divider present");
+    let user_plain = on_disk.find("[owner.plain]").unwrap();
+    let user_stateful = on_disk.find("[owner.stateful]").unwrap();
+    let state_stateful = on_disk.find("[owner.stateful.state]").unwrap();
+
+    assert!(user_plain < divider);
+    assert!(user_stateful < divider);
+    assert!(state_stateful > divider);
+    assert!(
+        !on_disk.contains("[owner.plain.state]"),
+        "stateless sub must not get a state block: {on_disk}",
+    );
+
+    let loaded = Config::load_from(f.path()).unwrap();
+    assert_eq!(loaded, cfg);
+}
+
+#[test]
+fn divider_omitted_when_no_state_anywhere() {
+    let cfg = one_sub_config(
+        "octocat",
+        "hello-world",
+        Subscription {
+            channel: Channel::Prerelease,
+            ..sub()
+        },
+    );
+    let f = NamedTempFile::new().unwrap();
+    cfg.save_to(f.path()).unwrap();
+    let on_disk = fs::read_to_string(f.path()).unwrap();
+    assert!(
+        !on_disk.contains(STATE_DIVIDER),
+        "divider should be omitted with no state: {on_disk}",
+    );
+}
+
+#[test]
+fn empty_user_fields_with_state_keeps_owner_repo_header() {
+    // All-default user fields + non-empty state must still emit an empty
+    // [owner.repo] header in the user region; otherwise the sub would
+    // disappear from the user-region listing.
+    let cfg = one_sub_config(
+        "octocat",
+        "hello-world",
+        Subscription {
+            state: SubscriptionState {
+                installed_version: Some("v1.0.0".into()),
+                ..SubscriptionState::default()
+            },
+            ..sub()
+        },
+    );
+    let f = NamedTempFile::new().unwrap();
+    cfg.save_to(f.path()).unwrap();
+    let on_disk = fs::read_to_string(f.path()).unwrap();
+
+    let user_header = on_disk.find("[octocat.hello-world]").unwrap();
+    let divider = on_disk.find(STATE_DIVIDER).unwrap();
+    let state_header = on_disk.find("[octocat.hello-world.state]").unwrap();
+    assert!(user_header < divider);
+    assert!(state_header > divider);
+
+    let loaded = Config::load_from(f.path()).unwrap();
+    assert_eq!(loaded, cfg);
+}
+
+#[test]
+fn fields_render_in_alphabetical_order() {
+    // Every populated field of UserView and SubscriptionState should render
+    // in A-Z order, so a hand-edit lands in a predictable column.
+    let cfg = one_sub_config(
+        "owner",
+        "repo",
+        Subscription {
+            channel: Channel::Prerelease,
+            disabled: true,
+            token: Some(Secret::new("tok".into())),
+            state: SubscriptionState {
+                cached_at: Some(2),
+                cached_published_at: Some(3),
+                cached_tag: Some("t".into()),
+                in_callback: Some("Init".into()),
+                installed_asset: Some("a.so".into()),
+                installed_at: Some(1),
+                installed_version: Some("v".into()),
+            },
+        },
+    );
+    let f = NamedTempFile::new().unwrap();
+    cfg.save_to(f.path()).unwrap();
+    let on_disk = fs::read_to_string(f.path()).unwrap();
+
+    // UserView: channel < disabled < token.
+    let p_channel = on_disk.find("channel = ").unwrap();
+    let p_disabled = on_disk.find("disabled = ").unwrap();
+    let p_token = on_disk.find("token = ").unwrap();
+    assert!(p_channel < p_disabled, "channel before disabled");
+    assert!(p_disabled < p_token, "disabled before token");
+
+    // SubscriptionState: cached_at < cached_published_at < cached_tag <
+    // in_callback < installed_asset < installed_at < installed_version.
+    let p_cached_at = on_disk.find("cached_at = ").unwrap();
+    let p_cached_published_at = on_disk.find("cached_published_at = ").unwrap();
+    let p_cached_tag = on_disk.find("cached_tag = ").unwrap();
+    let p_in_callback = on_disk.find("in_callback = ").unwrap();
+    let p_installed_asset = on_disk.find("installed_asset = ").unwrap();
+    let p_installed_at = on_disk.find("installed_at = ").unwrap();
+    let p_installed_version = on_disk.find("installed_version = ").unwrap();
+    assert!(p_cached_at < p_cached_published_at);
+    assert!(p_cached_published_at < p_cached_tag);
+    assert!(p_cached_tag < p_in_callback);
+    assert!(p_in_callback < p_installed_asset);
+    assert!(p_installed_asset < p_installed_at);
+    assert!(p_installed_at < p_installed_version);
+}
+
+#[test]
+fn table_headers_render_in_alphabetical_order() {
+    // Subscriptions across multiple owners; both regions should list headers
+    // in lexicographic owner.repo order.
+    let mut subscriptions = BTreeMap::new();
+    for owner in ["b-owner", "a-owner"] {
+        let mut repos = BTreeMap::new();
+        repos.insert(
+            "z-repo".into(),
+            Subscription {
+                state: SubscriptionState {
+                    installed_version: Some("v".into()),
+                    ..SubscriptionState::default()
+                },
+                ..sub()
+            },
+        );
+        repos.insert(
+            "m-repo".into(),
+            Subscription {
+                state: SubscriptionState {
+                    installed_version: Some("v".into()),
+                    ..SubscriptionState::default()
+                },
+                ..sub()
+            },
+        );
+        subscriptions.insert(owner.into(), repos);
+    }
+    let cfg = Config { subscriptions };
+    let f = NamedTempFile::new().unwrap();
+    cfg.save_to(f.path()).unwrap();
+    let on_disk = fs::read_to_string(f.path()).unwrap();
+
+    // User region order: a-owner.m-repo, a-owner.z-repo, b-owner.m-repo,
+    // b-owner.z-repo.
+    let order_user = [
+        on_disk.find("[a-owner.m-repo]").unwrap(),
+        on_disk.find("[a-owner.z-repo]").unwrap(),
+        on_disk.find("[b-owner.m-repo]").unwrap(),
+        on_disk.find("[b-owner.z-repo]").unwrap(),
+    ];
+    assert!(
+        order_user.windows(2).all(|w| w[0] < w[1]),
+        "user region not A-Z: {on_disk}"
+    );
+
+    // State region same order, all below divider.
+    let divider = on_disk.find(STATE_DIVIDER).unwrap();
+    let order_state = [
+        on_disk.find("[a-owner.m-repo.state]").unwrap(),
+        on_disk.find("[a-owner.z-repo.state]").unwrap(),
+        on_disk.find("[b-owner.m-repo.state]").unwrap(),
+        on_disk.find("[b-owner.z-repo.state]").unwrap(),
+    ];
+    assert!(order_state.iter().all(|&p| p > divider));
+    assert!(
+        order_state.windows(2).all(|w| w[0] < w[1]),
+        "state region not A-Z: {on_disk}"
+    );
+}
