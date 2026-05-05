@@ -268,3 +268,123 @@ fn cleanup_previous_managed_swallows_missing_file() {
     // Should not panic, should not error - ENOENT is the silent path.
     cleanup_previous_managed(dir.path(), Some("never-existed.so"), "fresh.so");
 }
+
+#[test]
+fn mark_previous_self_aside_removes_prev_when_different() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("base-v0.1.0.so"), b"old").unwrap();
+
+    mark_previous_self_aside(dir.path(), "base-v0.1.0.so", "base-v0.2.0.so");
+
+    // The prev file is gone (rename to .old then best-effort delete).
+    // Linux/macOS unlink the .old too; Windows leaves it for the next
+    // startup sweep. Either way the user-visible state is "prev gone".
+    assert!(!dir.path().join("base-v0.1.0.so").exists());
+    #[cfg(unix)]
+    assert!(!dir.path().join("base-v0.1.0.so.old").exists());
+}
+
+#[test]
+fn mark_previous_self_aside_noop_when_prev_equals_new() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("same.so"), b"keep").unwrap();
+
+    mark_previous_self_aside(dir.path(), "same.so", "same.so");
+
+    assert_eq!(fs::read(dir.path().join("same.so")).unwrap(), b"keep");
+    assert!(!dir.path().join("same.so.old").exists());
+}
+
+#[test]
+fn mark_previous_self_aside_noop_when_prev_missing() {
+    let dir = tempdir().unwrap();
+    // No file at prev. Should not panic, should not error, should not
+    // create an empty `.old`.
+    mark_previous_self_aside(dir.path(), "never-existed.so", "fresh.so");
+    assert!(!dir.path().join("never-existed.so.old").exists());
+}
+
+#[test]
+fn cleanup_self_old_in_sweeps_matching_old_files() {
+    let dir = tempdir().unwrap();
+    // Legacy v4 release-asset shape renamed aside.
+    fs::write(
+        dir.path()
+            .join("classicube_plugin_manager_linux_x86_64.so.old"),
+        b"a",
+    )
+    .unwrap();
+    // Legacy v3 release-asset shape (predates the `manager` rename).
+    fs::write(
+        dir.path()
+            .join("classicube_plugin_updater_linux_x86_64.so.old"),
+        b"b",
+    )
+    .unwrap();
+    // Current versioned scheme (`<SELF_OWNER>-<SELF_REPO>-<tag>.so`)
+    // renamed aside after a self-update bumped to a newer tag.
+    fs::write(
+        dir.path()
+            .join("SpiralP-classicube-plugin-manager-plugin-v0.2.0.so.old"),
+        b"c",
+    )
+    .unwrap();
+
+    cleanup_self_old_in(dir.path());
+
+    assert!(
+        !dir.path()
+            .join("classicube_plugin_manager_linux_x86_64.so.old")
+            .exists()
+    );
+    assert!(
+        !dir.path()
+            .join("classicube_plugin_updater_linux_x86_64.so.old")
+            .exists()
+    );
+    assert!(
+        !dir.path()
+            .join("SpiralP-classicube-plugin-manager-plugin-v0.2.0.so.old")
+            .exists()
+    );
+}
+
+#[test]
+fn cleanup_self_old_in_leaves_unrelated_files_alone() {
+    let dir = tempdir().unwrap();
+    // Non-matching prefix - user's own plugin or an unrelated `.old`.
+    fs::write(dir.path().join("some_other_plugin.so.old"), b"keep").unwrap();
+    // Matching prefix but not `.old`.
+    fs::write(
+        dir.path().join("classicube_plugin_manager_linux_x86_64.so"),
+        b"keep",
+    )
+    .unwrap();
+    // Matching prefix and `.old` - should be swept.
+    fs::write(
+        dir.path()
+            .join("classicube_plugin_manager_linux_x86_64-v0.1.0.so.old"),
+        b"sweep",
+    )
+    .unwrap();
+
+    cleanup_self_old_in(dir.path());
+
+    assert!(dir.path().join("some_other_plugin.so.old").exists());
+    assert!(
+        dir.path()
+            .join("classicube_plugin_manager_linux_x86_64.so")
+            .exists()
+    );
+    assert!(
+        !dir.path()
+            .join("classicube_plugin_manager_linux_x86_64-v0.1.0.so.old")
+            .exists()
+    );
+}
+
+#[test]
+fn cleanup_self_old_in_handles_missing_dir() {
+    // Should not panic - just logs and returns.
+    cleanup_self_old_in(Path::new("/__definitely_does_not_exist__"));
+}

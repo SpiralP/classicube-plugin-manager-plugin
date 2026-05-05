@@ -17,7 +17,7 @@ use classicube_sys::{OwnedChatCommand, cc_string};
 use tracing::{debug, error, warn};
 
 use crate::{
-    asset_match::pick_asset,
+    asset_match::{self, pick_asset},
     chat::{print_async, print_wrapped},
     component::Component,
     components::manager::{
@@ -28,7 +28,7 @@ use crate::{
     github_release::{GitHubRelease, get_release_for_channel, resolve_expected_digest},
     installer::{
         self, MANAGED_DIR, PLUGINS_DIR, cleanup_previous_managed, download_self,
-        download_to_managed_dir,
+        download_to_managed_dir, mark_previous_self_aside,
     },
     loader::{self, LoadOutcome, UnloadOutcome},
     reconcile,
@@ -1131,24 +1131,26 @@ async fn run_update_with_release(
     // the file is on disk. Same-tag re-installs don't actually swap code in
     // the running process anyway (versioned filename collides with the
     // currently-mapped one, so dlopen returns the cached handle), so
-    // there's no behavior to deliver.
-    if !is_self
-        && prev_version.as_deref() == Some(&release.tag_name)
+    // there's no behavior to deliver. Self lives in plugins/, managed in
+    // plugins/managed/.
+    if prev_version.as_deref() == Some(&release.tag_name)
         && let Some(name) = prev_asset.as_deref()
-        && Path::new(MANAGED_DIR).join(name).exists()
     {
-        print_async(format!(
-            "{}{}/{} {}is already on {}{}{}; nothing to do",
-            color::LIME,
-            owner,
-            repo,
-            color::PINK,
-            color::GREEN,
-            release.tag_name,
-            color::PINK,
-        ))
-        .await;
-        return Ok(());
+        let dir = if is_self { PLUGINS_DIR } else { MANAGED_DIR };
+        if Path::new(dir).join(name).exists() {
+            print_async(format!(
+                "{}{}/{} {}is already on {}{}{}; nothing to do",
+                color::LIME,
+                owner,
+                repo,
+                color::PINK,
+                color::GREEN,
+                release.tag_name,
+                color::PINK,
+            ))
+            .await;
+            return Ok(());
+        }
     }
 
     // Skip the file we'd legitimately overwrite: for non-self, the
@@ -1172,6 +1174,28 @@ async fn run_update_with_release(
     } else {
         None
     };
+    // Refuse to overwrite a `cargo build` self - the loaded file is what
+    // the dev wants to keep iterating on. Released self assets carry the
+    // `_<os>_<arch>` tokens and don't normalize to SELF_REPO.
+    if is_self
+        && let Some(name) = self_basename.as_deref()
+        && asset_match::is_canonical_or_cdylib_name(
+            name,
+            config::SELF_REPO,
+            env::consts::DLL_SUFFIX,
+        )
+    {
+        print_async(format!(
+            "{}Skipping self-update: loaded {}{}{} looks like a dev build (replace it with a \
+             released binary if you want self-updates)",
+            color::YELLOW,
+            color::LIME,
+            name,
+            color::YELLOW,
+        ))
+        .await;
+        return Ok(());
+    }
     let skip: Vec<&str> = if is_self {
         self_basename.as_deref().into_iter().collect()
     } else {
@@ -1205,7 +1229,7 @@ async fn run_update_with_release(
 
     let expected_digest = resolve_expected_digest(asset)?;
     let path = if is_self {
-        download_self(asset, expected_digest.as_deref(), token).await?
+        download_self(asset, expected_digest.as_deref(), token, &release.tag_name).await?
     } else {
         download_to_managed_dir(
             owner,
@@ -1222,6 +1246,18 @@ async fn run_update_with_release(
         .file_name()
         .and_then(|n| n.to_str())
         .map_or_else(|| asset.name.clone(), str::to_owned);
+
+    // For self, mark the previously-loaded file aside *before* persisting
+    // the new claim. If we crashed between install and rename, the next
+    // launch would load both the old and new versioned files (two
+    // managers); doing the rename first shrinks that window. Best-effort -
+    // a Windows lock leaves a `.old` for the next-session sweep.
+    if is_self
+        && let Some(prev) = self_basename.as_deref()
+        && let Some(dir) = path.parent()
+    {
+        mark_previous_self_aside(dir, prev, &installed_basename);
+    }
 
     let now = unix_now();
     persist_installed_versions(

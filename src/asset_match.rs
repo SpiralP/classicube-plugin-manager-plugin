@@ -82,6 +82,28 @@ fn arch_tokens(arch: &str) -> (&'static [&'static str], &'static [&'static str])
     }
 }
 
+/// Whether `filename` is the canonical or rust-cdylib build-output name
+/// for `repo` - i.e. came from `cargo build` of the source tree (or a
+/// hand-placed canonical-name copy), NOT a released release-asset.
+/// Released assets use the target-tuple shape (`<repo-prefix>_<os>_<arch>`)
+/// and don't match this; their detection lives in `matches_repo`'s
+/// platform-token arm. This narrower predicate is what self-update uses
+/// to spot a dev-build running self and skip overwriting it.
+///
+/// Recognized shapes (with the running platform's `dll_suffix`):
+/// - `<repo>.<ext>`                         (canonical)
+/// - `lib<repo-with-underscores>.<ext>`     (Linux/macOS rust-cdylib output)
+/// - `<repo-with-underscores>.<ext>`        (Windows rust-cdylib output)
+pub fn is_canonical_or_cdylib_name(filename: &str, repo: &str, dll_suffix: &str) -> bool {
+    let suffix_lc = dll_suffix.to_ascii_lowercase();
+    let name_lc = filename.to_ascii_lowercase();
+    let Some(stem) = name_lc.strip_suffix(&suffix_lc) else {
+        return false;
+    };
+    let stem = stem.strip_prefix("lib").unwrap_or(stem);
+    stem.replace('_', "-") == repo.to_ascii_lowercase()
+}
+
 /// Whether `filename` looks like a build artifact for `repo` on this platform.
 ///
 /// Recognizes three shapes:

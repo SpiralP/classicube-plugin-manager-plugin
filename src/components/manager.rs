@@ -13,13 +13,14 @@ use classicube_helpers::{async_manager, color};
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    asset_match::pick_asset,
+    asset_match::{self, pick_asset},
     chat::print_async,
     component::Component,
     config::{self, Config, Subscription, config_path},
     github_release::{GitHubRelease, get_release_for_channel, resolve_expected_digest},
     installer::{
         MANAGED_DIR, PLUGINS_DIR, cleanup_self_old, download_self, download_to_managed_dir,
+        mark_previous_self_aside,
     },
     loader::init_managed,
     reconcile::{self, ConflictDir},
@@ -130,6 +131,27 @@ async fn run_initial_pass() -> Result<()> {
                 continue;
             }
 
+            // For self, skip auto-update entirely if the loaded binary
+            // looks like a dev/manual build (cargo-build output or
+            // hand-placed canonical name). Done before the release fetch
+            // and the user-facing "Installing..." message so a dev iterating
+            // on the manager doesn't see noise about an update that would
+            // overwrite their own build. Released assets carry
+            // `_<os>_<arch>` tokens and don't normalize to SELF_REPO.
+            if config::is_self(owner, repo)
+                && let Some(loaded_basename) = current_lib_path()
+                    .ok()
+                    .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
+                && asset_match::is_canonical_or_cdylib_name(
+                    &loaded_basename,
+                    config::SELF_REPO,
+                    env::consts::DLL_SUFFIX,
+                )
+            {
+                debug!("self looks like a dev build ({loaded_basename}); skipping auto-update");
+                continue;
+            }
+
             let (tag, published_at, mut release_in_hand) =
                 match resolve_latest_release(owner, repo, sub, now, false).await {
                     Ok(t) => t,
@@ -154,13 +176,20 @@ async fn run_initial_pass() -> Result<()> {
             // and the file is on disk. Same-tag re-installs don't actually
             // swap code in-session anyway (versioned filename collides with
             // the currently-mapped one, so dlopen returns the cached
-            // handle), and this dodges a wasted asset fetch.
+            // handle), and this dodges a wasted asset fetch. Self lives in
+            // plugins/, managed in plugins/managed/.
             if sub.state.installed_version.as_deref() == Some(&tag)
                 && let Some(asset_name) = sub.state.installed_asset.as_deref()
-                && Path::new(MANAGED_DIR).join(asset_name).exists()
             {
-                debug!("{owner}/{repo} already on {tag} with asset on disk; skipping");
-                continue;
+                let dir = if config::is_self(owner, repo) {
+                    PLUGINS_DIR
+                } else {
+                    MANAGED_DIR
+                };
+                if Path::new(dir).join(asset_name).exists() {
+                    debug!("{owner}/{repo} already on {tag} with asset on disk; skipping");
+                    continue;
+                }
             }
 
             if !needs_install(
@@ -247,8 +276,20 @@ async fn run_initial_pass() -> Result<()> {
 
             let is_self = config::is_self(owner, repo);
             let token = sub.token.as_ref().map(Secret::expose);
+            // For self, capture the loaded basename BEFORE downloading - we
+            // need to know what file to rename aside as `.old` after a new
+            // versioned binary lands. current_lib_path() is unaffected by
+            // the install; it tracks the in-process mapping, not the
+            // dirent.
+            let prev_self_basename = if is_self {
+                current_lib_path()
+                    .ok()
+                    .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
+            } else {
+                None
+            };
             let install_result = if is_self {
-                download_self(asset, expected_digest.as_deref(), token).await
+                download_self(asset, expected_digest.as_deref(), token, &release.tag_name).await
             } else {
                 download_to_managed_dir(
                     owner,
@@ -266,6 +307,18 @@ async fn run_initial_pass() -> Result<()> {
                         .file_name()
                         .and_then(|n| n.to_str())
                         .map_or_else(|| asset.name.clone(), str::to_owned);
+                    if is_self
+                        && let Some(prev) = prev_self_basename.as_deref()
+                        && let Some(dir) = path.parent()
+                    {
+                        // Rename the previously-loaded self file aside so
+                        // ClassiCube doesn't auto-load both copies on next
+                        // launch. Best-effort: a Windows lock that blocks
+                        // the rename leaves a `.old` for cleanup_self_old
+                        // to reap on the *next* startup (current session
+                        // still has the old code mapped).
+                        mark_previous_self_aside(dir, prev, &installed_basename);
+                    }
                     installed.push((
                         owner.clone(),
                         repo.clone(),

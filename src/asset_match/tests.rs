@@ -468,3 +468,82 @@ fn starts_with_platform_token_rejects_non_token_prefix() {
     assert!(!starts_with_platform_token("foo"));
     assert!(!starts_with_platform_token("-linux"));
 }
+
+#[test]
+fn is_canonical_or_cdylib_name_matches_canonical() {
+    assert!(is_canonical_or_cdylib_name(
+        "classicube-foo-plugin.so",
+        "classicube-foo-plugin",
+        ".so",
+    ));
+}
+
+#[test]
+fn is_canonical_or_cdylib_name_matches_unix_cdylib_variant() {
+    // Linux/macOS rust-cdylib output: `lib` prefix + underscores.
+    assert!(is_canonical_or_cdylib_name(
+        "libclassicube_foo_plugin.so",
+        "classicube-foo-plugin",
+        ".so",
+    ));
+    assert!(is_canonical_or_cdylib_name(
+        "libclassicube_foo_plugin.dylib",
+        "classicube-foo-plugin",
+        ".dylib",
+    ));
+}
+
+#[test]
+fn is_canonical_or_cdylib_name_matches_windows_cdylib_variant() {
+    // Windows rust-cdylib output: no `lib` prefix, underscores.
+    assert!(is_canonical_or_cdylib_name(
+        "classicube_foo_plugin.dll",
+        "classicube-foo-plugin",
+        ".dll",
+    ));
+}
+
+#[test]
+fn is_canonical_or_cdylib_name_rejects_target_tuple_release_asset() {
+    // The whole point: released assets carry OS/arch tokens after the
+    // repo prefix and must NOT register as a dev-build name.
+    assert!(!is_canonical_or_cdylib_name(
+        "classicube_foo_linux_x86_64.so",
+        "classicube-foo-plugin",
+        ".so",
+    ));
+    assert!(!is_canonical_or_cdylib_name(
+        "classicube_plugin_manager_windows_x86_64.dll",
+        "classicube-plugin-manager-plugin",
+        ".dll",
+    ));
+}
+
+#[test]
+fn is_canonical_or_cdylib_name_rejects_versioned_name() {
+    // Our own write target `<owner>-<repo>-<tag>.<ext>` must not match
+    // either - it carries an extra prefix and a tag suffix.
+    assert!(!is_canonical_or_cdylib_name(
+        "SpiralP-classicube-plugin-manager-plugin-v0.3.1.so",
+        "classicube-plugin-manager-plugin",
+        ".so",
+    ));
+}
+
+#[test]
+fn is_canonical_or_cdylib_name_is_case_insensitive() {
+    assert!(is_canonical_or_cdylib_name(
+        "LibClassicube_Foo_Plugin.SO",
+        "classicube-foo-plugin",
+        ".so",
+    ));
+}
+
+#[test]
+fn is_canonical_or_cdylib_name_rejects_wrong_suffix() {
+    assert!(!is_canonical_or_cdylib_name(
+        "libclassicube_foo_plugin.dll",
+        "classicube-foo-plugin",
+        ".so",
+    ));
+}

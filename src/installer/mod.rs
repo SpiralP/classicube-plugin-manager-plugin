@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::{
+    config::{SELF_OWNER, SELF_REPO},
     github_release::{GitHubReleaseAsset, make_client, resolve_auth_token},
     self_path::current_lib_path,
 };
@@ -33,8 +34,12 @@ pub const MANAGED_DIR: &str = "plugins/managed";
 /// outside `[A-Za-z0-9._-]` becomes `_`. Sanitized tags are capped at 64
 /// chars to keep paths reasonable; tags rarely approach this.
 pub fn versioned_managed_filename(owner: &str, repo: &str, tag: &str, ext: &str) -> String {
-    let safe_tag: String = tag
-        .chars()
+    let safe_tag = sanitize_tag(tag);
+    format!("{owner}-{repo}-{safe_tag}{ext}")
+}
+
+fn sanitize_tag(tag: &str) -> String {
+    tag.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
                 c
@@ -43,9 +48,25 @@ pub fn versioned_managed_filename(owner: &str, repo: &str, tag: &str, ext: &str)
             }
         })
         .take(64)
-        .collect();
-    format!("{owner}-{repo}-{safe_tag}{ext}")
+        .collect()
 }
+
+/// Filename prefixes for self binaries the manager itself produces or has
+/// historically shipped. `cleanup_self_old` uses these to scope its
+/// `*.old` sweep so we only reap files that belong to this plugin.
+///
+/// - `classicube_plugin_manager` is the v4 release-asset shape
+///   (`classicube_plugin_manager_<os>_<arch>.<ext>`) - what users have
+///   on disk before their first post-versioning self-update, and what
+///   the previous-loaded basename gets renamed aside as.
+/// - `classicube_plugin_updater` is the v3 release-asset shape, kept
+///   so a v3 file renamed aside (or any `.old` left over from a v3->v4
+///   transition) still gets reaped.
+///
+/// The current versioned scheme uses the runtime-computed prefix
+/// `<SELF_OWNER>-<SELF_REPO>-` (built where the sweep runs - constants
+/// can't be concatenated at compile time without macro tricks).
+const LEGACY_SELF_PREFIXES: &[&str] = &["classicube_plugin_manager", "classicube_plugin_updater"];
 
 pub async fn download_to_managed_dir(
     owner: &str,
@@ -80,22 +101,24 @@ pub fn cleanup_previous_managed(managed_dir: &Path, previous: Option<&str>, new:
     }
 }
 
-/// Self-update install: write the new bytes over the loaded manager binary
-/// in `plugins/`. The existing `install_bytes_to` rename dance handles the
-/// loaded-and-locked file correctly:
+/// Self-update install: download the new manager binary into `plugins/`
+/// under the deterministic versioned filename
+/// `<SELF_OWNER>-<SELF_REPO>-<tag><ext>` (same scheme as managed plugins),
+/// distinct from whatever path the loaded binary was opened from. The
+/// user still has to restart for the new code to run; mapping vs dirent
+/// decoupling means the in-process old code keeps running until then.
 ///
-/// - Linux: `rename` of an mmap'd file is allowed; the in-memory mapping is
-///   decoupled from the dirent.
-/// - Windows: `MoveFileExW` (under `fs::rename`) allows renaming a locked
-///   DLL even though it forbids overwriting one. The leftover `.old` can't
-///   be deleted in-session and is cleaned up on next startup.
-///
-/// The current process keeps running the old code; the user must restart to
-/// pick up the new version.
+/// Writing to a fresh path avoids overwriting the currently-mmap'd file
+/// and lets us pick a stable name regardless of what the user originally
+/// installed (release-asset shape, rust-cdylib variant, hand-renamed,
+/// etc.). Marking the previous on-disk file aside (so ClassiCube doesn't
+/// load both copies on next launch) is the caller's job - see
+/// `mark_previous_self_aside`.
 pub async fn download_self(
     asset: &GitHubReleaseAsset,
     expected_digest: Option<&str>,
     token: Option<&str>,
+    tag: &str,
 ) -> Result<PathBuf> {
     let loaded = current_lib_path().context("resolving self path")?;
     let dir = loaded
@@ -107,25 +130,71 @@ pub async fn download_self(
             loaded.display()
         );
     }
-    let basename = loaded
-        .file_name()
-        .and_then(OsStr::to_str)
-        .ok_or_else(|| anyhow!("loaded path has no UTF-8 filename: {}", loaded.display()))?;
+    let new_basename =
+        versioned_managed_filename(SELF_OWNER, SELF_REPO, tag, env::consts::DLL_SUFFIX);
 
     debug!(
         "self-updating: downloading {} -> {}",
         asset.url,
-        loaded.display(),
+        dir.join(&new_basename).display(),
     );
     let bytes = download_bytes(asset, token).await?;
-    install_bytes_to(dir, basename, &bytes, expected_digest)
+    install_bytes_to(dir, &new_basename, &bytes, expected_digest)
 }
 
-/// Best-effort cleanup of a `<self>.old` left behind by a previous
-/// self-update. On Linux the `.old` is removed in-session by
-/// `install_bytes_to`; on Windows the loader's lock prevents that, so we
-/// retry here at startup (when the previous loaded copy is no longer mapped
-/// by anything).
+/// Best-effort: mark a previously-loaded self binary aside as `<prev>.old`
+/// after a self-update has written a new versioned file at `<dir>/<new>`.
+/// ClassiCube auto-loads every plugin file at launch, so leaving the prior
+/// `<prev>` in `plugins/` would cause two managers to load on the next
+/// session. We rename rather than delete because:
+///
+/// - Linux/macOS: rename works while the file is mapped; the in-memory
+///   mapping is decoupled from the dirent.
+/// - Windows: `MoveFileExW` allows renaming a locked DLL (already
+///   exercised by the legacy in-place self-update path).
+///
+/// After a successful rename, try to delete the `.old` immediately - same
+/// pattern as `cleanup_previous_managed` and the trailing
+/// `fs::remove_file(&old_path)` in `install_bytes_to`. Linux/macOS unlink
+/// succeeds even while the library is still mapped; Windows fails with a
+/// sharing violation and the startup `cleanup_self_old` sweep mops it up
+/// next session. No-op when `prev == new` (same-tag re-install, where
+/// install_bytes_to already handled it) or when the file is missing.
+pub fn mark_previous_self_aside(dir: &Path, prev: &str, new: &str) {
+    if prev == new {
+        return;
+    }
+    let prev_path = dir.join(prev);
+    if !prev_path.exists() {
+        return;
+    }
+    let old_path = dir.join(format!("{prev}.old"));
+    match fs::rename(&prev_path, &old_path) {
+        Ok(()) => debug!(
+            "renamed previous self {} -> {}",
+            prev_path.display(),
+            old_path.display()
+        ),
+        Err(e) => debug!(
+            "could not rename previous self {} -> {}: {e}",
+            prev_path.display(),
+            old_path.display()
+        ),
+    }
+    let _ = fs::remove_file(&old_path);
+}
+
+/// Best-effort cleanup of leftover self-binary `*.old` files in `plugins/`
+/// at startup. The previous-session DLL mapping is gone by now, so the
+/// lock that produced the `.old` (Windows) is gone too. On Linux/macOS
+/// most `.old` files are deleted in-session by `install_bytes_to`'s
+/// rename dance; this sweep is the safety net.
+///
+/// Scope: files in the running self binary's parent directory whose name
+/// ends in `.old` and starts with one of the known self-binary prefixes
+/// (current versioned scheme `<SELF_OWNER>-<SELF_REPO>-` plus legacy
+/// release-asset shapes). That keeps unrelated `.old` files alone while
+/// catching every plausible previous on-disk shape.
 pub fn cleanup_self_old() {
     let loaded = match current_lib_path() {
         Ok(p) => p,
@@ -134,17 +203,45 @@ pub fn cleanup_self_old() {
             return;
         }
     };
-    let Some(file_name) = loaded.file_name().and_then(OsStr::to_str) else {
-        return;
-    };
     let Some(dir) = loaded.parent() else {
         return;
     };
-    let old_path = dir.join(format!("{file_name}.old"));
-    match fs::remove_file(&old_path) {
-        Ok(()) => debug!("removed leftover {}", old_path.display()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => debug!("could not remove {}: {e}", old_path.display()),
+    cleanup_self_old_in(dir);
+}
+
+pub(crate) fn cleanup_self_old_in(dir: &Path) {
+    let versioned_prefix = format!("{SELF_OWNER}-{SELF_REPO}-");
+    let prefixes: Vec<&str> = std::iter::once(versioned_prefix.as_str())
+        .chain(LEGACY_SELF_PREFIXES.iter().copied())
+        .collect();
+
+    let read_dir = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            debug!("cleanup_self_old: read_dir {} failed: {e}", dir.display());
+            return;
+        }
+    };
+    for entry in read_dir.flatten() {
+        let entry_name = entry.file_name();
+        let Some(name) = entry_name.to_str() else {
+            continue;
+        };
+        if !name.ends_with(".old") {
+            continue;
+        }
+        if !prefixes.iter().any(|p| name.starts_with(p)) {
+            continue;
+        }
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => debug!("removed leftover {}", path.display()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => debug!("could not remove {}: {e}", path.display()),
+        }
     }
 }
 
