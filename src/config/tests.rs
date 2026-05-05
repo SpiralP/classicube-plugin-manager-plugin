@@ -971,3 +971,119 @@ fn table_headers_render_in_alphabetical_order() {
         "state region not A-Z: {on_disk}"
     );
 }
+
+#[test]
+fn migrate_legacy_config_renames_file_and_self_key() {
+    let dir = tempdir().unwrap();
+    let legacy = dir.path().join("plugin-updater.toml");
+    let current = dir.path().join("plugin-manager.toml");
+
+    let original = one_sub_config(
+        SELF_OWNER,
+        LEGACY_SELF_REPO,
+        Subscription {
+            state: SubscriptionState {
+                installed_version: Some("v1.2.3".into()),
+                ..SubscriptionState::default()
+            },
+            ..sub()
+        },
+    );
+    original.save_to(&legacy).unwrap();
+
+    migrate_legacy_config_at(&legacy, &current).unwrap();
+
+    assert!(!legacy.exists(), "legacy file should be removed");
+    assert!(current.exists(), "new file should exist");
+
+    let migrated = Config::load_from(&current).unwrap();
+    let owner_map = migrated.subscriptions.get(SELF_OWNER).unwrap();
+    assert!(!owner_map.contains_key(LEGACY_SELF_REPO));
+    let new_sub = owner_map
+        .get(SELF_REPO)
+        .expect("self key should be rewritten");
+    assert_eq!(new_sub.state.installed_version.as_deref(), Some("v1.2.3"));
+}
+
+#[test]
+fn migrate_legacy_config_no_op_when_new_path_exists() {
+    let dir = tempdir().unwrap();
+    let legacy = dir.path().join("plugin-updater.toml");
+    let current = dir.path().join("plugin-manager.toml");
+    one_sub_config("a", "b", sub()).save_to(&legacy).unwrap();
+    one_sub_config("c", "d", sub()).save_to(&current).unwrap();
+
+    migrate_legacy_config_at(&legacy, &current).unwrap();
+
+    assert!(
+        legacy.exists(),
+        "legacy untouched when new file already exists"
+    );
+    let cfg = Config::load_from(&current).unwrap();
+    assert!(cfg.subscriptions.contains_key("c"));
+    assert!(!cfg.subscriptions.contains_key("a"));
+}
+
+#[test]
+fn migrate_legacy_config_no_op_when_legacy_missing() {
+    let dir = tempdir().unwrap();
+    let legacy = dir.path().join("plugin-updater.toml");
+    let current = dir.path().join("plugin-manager.toml");
+
+    migrate_legacy_config_at(&legacy, &current).unwrap();
+
+    assert!(!current.exists());
+}
+
+#[test]
+fn migrate_legacy_config_keeps_new_self_when_both_keys_present() {
+    // Pathological: a hand-edited legacy file already contains an entry under
+    // the new repo name. The new entry wins; the legacy entry is dropped.
+    let dir = tempdir().unwrap();
+    let legacy = dir.path().join("plugin-updater.toml");
+    let current = dir.path().join("plugin-manager.toml");
+
+    let mut subs = BTreeMap::new();
+    let mut repos = BTreeMap::new();
+    repos.insert(
+        LEGACY_SELF_REPO.into(),
+        Subscription {
+            state: SubscriptionState {
+                installed_version: Some("legacy".into()),
+                ..SubscriptionState::default()
+            },
+            ..sub()
+        },
+    );
+    repos.insert(
+        SELF_REPO.into(),
+        Subscription {
+            state: SubscriptionState {
+                installed_version: Some("new".into()),
+                ..SubscriptionState::default()
+            },
+            ..sub()
+        },
+    );
+    subs.insert(SELF_OWNER.into(), repos);
+    Config {
+        subscriptions: subs,
+    }
+    .save_to(&legacy)
+    .unwrap();
+
+    migrate_legacy_config_at(&legacy, &current).unwrap();
+
+    let migrated = Config::load_from(&current).unwrap();
+    let owner_map = migrated.subscriptions.get(SELF_OWNER).unwrap();
+    assert!(!owner_map.contains_key(LEGACY_SELF_REPO));
+    assert_eq!(
+        owner_map
+            .get(SELF_REPO)
+            .unwrap()
+            .state
+            .installed_version
+            .as_deref(),
+        Some("new")
+    );
+}

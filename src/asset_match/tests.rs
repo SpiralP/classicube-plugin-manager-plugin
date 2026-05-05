@@ -49,9 +49,9 @@ fn picks_macos_dylib_over_other_suffixes() {
 fn picks_self_update_naming() {
     // Locks in the self-update path against this repo's own release naming
     // (see `.github/workflows/build.yml` mac job).
-    let assets = [asset("classicube_plugin_updater_macos_aarch64.dylib")];
+    let assets = [asset("classicube_plugin_manager_macos_aarch64.dylib")];
     let got = pick_asset(&assets, "aarch64", ".dylib").unwrap();
-    assert_eq!(got.name, "classicube_plugin_updater_macos_aarch64.dylib");
+    assert_eq!(got.name, "classicube_plugin_manager_macos_aarch64.dylib");
 }
 
 #[test]
@@ -281,8 +281,8 @@ fn matches_repo_target_tuple_macos() {
     // Mirrors `picks_self_update_naming` - this is the exact filename our
     // own CI publishes for the mac job.
     assert!(matches_repo(
-        "classicube_plugin_updater_macos_aarch64.dylib",
-        "classicube-plugin-updater-plugin",
+        "classicube_plugin_manager_macos_aarch64.dylib",
+        "classicube-plugin-manager-plugin",
         ".dylib",
     ));
 }

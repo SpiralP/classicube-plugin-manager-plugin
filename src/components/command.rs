@@ -20,7 +20,7 @@ use crate::{
     asset_match::pick_asset,
     chat::{print_async, print_wrapped},
     component::Component,
-    components::updater::{
+    components::manager::{
         persist_cache_updates, persist_installed_versions, resolve_latest_release,
     },
     config::{self, Channel, Config, Subscription, SubscriptionState},
@@ -148,18 +148,18 @@ fn find_stored_keys(config: &Config, candidates: &[(String, String)]) -> Option<
 }
 
 const USAGE_LINES: &[&str] = &[
-    "&a/client Updater add <owner>/<repo> [stable|prerelease|tag <ref>] [token <token>]",
-    "&a/client Updater remove <owner>/<repo>",
-    "&a/client Updater channel <owner>/<repo> stable|prerelease|tag <ref>",
-    "&a/client Updater disable <owner>/<repo>",
-    "&a/client Updater enable <owner>/<repo>",
-    "&a/client Updater pause <owner>/<repo>",
-    "&a/client Updater unpause <owner>/<repo>",
-    "&a/client Updater list",
-    "&a/client Updater update [<owner>/<repo>]",
-    "&a/client Updater load <owner>/<repo>",
-    "&a/client Updater unload <owner>/<repo>",
-    "&a/client Updater discover [<search>]",
+    "&a/client Manager add <owner>/<repo> [stable|prerelease|tag <ref>] [token <token>]",
+    "&a/client Manager remove <owner>/<repo>",
+    "&a/client Manager channel <owner>/<repo> stable|prerelease|tag <ref>",
+    "&a/client Manager disable <owner>/<repo>",
+    "&a/client Manager enable <owner>/<repo>",
+    "&a/client Manager pause <owner>/<repo>",
+    "&a/client Manager unpause <owner>/<repo>",
+    "&a/client Manager list",
+    "&a/client Manager update [<owner>/<repo>]",
+    "&a/client Manager load <owner>/<repo>",
+    "&a/client Manager unload <owner>/<repo>",
+    "&a/client Manager discover [<search>]",
 ];
 
 /// Parse the trailing channel arguments after `<owner>/<repo>`.
@@ -233,12 +233,12 @@ fn pause_target(sub: &Subscription) -> Result<Channel, String> {
         return Err(format!("already paused on tag: {v}"));
     }
     let Some(v) = sub.state.installed_version.clone() else {
-        return Err("no installed version; run /client Updater update <spec> first".into());
+        return Err("no installed version; run /client Manager update <spec> first".into());
     };
     Ok(Channel::Tag(v))
 }
 
-/// Returns a chat-ready refusal message when `(owner, repo)` is the updater's
+/// Returns a chat-ready refusal message when `(owner, repo)` is the manager's
 /// own subscription. Used by mutating handlers that would otherwise leave the
 /// user in a half-state (entry removed but binary still loaded, or
 /// self-updates silently disabled). `action` is the verb shown in the message
@@ -248,8 +248,8 @@ fn refuse_self_mutation(owner: &str, repo: &str, action: &str) -> Option<String>
         return None;
     }
     Some(format!(
-        "{}Refusing to {action} {}{owner}/{repo}{}: this is the updater plugin itself. Use \
-         {}/client Updater update{} to upgrade it; edit plugins/plugin-updater.toml by hand if \
+        "{}Refusing to {action} {}{owner}/{repo}{}: this is the manager plugin itself. Use \
+         {}/client Manager update{} to upgrade it; edit plugins/plugin-manager.toml by hand if \
          you really need to change this entry.",
         color::YELLOW,
         color::LIME,
@@ -279,7 +279,7 @@ fn print_usage() {
 async fn print_load_error(e: &Error) {
     error!("loading config: {e:#}");
     print_async(format!(
-        "{}Refusing to modify config (load failed - fix plugins/plugin-updater.toml first): {}{e}",
+        "{}Refusing to modify config (load failed - fix plugins/plugin-manager.toml first): {}{e}",
         color::RED,
         color::WHITE,
     ))
@@ -376,14 +376,14 @@ fn handle_add(spec: &str, channel: Channel, token: Option<String>) {
         if let Some((existing_owner, existing_repo, _)) = find_subscription(&config, &candidates) {
             let token_note = if token.is_some() {
                 format!(
-                    " {}(token ignored; edit plugins/plugin-updater.toml to change it)",
+                    " {}(token ignored; edit plugins/plugin-manager.toml to change it)",
                     color::YELLOW,
                 )
             } else {
                 String::new()
             };
             print_async(format!(
-                "{}Already added: {}{existing_owner}/{existing_repo} {}(use {}/client Updater \
+                "{}Already added: {}{existing_owner}/{existing_repo} {}(use {}/client Manager \
                  channel{} to switch channels){token_note}",
                 color::YELLOW,
                 color::LIME,
@@ -856,7 +856,7 @@ fn handle_unpause(spec: &str) {
             return;
         }
         print_async(format!(
-            "{}Resumed {}{owner}/{repo} {}on stable {}(use {}/client Updater channel{} to switch \
+            "{}Resumed {}{owner}/{repo} {}on stable {}(use {}/client Manager channel{} to switch \
              to prerelease)",
             color::PINK,
             color::LIME,
@@ -1237,7 +1237,7 @@ async fn run_update_with_release(
 
     if is_self {
         print_async(format!(
-            "{}Plugin updater updated to {}{}{} - restart ClassiCube to use the new version",
+            "{}Plugin manager updated to {}{}{} - restart ClassiCube to use the new version",
             color::PINK,
             color::GREEN,
             release.tag_name,
@@ -1450,14 +1450,14 @@ fn handle_load(spec: &str) {
                     print_wrapped(format!("{}Loaded {}{id}", color::PINK, color::LIME,))
                 }
                 LoadOutcome::Disabled => print_wrapped(format!(
-                    "{}{id} {}is disabled; use {}/client Updater enable {id}{} first",
+                    "{}{id} {}is disabled; use {}/client Manager enable {id}{} first",
                     color::LIME,
                     color::YELLOW,
                     color::LIME,
                     color::YELLOW,
                 )),
                 LoadOutcome::IsSelf => print_wrapped(format!(
-                    "{}Refusing to load {}{id}{}: this is the updater plugin itself.",
+                    "{}Refusing to load {}{id}{}: this is the manager plugin itself.",
                     color::YELLOW,
                     color::LIME,
                     color::YELLOW,
@@ -1470,7 +1470,7 @@ fn handle_load(spec: &str) {
                     color::YELLOW,
                 )),
                 LoadOutcome::NotInstalled => print_wrapped(format!(
-                    "{}{id} {}has no installed binary; use {}/client Updater update {id}{} first",
+                    "{}{id} {}has no installed binary; use {}/client Manager update {id}{} first",
                     color::LIME,
                     color::YELLOW,
                     color::LIME,
@@ -1549,7 +1549,7 @@ fn handle_unload(spec: &str) {
                     color::YELLOW,
                 )),
                 UnloadOutcome::IsSelf => print_wrapped(format!(
-                    "{}Refusing to unload {}{id}{}: this is the updater plugin itself.",
+                    "{}Refusing to unload {}{id}{}: this is the manager plugin itself.",
                     color::YELLOW,
                     color::LIME,
                     color::YELLOW,
@@ -1604,7 +1604,7 @@ impl Component for Command {
 
     fn init(&mut self) {
         COMMAND.with(|cell| {
-            let mut cmd = OwnedChatCommand::new("Updater", c_callback, false, USAGE_LINES.to_vec());
+            let mut cmd = OwnedChatCommand::new("Manager", c_callback, false, USAGE_LINES.to_vec());
             cmd.register();
             *cell.borrow_mut() = Some(cmd);
         });

@@ -474,7 +474,7 @@ fn pause_target_refuses_when_nothing_installed() {
 fn refuse_self_mutation_blocks_self_owner_repo() {
     let msg = refuse_self_mutation(SELF_OWNER, SELF_REPO, "remove")
         .expect("self target should be refused");
-    assert!(msg.contains("updater plugin"), "got: {msg}");
+    assert!(msg.contains("manager plugin"), "got: {msg}");
     assert!(msg.contains("remove"), "got: {msg}");
     assert!(msg.contains(SELF_OWNER), "got: {msg}");
     assert!(msg.contains(SELF_REPO), "got: {msg}");

@@ -72,7 +72,7 @@ pub enum LoadOutcome {
     Loaded,
     /// `sub.disabled = true`. Auto-load skips silently; `/load` refuses.
     Disabled,
-    /// `(owner, repo)` is the updater itself - the game already owns its handle.
+    /// `(owner, repo)` is the manager itself - the game already owns its handle.
     IsSelf,
     /// Previous session left an `in_callback` breadcrumb on this sub. The
     /// breadcrumb has been cleared on disk so the next `/load` (or next
@@ -100,7 +100,7 @@ pub enum UnloadOutcome {
     Unloaded,
     /// No `LOADED` entry for `(owner, repo)`.
     NotLoaded,
-    /// `(owner, repo)` is the updater itself - refuse, the game owns the handle.
+    /// `(owner, repo)` is the manager itself - refuse, the game owns the handle.
     IsSelf,
 }
 

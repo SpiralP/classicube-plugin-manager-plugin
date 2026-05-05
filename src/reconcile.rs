@@ -67,7 +67,7 @@ pub enum ConflictDir {
 ///   known subscription's repo are reported as conflicts. Other files in
 ///   `plugins_dir` are ignored; the game's plugins dir is shared with the
 ///   user's own files and unmanaged plugins.
-/// - The running updater binary's basename (`self_running_basename`) is
+/// - The running manager binary's basename (`self_running_basename`) is
 ///   excluded from the `plugins_dir` scan so we don't flag ourselves.
 ///
 /// The config is rewritten only when at least one subscription was disabled.

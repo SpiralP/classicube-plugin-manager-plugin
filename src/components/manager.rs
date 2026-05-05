@@ -34,11 +34,18 @@ thread_local!(
 );
 
 #[derive(Default)]
-pub struct Updater;
+pub struct Manager;
 
-impl Component for Updater {
+impl Component for Manager {
     fn name(&self) -> &'static str {
-        "Updater"
+        "Manager"
+    }
+
+    fn init(&mut self) {
+        if let Err(e) = config::migrate_legacy_config() {
+            warn!("legacy config migration failed: {e:#}");
+        }
+        crate::self_path::rename_legacy_self_binary();
     }
 
     fn on_new_map_loaded(&mut self) {
@@ -51,7 +58,7 @@ impl Component for Updater {
             if let Err(e) = run_initial_pass().await {
                 error!("initial update pass failed: {e:#}");
                 print_async(format!(
-                    "{}Plugin updater pass failed: {}{e}",
+                    "{}Plugin manager pass failed: {}{e}",
                     color::RED,
                     color::WHITE,
                 ))
@@ -268,7 +275,7 @@ async fn run_initial_pass() -> Result<()> {
                     ));
                     if is_self {
                         print_async(format!(
-                            "{}Plugin updater updated to {}{}{} - restart ClassiCube to use the \
+                            "{}Plugin manager updated to {}{}{} - restart ClassiCube to use the \
                              new version",
                             color::PINK,
                             color::GREEN,

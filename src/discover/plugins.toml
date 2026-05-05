@@ -1,8 +1,8 @@
 [[plugins]]
 owner = "SpiralP"
-repo = "classicube-plugin-updater-plugin"
-shorthand = "updater"
-description = "This plugin: keeps subscribed plugins up to date from GitHub releases."
+repo = "classicube-plugin-manager-plugin"
+shorthand = "manager"
+description = "This plugin: manages and updates subscribed plugins from GitHub releases."
 
 [[plugins]]
 owner = "SpiralP"

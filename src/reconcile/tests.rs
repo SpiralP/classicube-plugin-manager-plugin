@@ -54,7 +54,7 @@ fn rec(cfg_path: &Path, managed: &Path) -> Result<ReconcileReport> {
 #[test]
 fn missing_config_and_missing_dir_yield_empty_report() {
     let dir = tempdir().unwrap();
-    let cfg_path = dir.path().join("plugin-updater.toml");
+    let cfg_path = dir.path().join("plugin-manager.toml");
     let managed = dir.path().join("does-not-exist");
 
     let report = rec(&cfg_path, &managed).unwrap();
@@ -409,7 +409,7 @@ fn self_subscription_is_skipped() {
     let original = Subscription {
         state: SubscriptionState {
             installed_version: Some("v1.0.0".into()),
-            installed_asset: Some("plugin_updater.so".into()),
+            installed_asset: Some("plugin_manager.so".into()),
             installed_at: Some(1_700_000_000),
             ..SubscriptionState::default()
         },
@@ -626,7 +626,7 @@ fn self_running_basename_excluded_from_plugins_scan() {
     let managed = dir.path().join("managed");
     fs::create_dir(&plugins).unwrap();
     fs::create_dir(&managed).unwrap();
-    touch(&plugins, "libclassicube_plugin_updater_plugin.so");
+    touch(&plugins, "libclassicube_plugin_manager_plugin.so");
 
     let cfg = config_with(vec![(SELF_OWNER, SELF_REPO, empty_sub())]);
     write_config(&cfg_path, &cfg);
@@ -636,7 +636,7 @@ fn self_running_basename_excluded_from_plugins_scan() {
         &plugins,
         &managed,
         ".so",
-        Some("libclassicube_plugin_updater_plugin.so"),
+        Some("libclassicube_plugin_manager_plugin.so"),
     )
     .unwrap();
 
@@ -645,7 +645,7 @@ fn self_running_basename_excluded_from_plugins_scan() {
 
 #[test]
 fn second_self_named_file_in_plugins_is_a_conflict() {
-    // Running binary is libclassicube_plugin_updater_plugin.so; a stray
+    // Running binary is libclassicube_plugin_manager_plugin.so; a stray
     // canonical-named copy alongside it would cause the game to load both
     // (one through our self path, one as an unrelated plugin).
     let dir = tempdir().unwrap();
@@ -654,8 +654,8 @@ fn second_self_named_file_in_plugins_is_a_conflict() {
     let managed = dir.path().join("managed");
     fs::create_dir(&plugins).unwrap();
     fs::create_dir(&managed).unwrap();
-    touch(&plugins, "libclassicube_plugin_updater_plugin.so");
-    touch(&plugins, "classicube-plugin-updater-plugin.so");
+    touch(&plugins, "libclassicube_plugin_manager_plugin.so");
+    touch(&plugins, "classicube-plugin-manager-plugin.so");
 
     let cfg = config_with(vec![(SELF_OWNER, SELF_REPO, empty_sub())]);
     write_config(&cfg_path, &cfg);
@@ -665,7 +665,7 @@ fn second_self_named_file_in_plugins_is_a_conflict() {
         &plugins,
         &managed,
         ".so",
-        Some("libclassicube_plugin_updater_plugin.so"),
+        Some("libclassicube_plugin_manager_plugin.so"),
     )
     .unwrap();
 
@@ -675,7 +675,7 @@ fn second_self_named_file_in_plugins_is_a_conflict() {
     assert_eq!(report.conflicts[0].dir, ConflictDir::Plugins);
     assert_eq!(
         report.conflicts[0].filename,
-        "classicube-plugin-updater-plugin.so"
+        "classicube-plugin-manager-plugin.so"
     );
     assert_eq!(report.conflicts[0].owner, SELF_OWNER);
     assert_eq!(report.conflicts[0].repo, SELF_REPO);

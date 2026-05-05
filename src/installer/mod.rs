@@ -80,7 +80,7 @@ pub fn cleanup_previous_managed(managed_dir: &Path, previous: Option<&str>, new:
     }
 }
 
-/// Self-update install: write the new bytes over the loaded updater binary
+/// Self-update install: write the new bytes over the loaded manager binary
 /// in `plugins/`. The existing `install_bytes_to` rename dance handles the
 /// loaded-and-locked file correctly:
 ///
@@ -103,7 +103,7 @@ pub async fn download_self(
         .ok_or_else(|| anyhow!("loaded path has no parent: {}", loaded.display()))?;
     if dir.file_name() != Some(OsStr::new("plugins")) {
         bail!(
-            "loaded updater binary at {} is not directly under plugins/; refusing to self-update",
+            "loaded manager binary at {} is not directly under plugins/; refusing to self-update",
             loaded.display()
         );
     }

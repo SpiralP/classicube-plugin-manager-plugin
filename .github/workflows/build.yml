@@ -61,13 +61,13 @@ jobs:
         run: |
           cargo nextest run --target ${{ matrix.config.target }} ${{ inputs.release && '--release' || '' }} --no-capture
           Move-Item `
-            -Path 'target\${{ matrix.config.target }}\${{ inputs.release && 'release' || 'debug' }}\classicube_plugin_updater_plugin.dll' `
-            -Destination '.\classicube_plugin_updater_windows_${{ matrix.config.arch }}.dll'
+            -Path 'target\${{ matrix.config.target }}\${{ inputs.release && 'release' || 'debug' }}\classicube_plugin_manager_plugin.dll' `
+            -Destination '.\classicube_plugin_manager_windows_${{ matrix.config.arch }}.dll'
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: classicube_plugin_updater_windows_${{ matrix.config.arch }}
-          path: classicube_plugin_updater_windows_${{ matrix.config.arch }}.dll
+          name: classicube_plugin_manager_windows_${{ matrix.config.arch }}
+          path: classicube_plugin_manager_windows_${{ matrix.config.arch }}.dll
 
   linux_x86:
     name: Build Linux ${{ matrix.config.arch }}
@@ -105,7 +105,7 @@ jobs:
       - name: Build
         run: |
           cargo build --target ${{ matrix.config.target }} ${{ inputs.release && '--release' || '' }}
-          file 'target/${{ matrix.config.target }}/${{ inputs.release && 'release' || 'debug' }}/libclassicube_plugin_updater_plugin.so'
+          file 'target/${{ matrix.config.target }}/${{ inputs.release && 'release' || 'debug' }}/libclassicube_plugin_manager_plugin.so'
 
       - uses: taiki-e/install-action@db5fb34fa772531a3ece57ca434f579eb334e0fb # v2.75.30
         with:
@@ -114,13 +114,13 @@ jobs:
       - name: Test
         run: |
           cargo nextest run --target ${{ matrix.config.target }} ${{ inputs.release && '--release' || '' }} --no-capture
-          mv 'target/${{ matrix.config.target }}/${{ inputs.release && 'release' || 'debug' }}/libclassicube_plugin_updater_plugin.so' \
-            './classicube_plugin_updater_linux_${{ matrix.config.arch }}.so'
+          mv 'target/${{ matrix.config.target }}/${{ inputs.release && 'release' || 'debug' }}/libclassicube_plugin_manager_plugin.so' \
+            './classicube_plugin_manager_linux_${{ matrix.config.arch }}.so'
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: classicube_plugin_updater_linux_${{ matrix.config.arch }}
-          path: classicube_plugin_updater_linux_${{ matrix.config.arch }}.so
+          name: classicube_plugin_manager_linux_${{ matrix.config.arch }}
+          path: classicube_plugin_manager_linux_${{ matrix.config.arch }}.so
 
   mac:
     name: Build MacOS ${{ matrix.config.arch }}
@@ -147,7 +147,7 @@ jobs:
       - name: Build
         run: |
           cargo build --target ${{ matrix.config.target }} ${{ inputs.release && '--release' || '' }}
-          file 'target/${{ matrix.config.target }}/${{ inputs.release && 'release' || 'debug' }}/libclassicube_plugin_updater_plugin.dylib'
+          file 'target/${{ matrix.config.target }}/${{ inputs.release && 'release' || 'debug' }}/libclassicube_plugin_manager_plugin.dylib'
 
       - uses: taiki-e/install-action@db5fb34fa772531a3ece57ca434f579eb334e0fb # v2.75.30
         with:
@@ -156,10 +156,10 @@ jobs:
       - name: Test
         run: |
           cargo nextest run --target ${{ matrix.config.target }} ${{ inputs.release && '--release' || '' }} --no-capture
-          mv 'target/${{ matrix.config.target }}/${{ inputs.release && 'release' || 'debug' }}/libclassicube_plugin_updater_plugin.dylib' \
-            'classicube_plugin_updater_macos_${{ matrix.config.arch }}.dylib'
+          mv 'target/${{ matrix.config.target }}/${{ inputs.release && 'release' || 'debug' }}/libclassicube_plugin_manager_plugin.dylib' \
+            'classicube_plugin_manager_macos_${{ matrix.config.arch }}.dylib'
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: classicube_plugin_updater_macos_${{ matrix.config.arch }}
-          path: classicube_plugin_updater_macos_${{ matrix.config.arch }}.dylib
+          name: classicube_plugin_manager_macos_${{ matrix.config.arch }}
+          path: classicube_plugin_manager_macos_${{ matrix.config.arch }}.dylib

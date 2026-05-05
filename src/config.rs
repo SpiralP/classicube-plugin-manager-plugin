@@ -14,13 +14,23 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeErr
 
 use crate::secret::Secret;
 
-const CONFIG_PATH: &str = "plugins/plugin-updater.toml";
+const CONFIG_PATH: &str = "plugins/plugin-manager.toml";
+
+/// Pre-rename config path. The v3 -> v4 startup migration renames this file
+/// to [`CONFIG_PATH`] (and rewrites the self-subscription key) on first run,
+/// then never touches it again.
+const LEGACY_CONFIG_PATH: &str = "plugins/plugin-updater.toml";
+
+/// Pre-rename crate name. The startup migration rewrites a self subscription
+/// keyed at `(SELF_OWNER, LEGACY_SELF_REPO)` into `(SELF_OWNER, SELF_REPO)`,
+/// so existing v3 users don't lose their subscription on upgrade.
+const LEGACY_SELF_REPO: &str = "classicube-plugin-updater-plugin";
 
 /// Comment line written between the user-editable region (every `[owner.repo]`
 /// table) and the plugin-managed region (every `[owner.repo.state]` table) on
 /// `save_to`. Comments are stripped on parse, so this is regenerated from
 /// scratch on every write.
-const STATE_DIVIDER: &str = "# ---- managed by plugin-updater (do not edit below) ----";
+const STATE_DIVIDER: &str = "# ---- managed by plugin-manager (do not edit below) ----";
 
 /// Owner of this plugin's own repo. Used to identify the "self" subscription
 /// so the auto-update path can install over the loaded binary instead of
@@ -38,6 +48,44 @@ pub fn config_path() -> &'static Path {
 /// Whether `(owner, repo)` refers to this plugin itself.
 pub fn is_self(owner: &str, repo: &str) -> bool {
     owner == SELF_OWNER && repo == SELF_REPO
+}
+
+/// One-shot v3 -> v4 rename: if the legacy `plugins/plugin-updater.toml`
+/// exists and the new path is absent, rename the file and rewrite a
+/// `SpiralP/classicube-plugin-updater-plugin` self subscription to the new
+/// crate name. After the new file is in place this is a no-op.
+///
+/// Errors are logged by the caller; a failed migration must not block
+/// startup (the user can rename the file by hand).
+pub fn migrate_legacy_config() -> Result<()> {
+    migrate_legacy_config_at(Path::new(LEGACY_CONFIG_PATH), config_path())
+}
+
+pub(crate) fn migrate_legacy_config_at(legacy: &Path, current: &Path) -> Result<()> {
+    if current.exists() || !legacy.exists() {
+        return Ok(());
+    }
+    fs::rename(legacy, current)
+        .with_context(|| format!("renaming {} -> {}", legacy.display(), current.display()))?;
+    let mut cfg = Config::load_from(current)?;
+    if rewrite_legacy_self_key(&mut cfg) {
+        cfg.save_to(current)?;
+    }
+    Ok(())
+}
+
+/// Move `(SELF_OWNER, LEGACY_SELF_REPO)` -> `(SELF_OWNER, SELF_REPO)` in the
+/// in-memory config. Returns `true` if anything changed. The new key wins on
+/// collision; the legacy entry is dropped either way.
+fn rewrite_legacy_self_key(cfg: &mut Config) -> bool {
+    let Some(owner_map) = cfg.subscriptions.get_mut(SELF_OWNER) else {
+        return false;
+    };
+    let Some(legacy_sub) = owner_map.remove(LEGACY_SELF_REPO) else {
+        return false;
+    };
+    owner_map.entry(SELF_REPO.into()).or_insert(legacy_sub);
+    true
 }
 
 /// Top-level config. The TOML document is the map directly: each subscription
@@ -340,7 +388,7 @@ impl Config {
 
 /// Set or clear the crash-recovery breadcrumb for one subscription, then
 /// persist. Re-reads the on-disk config first so a concurrent cache write
-/// from the background updater task doesn't clobber the breadcrumb (and
+/// from the background manager task doesn't clobber the breadcrumb (and
 /// vice-versa) — same pattern as `persist_cache_updates_to`.
 ///
 /// No-op if the subscription is no longer present.
