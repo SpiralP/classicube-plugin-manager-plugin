@@ -105,7 +105,7 @@ async fn run_initial_pass() -> Result<()> {
             }
 
             let (tag, published_at, mut release_in_hand) =
-                match resolve_latest_release(owner, repo, sub, now).await {
+                match resolve_latest_release(owner, repo, sub, now, false).await {
                     Ok(t) => t,
                     Err(e) => {
                         warn!("checking {owner}/{repo}: {e:#}");
@@ -359,13 +359,14 @@ fn needs_install(
     installed_asset.is_none() || installed_at.is_none_or(|t| latest_published_at > t)
 }
 
-async fn resolve_latest_release(
+pub(crate) async fn resolve_latest_release(
     owner: &str,
     repo: &str,
     sub: &Subscription,
     now: u64,
+    force_refresh: bool,
 ) -> Result<(String, u64, Option<GitHubRelease>)> {
-    if let Some((tag, pub_at)) = sub.fresh_cached_release(now, TTL_SECS) {
+    if !force_refresh && let Some((tag, pub_at)) = sub.fresh_cached_release(now, TTL_SECS) {
         debug!("{owner}/{repo} served from cache ({tag})");
         return Ok((tag.to_owned(), pub_at, None));
     }
@@ -383,7 +384,10 @@ async fn resolve_latest_release(
     ))
 }
 
-fn persist_cache_updates(now: u64, updates: Vec<(String, String, String, u64)>) -> Result<()> {
+pub(crate) fn persist_cache_updates(
+    now: u64,
+    updates: Vec<(String, String, String, u64)>,
+) -> Result<()> {
     persist_cache_updates_to(config_path(), now, updates)
 }
 

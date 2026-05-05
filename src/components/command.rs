@@ -19,10 +19,12 @@ use crate::{
     asset_match::pick_asset,
     chat::{print_async, print_wrapped},
     component::Component,
-    components::updater::persist_installed_versions,
+    components::updater::{
+        persist_cache_updates, persist_installed_versions, resolve_latest_release,
+    },
     config::{self, Channel, Config, Subscription, SubscriptionState},
     discover,
-    github_release::{get_release_for_channel, resolve_expected_digest},
+    github_release::{GitHubRelease, get_release_for_channel, resolve_expected_digest},
     installer::{download_self, download_to_managed_dir},
     secret::Secret,
 };
@@ -819,30 +821,69 @@ fn handle_update_all() {
             }
         };
 
-        let stale: Vec<(String, String, Channel, Option<String>)> = config
+        let candidates: Vec<(String, String, Subscription)> = config
             .subscriptions
-            .iter()
+            .into_iter()
             .flat_map(|(owner, repos)| {
                 repos
-                    .iter()
-                    .map(move |(repo, sub)| (owner.clone(), repo.clone(), sub))
+                    .into_iter()
+                    .map(move |(repo, sub)| (owner.clone(), repo, sub))
             })
             .filter(|(_, _, s)| !s.disabled)
-            .filter(
-                |(_, _, s)| match (s.state.installed_at, s.state.cached_published_at) {
-                    (Some(installed_at), Some(latest_pub_at)) => latest_pub_at > installed_at,
-                    _ => true,
-                },
-            )
-            .map(|(owner, repo, s)| {
-                (
-                    owner,
-                    repo,
-                    s.channel.clone(),
-                    s.token.as_ref().map(|t| t.expose().to_owned()),
-                )
-            })
             .collect();
+
+        if candidates.is_empty() {
+            print_async(format!("{}Nothing to update", color::YELLOW)).await;
+            return;
+        }
+
+        print_async(format!(
+            "{}Checking {}{}{} subscription(s) for updates...",
+            color::PINK,
+            color::YELLOW,
+            candidates.len(),
+            color::PINK,
+        ))
+        .await;
+
+        let now = unix_now();
+        let mut cache_updates: Vec<(String, String, String, u64)> = Vec::new();
+        let mut stale: Vec<(String, String, Option<String>, GitHubRelease)> = Vec::new();
+
+        for (owner, repo, sub) in candidates {
+            match resolve_latest_release(&owner, &repo, &sub, now, true).await {
+                Ok((tag, pub_at, Some(release))) => {
+                    cache_updates.push((owner.clone(), repo.clone(), tag, pub_at));
+                    if sub.state.installed_at.is_none_or(|i| pub_at > i) {
+                        let token = sub.token.as_ref().map(|t| t.expose().to_owned());
+                        stale.push((owner, repo, token, release));
+                    }
+                }
+                Ok((_, _, None)) => {
+                    // resolve_latest_release with force_refresh=true always
+                    // returns Some(release); no-op fallback.
+                }
+                Err(e) => {
+                    error!("checking {}/{}: {e:#}", owner, repo);
+                    print_async(format!(
+                        "{}Failed to check {}{}/{}{}: {}{e}",
+                        color::RED,
+                        color::LIME,
+                        owner,
+                        repo,
+                        color::RED,
+                        color::WHITE,
+                    ))
+                    .await;
+                }
+            }
+        }
+
+        if !cache_updates.is_empty()
+            && let Err(e) = persist_cache_updates(now, cache_updates)
+        {
+            error!("saving config (cache update): {e:#}");
+        }
 
         if stale.is_empty() {
             print_async(format!("{}Nothing to update", color::YELLOW)).await;
@@ -857,8 +898,8 @@ fn handle_update_all() {
             color::PINK,
         ))
         .await;
-        for (owner, repo, channel, token) in stale {
-            spawn_update_task(owner, repo, channel, token);
+        for (owner, repo, token, release) in stale {
+            spawn_update_task_with_release(owner, repo, token, release);
         }
     });
 }
@@ -866,6 +907,29 @@ fn handle_update_all() {
 fn spawn_update_task(owner: String, repo: String, channel: Channel, token: Option<String>) {
     async_manager::spawn(async move {
         if let Err(e) = run_update(&owner, &repo, &channel, token.as_deref()).await {
+            error!("update {}/{}: {e:#}", owner, repo);
+            print_async(format!(
+                "{}Update {}{}/{}{} failed: {}{e}",
+                color::RED,
+                color::LIME,
+                owner,
+                repo,
+                color::RED,
+                color::WHITE,
+            ))
+            .await;
+        }
+    });
+}
+
+fn spawn_update_task_with_release(
+    owner: String,
+    repo: String,
+    token: Option<String>,
+    release: GitHubRelease,
+) {
+    async_manager::spawn(async move {
+        if let Err(e) = run_update_with_release(&owner, &repo, token.as_deref(), release).await {
             error!("update {}/{}: {e:#}", owner, repo);
             print_async(format!(
                 "{}Update {}{}/{}{} failed: {}{e}",
@@ -893,6 +957,15 @@ async fn run_update(owner: &str, repo: &str, channel: &Channel, token: Option<&s
     .await;
 
     let release = get_release_for_channel(owner, repo, channel, token).await?;
+    run_update_with_release(owner, repo, token, release).await
+}
+
+async fn run_update_with_release(
+    owner: &str,
+    repo: &str,
+    token: Option<&str>,
+    release: GitHubRelease,
+) -> Result<()> {
     let asset = pick_asset(&release.assets, env::consts::ARCH, env::consts::DLL_SUFFIX)?;
 
     print_async(format!(
