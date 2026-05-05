@@ -121,6 +121,31 @@ pub async fn download_self(
     tag: &str,
 ) -> Result<PathBuf> {
     let loaded = current_lib_path().context("resolving self path")?;
+    let (dir, new_basename) = resolve_self_update_target(&loaded, tag, env::consts::DLL_SUFFIX)?;
+
+    debug!(
+        "self-updating: downloading {} -> {}",
+        asset.url,
+        dir.join(&new_basename).display(),
+    );
+    let bytes = download_bytes(asset, token).await?;
+    install_bytes_to(&dir, &new_basename, &bytes, expected_digest)
+}
+
+/// Pure: derive the directory and target basename for a self-update from
+/// the currently-loaded binary's path. Refuses cases that would corrupt
+/// the install:
+///
+/// - loaded path has no parent (shouldn't happen in practice).
+/// - parent isn't `plugins/` (we don't know where to put files safely).
+/// - target basename equals loaded basename (we'd write over the
+///   currently-mmap'd file - belt-and-suspenders against stale-config
+///   short-circuits in callers).
+pub(crate) fn resolve_self_update_target(
+    loaded: &Path,
+    tag: &str,
+    ext: &str,
+) -> Result<(PathBuf, String)> {
     let dir = loaded
         .parent()
         .ok_or_else(|| anyhow!("loaded path has no parent: {}", loaded.display()))?;
@@ -130,16 +155,18 @@ pub async fn download_self(
             loaded.display()
         );
     }
-    let new_basename =
-        versioned_managed_filename(SELF_OWNER, SELF_REPO, tag, env::consts::DLL_SUFFIX);
-
-    debug!(
-        "self-updating: downloading {} -> {}",
-        asset.url,
-        dir.join(&new_basename).display(),
-    );
-    let bytes = download_bytes(asset, token).await?;
-    install_bytes_to(dir, &new_basename, &bytes, expected_digest)
+    let basename = loaded
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| anyhow!("loaded path has no UTF-8 filename: {}", loaded.display()))?;
+    let new_basename = versioned_managed_filename(SELF_OWNER, SELF_REPO, tag, ext);
+    if new_basename == basename {
+        bail!(
+            "self already loaded at {} for tag {tag}; nothing to do",
+            loaded.display()
+        );
+    }
+    Ok((dir.to_path_buf(), new_basename))
 }
 
 /// Best-effort: mark a previously-loaded self binary aside as `<prev>.old`

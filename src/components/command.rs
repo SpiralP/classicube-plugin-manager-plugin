@@ -1133,24 +1133,33 @@ async fn run_update_with_release(
     // currently-mapped one, so dlopen returns the cached handle), so
     // there's no behavior to deliver. Self lives in plugins/, managed in
     // plugins/managed/.
-    if prev_version.as_deref() == Some(&release.tag_name)
-        && let Some(name) = prev_asset.as_deref()
-    {
-        let dir = if is_self { PLUGINS_DIR } else { MANAGED_DIR };
-        if Path::new(dir).join(name).exists() {
-            print_async(format!(
-                "{}{}/{} {}is already on {}{}{}; nothing to do",
-                color::LIME,
-                owner,
-                repo,
-                color::PINK,
-                color::GREEN,
-                release.tag_name,
-                color::PINK,
-            ))
-            .await;
-            return Ok(());
-        }
+    let already_installed = (prev_version.as_deref() == Some(&release.tag_name)
+        && prev_asset.as_deref().is_some_and(|name| {
+            let dir = if is_self { PLUGINS_DIR } else { MANAGED_DIR };
+            Path::new(dir).join(name).exists()
+        }))
+        || (is_self
+            && Path::new(PLUGINS_DIR)
+                .join(installer::versioned_managed_filename(
+                    config::SELF_OWNER,
+                    config::SELF_REPO,
+                    &release.tag_name,
+                    env::consts::DLL_SUFFIX,
+                ))
+                .exists());
+    if already_installed {
+        print_async(format!(
+            "{}{}/{} {}is already on {}{}{}; nothing to do",
+            color::LIME,
+            owner,
+            repo,
+            color::PINK,
+            color::GREEN,
+            release.tag_name,
+            color::PINK,
+        ))
+        .await;
+        return Ok(());
     }
 
     // Skip the file we'd legitimately overwrite: for non-self, the

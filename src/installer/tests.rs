@@ -388,3 +388,46 @@ fn cleanup_self_old_in_handles_missing_dir() {
     // Should not panic - just logs and returns.
     cleanup_self_old_in(Path::new("/__definitely_does_not_exist__"));
 }
+
+#[test]
+fn resolve_self_update_target_returns_dir_and_versioned_basename() {
+    let loaded = Path::new("/game/plugins/classicube_plugin_manager_linux_x86_64.so");
+    let (dir, basename) = resolve_self_update_target(loaded, "v0.3.1", ".so").unwrap();
+    assert_eq!(dir, Path::new("/game/plugins"));
+    // Same scheme as managed: <SELF_OWNER>-<SELF_REPO>-<tag><ext>.
+    let expected = versioned_managed_filename(SELF_OWNER, SELF_REPO, "v0.3.1", ".so");
+    assert_eq!(basename, expected);
+}
+
+#[test]
+fn resolve_self_update_target_refuses_to_overwrite_loaded_file() {
+    // Regression: when the latest release tag matches the version baked
+    // into the loaded self filename, the would-be-new versioned filename
+    // equals the loaded basename. download_self used to plough ahead and
+    // write over the currently-mmap'd file (caught only later by
+    // install_bytes_to's rename dance, with no behavior delivered). The
+    // guard refuses cleanly so callers can short-circuit silently.
+    let loaded_basename =
+        versioned_managed_filename(SELF_OWNER, SELF_REPO, "v0.2.0", env::consts::DLL_SUFFIX);
+    let loaded = PathBuf::from("/game/plugins").join(&loaded_basename);
+    let err =
+        resolve_self_update_target(&loaded, "v0.2.0", env::consts::DLL_SUFFIX).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("already loaded") && msg.contains("v0.2.0"),
+        "expected 'already loaded ... v0.2.0' in error, got: {msg}",
+    );
+}
+
+#[test]
+fn resolve_self_update_target_refuses_when_parent_is_not_plugins() {
+    // The function is called with the currently-loaded binary path; if
+    // that's not under plugins/ (e.g. dev running from target/debug)
+    // we don't know where to write the new versioned file safely.
+    let loaded = Path::new("/home/user/target/debug/libclassicube_plugin_manager_plugin.so");
+    let err = resolve_self_update_target(loaded, "v0.3.1", ".so").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("not directly under plugins/"),
+        "expected 'not directly under plugins/' in error",
+    );
+}

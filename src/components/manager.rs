@@ -19,7 +19,7 @@ use crate::{
     config::{self, Config, Subscription, config_path},
     github_release::{GitHubRelease, get_release_for_channel, resolve_expected_digest},
     installer::{
-        MANAGED_DIR, PLUGINS_DIR, cleanup_self_old, download_self, download_to_managed_dir,
+        self, MANAGED_DIR, PLUGINS_DIR, cleanup_self_old, download_self, download_to_managed_dir,
         mark_previous_self_aside,
     },
     loader::init_managed,
@@ -188,6 +188,23 @@ async fn run_initial_pass() -> Result<()> {
                 };
                 if Path::new(dir).join(asset_name).exists() {
                     debug!("{owner}/{repo} already on {tag} with asset on disk; skipping");
+                    continue;
+                }
+            }
+            // Self-only: even if config didn't track installed_version (or
+            // doesn't match the loaded file), refuse to "update" to a tag
+            // whose versioned file already exists in plugins/. The on-disk
+            // file is the source of truth for what'll be loaded next
+            // restart.
+            if config::is_self(owner, repo) {
+                let target = installer::versioned_managed_filename(
+                    config::SELF_OWNER,
+                    config::SELF_REPO,
+                    &tag,
+                    env::consts::DLL_SUFFIX,
+                );
+                if Path::new(PLUGINS_DIR).join(&target).exists() {
+                    debug!("self target {target} already on disk; skipping");
                     continue;
                 }
             }
