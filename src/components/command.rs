@@ -378,18 +378,21 @@ fn handle_add(spec: &str, channel: Channel, token: Option<String>) {
             return;
         }
 
+        let install_token = token.clone();
         let Some((owner, repo)) =
             add_subscription(&spec, candidates, &channel, token, &mut config).await
         else {
             return;
         };
         print_async(format!(
-            "{}Added {}{owner}/{repo}{}",
+            "{}Added {}{owner}/{repo}{}{}, installing...",
             color::PINK,
             color::LIME,
             channel_suffix(&channel),
+            color::PINK,
         ))
         .await;
+        spawn_update_task(owner, repo, channel, install_token);
     });
 }
 
