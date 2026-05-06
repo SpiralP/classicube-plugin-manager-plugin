@@ -85,7 +85,12 @@ impl Component for Manager {
             // dlopen).
             let swept = reconcile::sweep_managed_orphans(Path::new(MANAGED_DIR), &cfg);
             if !swept.is_empty() {
-                info!(
+                // Warn at the point of action: the orphan / managed-conflict
+                // observations in `run_reconcile_and_warn` were demoted
+                // (they're transient predictions of what's about to be
+                // deleted); this consolidated line is the actual record of
+                // what got removed.
+                warn!(
                     "cleaned up {} stale plugin binar{}: {}",
                     swept.len(),
                     if swept.len() == 1 { "y" } else { "ies" },
@@ -464,41 +469,35 @@ async fn run_reconcile_and_warn() {
         .await;
     }
     // Orphans and managed-dir conflicts both end up in
-    // sweep_managed_orphans' delete list; warn for the log but skip the
-    // chat - the sweep emits a single consolidated line for whatever it
-    // actually removed.
-    for name in &report.orphans {
-        warn!("orphan in {}: {name}", MANAGED_DIR);
-    }
+    // sweep_managed_orphans' delete list a few steps later; the sweep
+    // emits a single consolidated `warn!` for whatever it actually
+    // removed, which is the right place to surface the cleanup. No
+    // chat for either - sweep is routine.
     for conflict in &report.conflicts {
-        let dir_label = match conflict.dir {
-            ConflictDir::Plugins => PLUGINS_DIR,
-            ConflictDir::Managed => MANAGED_DIR,
-        };
-        let claim = match &conflict.installed_asset {
-            Some(a) => format!(" (managed file: {a})"),
-            None => String::new(),
-        };
-        warn!(
-            "conflict in {dir_label}: {} duplicates {}/{}{}",
-            conflict.filename, conflict.owner, conflict.repo, claim,
-        );
         if matches!(conflict.dir, ConflictDir::Managed) {
-            // Stray file in managed/ - the loader only opens
-            // `installed_asset`, so it's pure clutter and the sweep will
-            // remove it.
+            // Stray file in managed/ - loader only opens `installed_asset`,
+            // so it's pure clutter; the sweep will remove it.
             continue;
         }
         // Plugins-dir conflict: ClassiCube auto-loads the user's file in
         // plugins/, so the loader skips the managed copy to keep only one
         // instance live. The user has to intervene; we don't touch
-        // plugins/.
+        // plugins/. This one stays a warn + chat because the sweep won't
+        // clean it up.
+        let claim = match &conflict.installed_asset {
+            Some(a) => format!(" (managed file: {a})"),
+            None => String::new(),
+        };
+        warn!(
+            "conflict in {}: {} duplicates {}/{}{}",
+            PLUGINS_DIR, conflict.filename, conflict.owner, conflict.repo, claim,
+        );
         print_async(format!(
             "{}Conflict in {}{}{}: {}{}{} duplicates {}{}/{}{}{} - skipping the managed copy; \
              delete one to consolidate",
             color::YELLOW,
             color::LIME,
-            dir_label,
+            PLUGINS_DIR,
             color::YELLOW,
             color::LIME,
             conflict.filename,
