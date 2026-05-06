@@ -22,7 +22,7 @@ pub struct ReconcileReport {
     pub conflicts: Vec<Conflict>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MissingFile {
     pub owner: String,
     pub repo: String,
@@ -78,16 +78,19 @@ pub fn reconcile(
     dll_suffix: &str,
     self_running_basename: Option<&str>,
 ) -> Result<ReconcileReport> {
-    let mut config = Config::load_from(config_path)?;
+    // Disk listings happen outside the config lock - they don't touch the
+    // toml file and can be slow on cold disks.
     let managed_on_disk = list_dir_files(managed_dir)
         .with_context(|| format!("listing {}", managed_dir.display()))?;
     let plugins_on_disk = list_dir_files(plugins_dir)
         .with_context(|| format!("listing {}", plugins_dir.display()))?;
 
+    let config = Config::load_from(config_path)?;
     // Snapshot (owner, repo, installed_asset) up front: the missing-clearing
-    // pass below mutates `installed_asset` to None for missing subs, but the
+    // step below mutates `installed_asset` to None for missing subs, but the
     // conflict warning reads better with the *original* claim ("sub thought
-    // it owned X, but Y looks similar - is one of them the build you meant?").
+    // it owned X, but Y looks similar - is one of them the build you
+    // meant?").
     let subs: Vec<(String, String, Option<String>)> = config
         .subscriptions
         .iter()
@@ -101,13 +104,13 @@ pub fn reconcile(
     let mut report = ReconcileReport::default();
     let mut claimed: HashSet<String> = HashSet::new();
 
-    for (owner, repos) in &mut config.subscriptions {
+    for (owner, repos) in &config.subscriptions {
         for (repo, sub) in repos {
-            // The self subscription installs into plugins/ (not plugins/managed/),
-            // so it never participates in this reconcile pass - checking here
-            // would always flag it missing. Self-vs-variant conflicts are
-            // handled in the conflict-classification pass below, which scans
-            // plugins/ too.
+            // The self subscription installs into plugins/ (not
+            // plugins/managed/), so it never participates in this reconcile
+            // pass - checking here would always flag it missing.
+            // Self-vs-variant conflicts are handled in the conflict-
+            // classification pass below, which scans plugins/ too.
             if config::is_self(owner, repo) {
                 continue;
             }
@@ -122,10 +125,6 @@ pub fn reconcile(
                     repo: repo.clone(),
                     asset,
                 });
-                sub.disabled = true;
-                sub.state.installed_version = None;
-                sub.state.installed_asset = None;
-                sub.state.installed_at = None;
             }
         }
     }
@@ -167,12 +166,28 @@ pub fn reconcile(
         }
     }
 
+    // Apply the missing-clearing pass under the config lock so a concurrent
+    // breadcrumb / cache write doesn't get clobbered by our save. The
+    // clearing is idempotent against fresh state (we only flip fields that
+    // were already present in the snapshot).
     if !report.missing.is_empty() {
-        config
-            .save_to(config_path)
-            .with_context(|| format!("saving {}", config_path.display()))?;
+        let missing = report.missing.clone();
+        Config::modify_at(config_path, |fresh| {
+            for m in &missing {
+                if let Some(sub) = fresh
+                    .subscriptions
+                    .get_mut(&m.owner)
+                    .and_then(|r| r.get_mut(&m.repo))
+                {
+                    sub.disabled = true;
+                    sub.state.installed_version = None;
+                    sub.state.installed_asset = None;
+                    sub.state.installed_at = None;
+                }
+            }
+        })
+        .with_context(|| format!("saving {}", config_path.display()))?;
     }
-
     Ok(report)
 }
 

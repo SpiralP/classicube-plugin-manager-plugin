@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, io::Write};
+use std::{
+    collections::BTreeMap,
+    io::Write,
+    sync::{Arc, Barrier},
+    thread,
+};
 
 use tempfile::{NamedTempFile, tempdir};
 
@@ -1085,5 +1090,90 @@ fn migrate_legacy_config_keeps_new_self_when_both_keys_present() {
             .installed_version
             .as_deref(),
         Some("new")
+    );
+}
+
+/// Two threads modify different fields of the same subscription
+/// concurrently. Without `Config::modify_at`'s lock, the later writer's
+/// `load -> mutate -> save` chain could clobber the earlier writer's
+/// change because both load+save are non-atomic together. With the lock,
+/// both fields land on disk regardless of order. This is the regression
+/// guard for the cef-loader stale-breadcrumb race.
+#[test]
+fn modify_at_serializes_concurrent_writers() {
+    let f = NamedTempFile::new().unwrap();
+    one_sub_config("octocat", "hello-world", sub())
+        .save_to(f.path())
+        .unwrap();
+
+    let path: std::path::PathBuf = f.path().into();
+    let iters = 64;
+    let barrier = Arc::new(Barrier::new(2));
+
+    let writer_breadcrumb = {
+        let path = path.clone();
+        let barrier = barrier.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            for i in 0..iters {
+                let tag = format!("Init-{i}");
+                Config::modify_at(&path, |cfg| {
+                    let sub = cfg
+                        .subscriptions
+                        .get_mut("octocat")
+                        .and_then(|m| m.get_mut("hello-world"))
+                        .unwrap();
+                    sub.state.in_callback = Some(tag.clone());
+                })
+                .unwrap();
+                Config::modify_at(&path, |cfg| {
+                    let sub = cfg
+                        .subscriptions
+                        .get_mut("octocat")
+                        .and_then(|m| m.get_mut("hello-world"))
+                        .unwrap();
+                    sub.state.in_callback = None;
+                })
+                .unwrap();
+            }
+        })
+    };
+
+    let writer_cache = {
+        let path = path.clone();
+        let barrier = barrier.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            for i in 0..iters {
+                Config::modify_at(&path, |cfg| {
+                    let sub = cfg
+                        .subscriptions
+                        .get_mut("octocat")
+                        .and_then(|m| m.get_mut("hello-world"))
+                        .unwrap();
+                    sub.state.cached_at = Some(i);
+                    sub.state.cached_tag = Some(format!("v0.0.{i}"));
+                })
+                .unwrap();
+            }
+        })
+    };
+
+    writer_breadcrumb.join().unwrap();
+    writer_cache.join().unwrap();
+
+    let final_cfg = Config::load_from(&path).unwrap();
+    let (_, _, s) = first_sub(&final_cfg);
+    // breadcrumb writer ends with None.
+    assert!(
+        s.state.in_callback.is_none(),
+        "stale breadcrumb after concurrent writers: {:?}",
+        s.state.in_callback,
+    );
+    // cache writer ends with the last iter's value.
+    assert_eq!(s.state.cached_at, Some(iters - 1));
+    assert_eq!(
+        s.state.cached_tag.as_deref(),
+        Some(format!("v0.0.{}", iters - 1)).as_deref()
     );
 }

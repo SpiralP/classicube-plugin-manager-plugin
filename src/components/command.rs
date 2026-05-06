@@ -23,7 +23,7 @@ use crate::{
     components::manager::{
         persist_cache_updates, persist_installed_versions, resolve_latest_release,
     },
-    config::{self, Channel, Config, Subscription, SubscriptionState},
+    config::{self, Channel, Config, Subscription, SubscriptionState, config_path},
     discover,
     github_release::{GitHubRelease, get_release_for_channel, resolve_expected_digest},
     installer::{
@@ -365,7 +365,7 @@ fn handle_add(spec: &str, channel: Channel, token: Option<String>) {
     let spec = spec.to_string();
 
     async_manager::spawn(async move {
-        let mut config = match Config::load() {
+        let config = match Config::load() {
             Ok(c) => c,
             Err(e) => {
                 print_load_error(&e).await;
@@ -394,11 +394,10 @@ fn handle_add(spec: &str, channel: Channel, token: Option<String>) {
             .await;
             return;
         }
+        drop(config);
 
         let install_token = token.clone();
-        let Some((owner, repo)) =
-            add_subscription(&spec, candidates, &channel, token, &mut config).await
-        else {
+        let Some((owner, repo)) = add_subscription(&spec, candidates, &channel, token).await else {
             return;
         };
         print_async(format!(
@@ -426,7 +425,6 @@ async fn add_subscription(
     candidates: Vec<(String, String)>,
     channel: &Channel,
     token: Option<String>,
-    config: &mut Config,
 ) -> Option<(String, String)> {
     let (owner, repo) = if candidates.len() == 1 {
         candidates.into_iter().next().unwrap()
@@ -465,20 +463,25 @@ async fn add_subscription(
         return None;
     }
 
-    config
-        .subscriptions
-        .entry(owner.clone())
-        .or_default()
-        .insert(
-            repo.clone(),
-            Subscription {
-                channel: channel.clone(),
-                disabled: false,
-                token: token.map(Secret::new),
-                state: SubscriptionState::default(),
-            },
-        );
-    if let Err(e) = config.save() {
+    let owner_for_save = owner.clone();
+    let repo_for_save = repo.clone();
+    let channel_for_save = channel.clone();
+    let save_result = Config::modify_at(config_path(), move |config| {
+        config
+            .subscriptions
+            .entry(owner_for_save)
+            .or_default()
+            .insert(
+                repo_for_save,
+                Subscription {
+                    channel: channel_for_save,
+                    disabled: false,
+                    token: token.map(Secret::new),
+                    state: SubscriptionState::default(),
+                },
+            );
+    });
+    if let Err(e) = save_result {
         print_save_error(&e).await;
         return None;
     }
@@ -523,14 +526,8 @@ async fn probe_release(
 /// `add_subscription` with an "(auto), installing..." chat message and
 /// hands off to the existing install path. Caller has already checked
 /// that no subscription exists for `candidates`.
-async fn auto_add_and_install(
-    spec: &str,
-    candidates: Vec<(String, String)>,
-    channel: Channel,
-    config: &mut Config,
-) {
-    let Some((owner, repo)) = add_subscription(spec, candidates, &channel, None, config).await
-    else {
+async fn auto_add_and_install(spec: &str, candidates: Vec<(String, String)>, channel: Channel) {
+    let Some((owner, repo)) = add_subscription(spec, candidates, &channel, None).await else {
         return;
     };
     print_async(format!(
@@ -552,42 +549,61 @@ fn handle_remove(spec: &str) {
     let spec = spec.to_string();
 
     async_manager::spawn(async move {
-        let mut config = match Config::load() {
-            Ok(c) => c,
+        enum RemoveOutcome {
+            NotAdded,
+            RefuseSelf(String),
+            Removed {
+                stored_owner: String,
+                stored_repo: String,
+                installed_asset: Option<String>,
+            },
+        }
+        let outcome = Config::modify_at(config_path(), |config| {
+            let Some((stored_owner, stored_repo, sub)) = find_subscription(config, &candidates)
+            else {
+                return RemoveOutcome::NotAdded;
+            };
+            if let Some(msg) = refuse_self_mutation(&stored_owner, &stored_repo, "remove") {
+                return RemoveOutcome::RefuseSelf(msg);
+            }
+            let installed_asset = sub.state.installed_asset.clone();
+            if let Some(repos) = config.subscriptions.get_mut(&stored_owner) {
+                repos.remove(&stored_repo);
+                if repos.is_empty() {
+                    config.subscriptions.remove(&stored_owner);
+                }
+            }
+            RemoveOutcome::Removed {
+                stored_owner,
+                stored_repo,
+                installed_asset,
+            }
+        });
+        let (stored_owner, stored_repo, installed_asset) = match outcome {
             Err(e) => {
-                print_load_error(&e).await;
+                print_save_error(&e).await;
                 return;
             }
-        };
-
-        let Some((stored_owner, stored_repo, sub)) = find_subscription(&config, &candidates) else {
-            print_async(format!(
-                "{}Not added: {}{}",
-                color::YELLOW,
-                color::LIME,
-                spec,
-            ))
-            .await;
-            return;
-        };
-
-        if let Some(msg) = refuse_self_mutation(&stored_owner, &stored_repo, "remove") {
-            print_async(msg).await;
-            return;
-        }
-
-        let installed_asset = sub.state.installed_asset.clone();
-
-        if let Some(repos) = config.subscriptions.get_mut(&stored_owner) {
-            repos.remove(&stored_repo);
-            if repos.is_empty() {
-                config.subscriptions.remove(&stored_owner);
+            Ok(RemoveOutcome::NotAdded) => {
+                print_async(format!(
+                    "{}Not added: {}{}",
+                    color::YELLOW,
+                    color::LIME,
+                    spec,
+                ))
+                .await;
+                return;
             }
-        }
-        if let Err(e) = config.save() {
-            print_save_error(&e).await;
-            return;
-        }
+            Ok(RemoveOutcome::RefuseSelf(msg)) => {
+                print_async(msg).await;
+                return;
+            }
+            Ok(RemoveOutcome::Removed {
+                stored_owner,
+                stored_repo,
+                installed_asset,
+            }) => (stored_owner, stored_repo, installed_asset),
+        };
         print_async(format!(
             "{}Removed {}{stored_owner}/{stored_repo}",
             color::PINK,
@@ -644,16 +660,39 @@ fn handle_channel(spec: &str, channel: Channel) {
     let spec = spec.to_string();
 
     async_manager::spawn(async move {
-        let mut config = match Config::load() {
-            Ok(c) => c,
-            Err(e) => {
-                print_load_error(&e).await;
-                return;
-            }
-        };
-
-        if let Some((owner, repo, sub)) = find_subscription_mut(&mut config, &candidates) {
+        enum ChannelOutcome {
+            NoSub,
+            AlreadyOnChannel {
+                owner: String,
+                repo: String,
+            },
+            Switched {
+                owner: String,
+                repo: String,
+                token: Option<String>,
+                installed_version: Option<String>,
+            },
+        }
+        let outcome = Config::modify_at(config_path(), |config| {
+            let Some((owner, repo, sub)) = find_subscription_mut(config, &candidates) else {
+                return ChannelOutcome::NoSub;
+            };
             if sub.channel == channel {
+                return ChannelOutcome::AlreadyOnChannel { owner, repo };
+            }
+            let token = sub.token.as_ref().map(|s| s.expose().to_owned());
+            let installed_version = sub.state.installed_version.clone();
+            apply_channel_switch(sub, channel.clone());
+            ChannelOutcome::Switched {
+                owner,
+                repo,
+                token,
+                installed_version,
+            }
+        });
+        match outcome {
+            Err(e) => print_save_error(&e).await,
+            Ok(ChannelOutcome::AlreadyOnChannel { owner, repo }) => {
                 print_async(format!(
                     "{}{owner}/{repo} {}already on channel {}{}",
                     color::LIME,
@@ -662,37 +701,34 @@ fn handle_channel(spec: &str, channel: Channel) {
                     channel.pretty(),
                 ))
                 .await;
-                return;
             }
-            let token = sub.token.as_ref().map(|s| s.expose().to_owned());
-            let installed_version = sub.state.installed_version.clone();
-            apply_channel_switch(sub, channel.clone());
-
-            if let Err(e) = config.save() {
-                print_save_error(&e).await;
-                return;
+            Ok(ChannelOutcome::Switched {
+                owner,
+                repo,
+                token,
+                installed_version,
+            }) => {
+                print_async(format!(
+                    "{}Channel for {}{owner}/{repo} {}set to {}{}",
+                    color::PINK,
+                    color::LIME,
+                    color::PINK,
+                    color::YELLOW,
+                    channel.pretty(),
+                ))
+                .await;
+                // Pulling the new channel's binary is the whole point of
+                // the switch; skip only the pause-to-current-tag case to
+                // avoid the "Checking..." / "already on ..." chat noise on
+                // top of the "Channel set to ..." line we just printed.
+                if !channel_matches_installed(&channel, installed_version.as_deref()) {
+                    run_update_task(owner, repo, channel, token).await;
+                }
             }
-            print_async(format!(
-                "{}Channel for {}{owner}/{repo} {}set to {}{}",
-                color::PINK,
-                color::LIME,
-                color::PINK,
-                color::YELLOW,
-                channel.pretty(),
-            ))
-            .await;
-
-            // Pulling the new channel's binary is the whole point of the
-            // switch; skip only the pause-to-current-tag case to avoid the
-            // "Checking..." / "already on ..." chat noise on top of the
-            // "Channel set to ..." line we just printed.
-            if !channel_matches_installed(&channel, installed_version.as_deref()) {
-                run_update_task(owner, repo, channel, token).await;
+            Ok(ChannelOutcome::NoSub) => {
+                auto_add_and_install(&spec, candidates, channel).await;
             }
-            return;
         }
-
-        auto_add_and_install(&spec, candidates, channel, &mut config).await;
     });
 }
 
@@ -704,21 +740,29 @@ fn set_disabled(spec: &str, disabled: bool) {
     let spec = spec.to_string();
 
     async_manager::spawn(async move {
-        let mut config = match Config::load() {
-            Ok(c) => c,
-            Err(e) => {
-                print_load_error(&e).await;
-                return;
-            }
-        };
-
-        if let Some((owner, repo, sub)) = find_subscription_mut(&mut config, &candidates) {
+        enum SetDisabledOutcome {
+            NoSub,
+            RefuseSelf(String),
+            AlreadyMatched { owner: String, repo: String },
+            Toggled { owner: String, repo: String },
+        }
+        let outcome = Config::modify_at(config_path(), |config| {
+            let Some((owner, repo, sub)) = find_subscription_mut(config, &candidates) else {
+                return SetDisabledOutcome::NoSub;
+            };
             if disabled && let Some(msg) = refuse_self_mutation(&owner, &repo, "disable") {
-                print_async(msg).await;
-                return;
+                return SetDisabledOutcome::RefuseSelf(msg);
             }
-
             if sub.disabled == disabled {
+                return SetDisabledOutcome::AlreadyMatched { owner, repo };
+            }
+            sub.disabled = disabled;
+            SetDisabledOutcome::Toggled { owner, repo }
+        });
+        match outcome {
+            Err(e) => print_save_error(&e).await,
+            Ok(SetDisabledOutcome::RefuseSelf(msg)) => print_async(msg).await,
+            Ok(SetDisabledOutcome::AlreadyMatched { owner, repo }) => {
                 let word = if disabled { "disabled" } else { "enabled" };
                 print_async(format!(
                     "{}Already {word} {}{owner}/{repo}",
@@ -726,36 +770,31 @@ fn set_disabled(spec: &str, disabled: bool) {
                     color::LIME,
                 ))
                 .await;
-                return;
             }
-            sub.disabled = disabled;
-
-            if let Err(e) = config.save() {
-                print_save_error(&e).await;
-                return;
+            Ok(SetDisabledOutcome::Toggled { owner, repo }) => {
+                let word = if disabled { "Disabled" } else { "Enabled" };
+                print_async(format!(
+                    "{}{word} {}{owner}/{repo}",
+                    color::PINK,
+                    color::LIME,
+                ))
+                .await;
+                if disabled {
+                    run_unload_followup(owner, repo).await;
+                }
             }
-            let word = if disabled { "Disabled" } else { "Enabled" };
-            print_async(format!(
-                "{}{word} {}{owner}/{repo}",
-                color::PINK,
-                color::LIME,
-            ))
-            .await;
-            if disabled {
-                run_unload_followup(owner, repo).await;
+            Ok(SetDisabledOutcome::NoSub) => {
+                // /disable on an unsubscribed repo would create a sub only to
+                // immediately turn it off, which is pointless. /enable, on the
+                // other hand, reads as "I want this plugin on" - same intent as
+                // /update, so auto-subscribe + install with the default channel.
+                if disabled {
+                    print_not_added(&spec).await;
+                } else {
+                    auto_add_and_install(&spec, candidates, Channel::Stable).await;
+                }
             }
-            return;
         }
-
-        // /disable on an unsubscribed repo would create a sub only to
-        // immediately turn it off, which is pointless. /enable, on the
-        // other hand, reads as "I want this plugin on" - same intent as
-        // /update, so auto-subscribe + install with the default channel.
-        if disabled {
-            print_not_added(&spec).await;
-            return;
-        }
-        auto_add_and_install(&spec, candidates, Channel::Stable, &mut config).await;
     });
 }
 
@@ -767,52 +806,67 @@ fn handle_pause(spec: &str) {
     let spec = spec.to_string();
 
     async_manager::spawn(async move {
-        let mut config = match Config::load() {
-            Ok(c) => c,
-            Err(e) => {
-                print_load_error(&e).await;
-                return;
+        enum PauseOutcome {
+            NotAdded,
+            CannotPause {
+                owner: String,
+                repo: String,
+                error: String,
+            },
+            Paused {
+                owner: String,
+                repo: String,
+                pinned_tag: String,
+            },
+        }
+        let outcome = Config::modify_at(config_path(), |config| {
+            let Some((owner, repo, sub)) = find_subscription_mut(config, &candidates) else {
+                return PauseOutcome::NotAdded;
+            };
+            let target = match pause_target(sub) {
+                Ok(c) => c,
+                Err(error) => return PauseOutcome::CannotPause { owner, repo, error },
+            };
+            let pinned_tag = match &target {
+                Channel::Tag(t) => t.clone(),
+                _ => unreachable!("pause_target only returns Channel::Tag"),
+            };
+            apply_channel_switch(sub, target);
+            PauseOutcome::Paused {
+                owner,
+                repo,
+                pinned_tag,
             }
-        };
-
-        let Some((owner, repo, sub)) = find_subscription_mut(&mut config, &candidates) else {
-            print_not_added(&spec).await;
-            return;
-        };
-
-        let target = match pause_target(sub) {
-            Ok(c) => c,
-            Err(e) => {
+        });
+        match outcome {
+            Err(e) => print_save_error(&e).await,
+            Ok(PauseOutcome::NotAdded) => print_not_added(&spec).await,
+            Ok(PauseOutcome::CannotPause { owner, repo, error }) => {
                 print_async(format!(
-                    "{}Cannot pause {}{owner}/{repo}{}: {}{e}",
+                    "{}Cannot pause {}{owner}/{repo}{}: {}{error}",
                     color::YELLOW,
                     color::LIME,
                     color::YELLOW,
                     color::WHITE,
                 ))
                 .await;
-                return;
             }
-        };
-        let pinned_tag = match &target {
-            Channel::Tag(t) => t.clone(),
-            _ => unreachable!("pause_target only returns Channel::Tag"),
-        };
-        apply_channel_switch(sub, target);
-
-        if let Err(e) = config.save() {
-            print_save_error(&e).await;
-            return;
+            Ok(PauseOutcome::Paused {
+                owner,
+                repo,
+                pinned_tag,
+            }) => {
+                print_async(format!(
+                    "{}Paused {}{owner}/{repo} {}on tag {}{}",
+                    color::PINK,
+                    color::LIME,
+                    color::PINK,
+                    color::YELLOW,
+                    pinned_tag,
+                ))
+                .await;
+            }
         }
-        print_async(format!(
-            "{}Paused {}{owner}/{repo} {}on tag {}{}",
-            color::PINK,
-            color::LIME,
-            color::PINK,
-            color::YELLOW,
-            pinned_tag,
-        ))
-        .await;
     });
 }
 
@@ -824,48 +878,64 @@ fn handle_unpause(spec: &str) {
     let spec = spec.to_string();
 
     async_manager::spawn(async move {
-        let mut config = match Config::load() {
-            Ok(c) => c,
-            Err(e) => {
-                print_load_error(&e).await;
-                return;
+        enum UnpauseOutcome {
+            NotAdded,
+            NotPaused {
+                owner: String,
+                repo: String,
+                channel: Channel,
+            },
+            Resumed {
+                owner: String,
+                repo: String,
+            },
+        }
+        let outcome = Config::modify_at(config_path(), |config| {
+            let Some((owner, repo, sub)) = find_subscription_mut(config, &candidates) else {
+                return UnpauseOutcome::NotAdded;
+            };
+            if !matches!(sub.channel, Channel::Tag(_)) {
+                return UnpauseOutcome::NotPaused {
+                    owner,
+                    repo,
+                    channel: sub.channel.clone(),
+                };
             }
-        };
-
-        let Some((owner, repo, sub)) = find_subscription_mut(&mut config, &candidates) else {
-            print_not_added(&spec).await;
-            return;
-        };
-
-        if !matches!(sub.channel, Channel::Tag(_)) {
-            print_async(format!(
-                "{}{owner}/{repo} {}is not paused (channel: {}{}{})",
-                color::LIME,
-                color::YELLOW,
-                color::PINK,
-                sub.channel.pretty(),
-                color::YELLOW,
-            ))
-            .await;
-            return;
+            apply_channel_switch(sub, Channel::Stable);
+            UnpauseOutcome::Resumed { owner, repo }
+        });
+        match outcome {
+            Err(e) => print_save_error(&e).await,
+            Ok(UnpauseOutcome::NotAdded) => print_not_added(&spec).await,
+            Ok(UnpauseOutcome::NotPaused {
+                owner,
+                repo,
+                channel,
+            }) => {
+                print_async(format!(
+                    "{}{owner}/{repo} {}is not paused (channel: {}{}{})",
+                    color::LIME,
+                    color::YELLOW,
+                    color::PINK,
+                    channel.pretty(),
+                    color::YELLOW,
+                ))
+                .await;
+            }
+            Ok(UnpauseOutcome::Resumed { owner, repo }) => {
+                print_async(format!(
+                    "{}Resumed {}{owner}/{repo} {}on stable {}(use {}/client Manager channel{} to \
+                     switch to prerelease)",
+                    color::PINK,
+                    color::LIME,
+                    color::PINK,
+                    color::YELLOW,
+                    color::LIME,
+                    color::YELLOW,
+                ))
+                .await;
+            }
         }
-        apply_channel_switch(sub, Channel::Stable);
-
-        if let Err(e) = config.save() {
-            print_save_error(&e).await;
-            return;
-        }
-        print_async(format!(
-            "{}Resumed {}{owner}/{repo} {}on stable {}(use {}/client Manager channel{} to switch \
-             to prerelease)",
-            color::PINK,
-            color::LIME,
-            color::PINK,
-            color::YELLOW,
-            color::LIME,
-            color::YELLOW,
-        ))
-        .await;
     });
 }
 
@@ -921,7 +991,7 @@ fn handle_update_one(spec: &str) {
     let spec = spec.to_string();
 
     async_manager::spawn(async move {
-        let mut config = match Config::load() {
+        let config = match Config::load() {
             Ok(c) => c,
             Err(e) => {
                 print_load_error(&e).await;
@@ -948,8 +1018,9 @@ fn handle_update_one(spec: &str) {
             run_update_task(owner, repo, sub.channel.clone(), token).await;
             return;
         }
+        drop(config);
 
-        auto_add_and_install(&spec, candidates, Channel::Stable, &mut config).await;
+        auto_add_and_install(&spec, candidates, Channel::Stable).await;
     });
 }
 

@@ -54,12 +54,6 @@ description = "Held block info plugin."
 
 [[plugins]]
 owner = "SpiralP"
-repo = "classicube-map-saver-plugin"
-shorthand = "map-saver"
-description = "Map saver plugin."
-
-[[plugins]]
-owner = "SpiralP"
 repo = "classicube-anti-afk-plugin"
 shorthand = "anti-afk"
 description = "Anti afk plugin."

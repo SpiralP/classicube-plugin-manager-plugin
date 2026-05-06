@@ -7,12 +7,24 @@ use std::{
     io::{self, Write},
     path::Path,
     str::FromStr,
+    sync::{Mutex, PoisonError},
 };
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 
 use crate::secret::Secret;
+
+/// Process-wide lock around the load + mutate + save chain. Held for the
+/// entire body of [`Config::modify_at`] so concurrent writers from the
+/// main thread (breadcrumb writes wrapping each managed-plugin callback)
+/// and worker threads (the deferred update pass, chat-command handlers)
+/// can't interleave. Without this, a worker that loads stale state and
+/// saves later overwrites a main-thread write that landed in between -
+/// the symptom is a stale `in_callback` breadcrumb that survives a clean
+/// session and triggers a false-positive `crashed inside ...` warning on
+/// the next boot.
+static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 
 const CONFIG_PATH: &str = "plugins/plugin-manager.toml";
 
@@ -67,10 +79,7 @@ pub(crate) fn migrate_legacy_config_at(legacy: &Path, current: &Path) -> Result<
     }
     fs::rename(legacy, current)
         .with_context(|| format!("renaming {} -> {}", legacy.display(), current.display()))?;
-    let mut cfg = Config::load_from(current)?;
-    if rewrite_legacy_self_key(&mut cfg) {
-        cfg.save_to(current)?;
-    }
+    Config::modify_at(current, rewrite_legacy_self_key)?;
     Ok(())
 }
 
@@ -291,10 +300,6 @@ impl Config {
         Self::load_from(config_path())
     }
 
-    pub fn save(&self) -> Result<()> {
-        self.save_to(config_path())
-    }
-
     pub fn load_from(path: &Path) -> Result<Self> {
         match fs::read_to_string(path) {
             Ok(contents) => {
@@ -309,10 +314,32 @@ impl Config {
         }
     }
 
-    /// Serialize and write the config, then `fsync` so the bytes are durable
-    /// before we return. The crash-recovery breadcrumb relies on writes
-    /// surviving an immediately-following process death; `fs::write` alone
-    /// only hands the data to the kernel.
+    /// Atomically load + mutate + save the config at `path`. Acquires
+    /// [`CONFIG_LOCK`] for the entire chain so concurrent modifications
+    /// can't lose updates to each other. The closure runs synchronously
+    /// on the calling thread; it must NOT block on async I/O or wait on
+    /// other [`Config::modify_at`] callers (would deadlock).
+    ///
+    /// Always saves, even if `f` made no changes. The cost is one fsync;
+    /// the win is that callers don't need a "did anything change?" return
+    /// from the closure, and the lock is held for a uniform duration.
+    pub fn modify_at<F, R>(path: &Path, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Self) -> R,
+    {
+        let _guard = CONFIG_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut cfg = Self::load_from(path)?;
+        let r = f(&mut cfg);
+        cfg.save_to(path)?;
+        Ok(r)
+    }
+
+    /// Serialize and write the config via a `<path>.tmp` -> rename dance,
+    /// then `fsync` the parent directory so the rename itself is durable.
+    /// The atomic rename means concurrent readers always see either the
+    /// old or the new file - never a truncated mid-state. The crash-recovery
+    /// breadcrumb relies on writes surviving an immediately-following
+    /// process death; the tmp file is fsynced before the rename.
     ///
     /// The output is split into two regions: every `[owner.repo]` table comes
     /// first, then a single `STATE_DIVIDER` comment, then every
@@ -351,16 +378,39 @@ impl Config {
             out.push_str(&toml::to_string_pretty(&state_map).context("serializing state view")?);
         }
 
+        let tmp_path = match path.file_name() {
+            Some(name) => {
+                let mut tmp_name = name.to_owned();
+                tmp_name.push(".tmp");
+                path.with_file_name(tmp_name)
+            }
+            None => bail!("config path has no file name: {}", path.display()),
+        };
+
         let mut f = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(path)
-            .with_context(|| format!("opening {}", path.display()))?;
+            .open(&tmp_path)
+            .with_context(|| format!("opening {}", tmp_path.display()))?;
         f.write_all(out.as_bytes())
-            .with_context(|| format!("writing {}", path.display()))?;
+            .with_context(|| format!("writing {}", tmp_path.display()))?;
         f.sync_all()
-            .with_context(|| format!("fsync {}", path.display()))?;
+            .with_context(|| format!("fsync {}", tmp_path.display()))?;
+        drop(f);
+
+        fs::rename(&tmp_path, path)
+            .with_context(|| format!("renaming {} -> {}", tmp_path.display(), path.display()))?;
+
+        // Best-effort parent-dir fsync so the rename itself survives power
+        // loss on filesystems that need it (ext4, xfs). The rename was
+        // already visible; failure here is non-fatal.
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && let Ok(dir) = fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
 
@@ -398,16 +448,15 @@ pub fn set_in_callback_to(
     repo: &str,
     value: Option<String>,
 ) -> Result<()> {
-    let mut cfg = Config::load_from(path)?;
-    if let Some(sub) = cfg
-        .subscriptions
-        .get_mut(owner)
-        .and_then(|m| m.get_mut(repo))
-    {
-        sub.state.in_callback = value;
-        cfg.save_to(path)?;
-    }
-    Ok(())
+    Config::modify_at(path, |cfg| {
+        if let Some(sub) = cfg
+            .subscriptions
+            .get_mut(owner)
+            .and_then(|m| m.get_mut(repo))
+        {
+            sub.state.in_callback = value;
+        }
+    })
 }
 
 fn validate_segment(kind: &str, s: &str) -> Result<()> {

@@ -406,19 +406,14 @@ async fn run_initial_pass() -> Result<()> {
 }
 
 async fn ensure_self_subscription() {
-    let mut cfg = match Config::load() {
-        Ok(c) => c,
+    let added = match Config::modify_at(config_path(), Config::ensure_self) {
+        Ok(added) => added,
         Err(e) => {
-            warn!("loading config to ensure self subscription: {e:#}");
+            warn!("ensuring self subscription: {e:#}");
             return;
         }
     };
-    if !cfg.ensure_self() {
-        return;
-    }
-    if let Err(e) = cfg.save() {
-        warn!("saving config after ensure_self: {e:#}");
-    } else {
+    if added {
         debug!("auto-added self subscription to config");
     }
 }
@@ -568,21 +563,21 @@ fn persist_cache_updates_to(
     now: u64,
     updates: Vec<(String, String, String, u64)>,
 ) -> Result<()> {
-    // Re-read so we don't clobber concurrent /add edits made on the
-    // game thread while HTTP was in flight.
-    let mut fresh = Config::load_from(path)?;
-    for (owner, repo, tag, published_at) in updates {
-        if let Some(sub) = fresh
-            .subscriptions
-            .get_mut(&owner)
-            .and_then(|m| m.get_mut(&repo))
-        {
-            sub.state.cached_tag = Some(tag);
-            sub.state.cached_at = Some(now);
-            sub.state.cached_published_at = Some(published_at);
+    // modify_at takes the process-wide CONFIG_LOCK and re-reads inside it,
+    // so concurrent breadcrumb writes on the main thread can't be lost.
+    Config::modify_at(path, |fresh| {
+        for (owner, repo, tag, published_at) in updates {
+            if let Some(sub) = fresh
+                .subscriptions
+                .get_mut(&owner)
+                .and_then(|m| m.get_mut(&repo))
+            {
+                sub.state.cached_tag = Some(tag);
+                sub.state.cached_at = Some(now);
+                sub.state.cached_published_at = Some(published_at);
+            }
         }
-    }
-    fresh.save_to(path)
+    })
 }
 
 // Tuple shape: (owner, repo, version, asset_filename, published_at).
@@ -598,24 +593,24 @@ pub fn persist_installed_versions_to(
     now: u64,
     updates: Vec<(String, String, String, String, u64)>,
 ) -> Result<()> {
-    let mut fresh = Config::load_from(path)?;
-    for (owner, repo, version, asset, published_at) in updates {
-        if let Some(sub) = fresh
-            .subscriptions
-            .get_mut(&owner)
-            .and_then(|m| m.get_mut(&repo))
-        {
-            sub.state.installed_version = Some(version.clone());
-            sub.state.installed_asset = Some(asset);
-            sub.state.installed_at = Some(published_at);
-            // Installing the version means whatever we just stored *is* the
-            // up-to-date cached tag from the user's perspective.
-            sub.state.cached_tag = Some(version);
-            sub.state.cached_at = Some(now);
-            sub.state.cached_published_at = Some(published_at);
+    Config::modify_at(path, |fresh| {
+        for (owner, repo, version, asset, published_at) in updates {
+            if let Some(sub) = fresh
+                .subscriptions
+                .get_mut(&owner)
+                .and_then(|m| m.get_mut(&repo))
+            {
+                sub.state.installed_version = Some(version.clone());
+                sub.state.installed_asset = Some(asset);
+                sub.state.installed_at = Some(published_at);
+                // Installing the version means whatever we just stored *is*
+                // the up-to-date cached tag from the user's perspective.
+                sub.state.cached_tag = Some(version);
+                sub.state.cached_at = Some(now);
+                sub.state.cached_published_at = Some(published_at);
+            }
         }
-    }
-    fresh.save_to(path)
+    })
 }
 
 fn unix_now() -> u64 {
