@@ -46,7 +46,6 @@ impl Component for Manager {
         if let Err(e) = config::migrate_legacy_config() {
             warn!("legacy config migration failed: {e:#}");
         }
-        crate::self_path::rename_legacy_self_binary();
     }
 
     fn on_new_map_loaded(&mut self) {
