@@ -56,9 +56,27 @@ thread_local!(
     static LOADED: RefCell<Vec<LoadedPlugin>> = const { RefCell::new(Vec::new()) };
 );
 
-pub fn init_managed(subs: &[(String, String, Subscription)]) {
+/// Which lifecycle callbacks to invoke after a successful `dlopen` + `Init`.
+///
+/// `Startup` is the host-`Init` path (`Loader::init`): the host hasn't yet
+/// dispatched `OnNewMap` / `OnNewMapLoaded`, so we ONLY call the managed
+/// plugin's `Init`. The Loader component's existing `on_new_map` /
+/// `on_new_map_loaded` forwarders deliver those events when the host fires
+/// them for real.
+///
+/// `Catchup` is for mid-session loads (deferred update pass, `/load`,
+/// post-`/update` reload): the host has already fired `Init`, `OnNewMap`,
+/// and at least one `OnNewMapLoaded` against an empty `LOADED`, so we
+/// fire all three on the new entry to bring it in sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecyclePhase {
+    Startup,
+    Catchup,
+}
+
+pub fn init_managed(subs: &[(String, String, Subscription)], phase: LifecyclePhase) {
     for (owner, repo, sub) in subs {
-        let outcome = load_one(owner, repo, sub);
+        let outcome = load_one(owner, repo, sub, phase);
         report_init_outcome(owner, repo, &outcome);
     }
 }
@@ -126,7 +144,7 @@ fn classify_early(owner: &str, repo: &str, sub: &Subscription) -> Option<LoadOut
 /// the dlopen so a crash in the loaded library leaves a visible trail; the
 /// returned `LoadOutcome` is the caller's hook for outcome chat
 /// (`report_init_outcome` for auto-load, custom mapping for `/load`).
-pub fn load_one(owner: &str, repo: &str, sub: &Subscription) -> LoadOutcome {
+pub fn load_one(owner: &str, repo: &str, sub: &Subscription, phase: LifecyclePhase) -> LoadOutcome {
     if let Some(o) = classify_early(owner, repo, sub) {
         return o;
     }
@@ -183,7 +201,7 @@ pub fn load_one(owner: &str, repo: &str, sub: &Subscription) -> LoadOutcome {
                 });
             });
             debug!("loaded {id} from {path_str}");
-            run_init_sequence(component, owner, repo);
+            run_init_sequence(component, owner, repo, phase);
             LoadOutcome::Loaded
         }
         ApiVersionCheck::PluginOutdated => LoadOutcome::PluginOutdated {
@@ -314,20 +332,42 @@ fn check_api_version(host: c_int, plugin: c_int) -> ApiVersionCheck {
     }
 }
 
-fn run_init_sequence(component: *mut IGameComponent, owner: &str, repo: &str) {
+fn run_init_sequence(
+    component: *mut IGameComponent,
+    owner: &str,
+    repo: &str,
+    phase: LifecyclePhase,
+) {
+    run_init_sequence_at(config_path(), component, owner, repo, phase);
+}
+
+fn run_init_sequence_at(
+    path: &Path,
+    component: *mut IGameComponent,
+    owner: &str,
+    repo: &str,
+    phase: LifecyclePhase,
+) {
     let id = format!("{owner}/{repo}");
     let component = unsafe { &mut *component };
     if let Some(f) = component.Init {
         debug!("calling Init on {id}");
-        with_breadcrumb(owner, repo, "Init", || unsafe { f() });
+        with_breadcrumb_at(path, owner, repo, "Init", || unsafe { f() });
+    }
+    // Startup runs from the host's own Init callback - the host has NOT yet
+    // dispatched OnNewMap or OnNewMapLoaded, so we must not pre-fire them.
+    // The Loader component's on_new_map / on_new_map_loaded forwarders will
+    // deliver those when the host fires them for real.
+    if phase == LifecyclePhase::Startup {
+        return;
     }
     if let Some(f) = component.OnNewMap {
         debug!("calling OnNewMap on {id}");
-        with_breadcrumb(owner, repo, "OnNewMap", || unsafe { f() });
+        with_breadcrumb_at(path, owner, repo, "OnNewMap", || unsafe { f() });
     }
     if let Some(f) = component.OnNewMapLoaded {
         debug!("calling OnNewMapLoaded on {id}");
-        with_breadcrumb(owner, repo, "OnNewMapLoaded", || unsafe { f() });
+        with_breadcrumb_at(path, owner, repo, "OnNewMapLoaded", || unsafe { f() });
     }
 }
 

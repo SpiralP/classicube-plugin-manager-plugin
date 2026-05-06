@@ -22,7 +22,7 @@ use crate::{
         self, MANAGED_DIR, PLUGINS_DIR, cleanup_self_old, download_self, download_to_managed_dir,
         mark_previous_self_aside,
     },
-    loader::init_managed,
+    loader::{LifecyclePhase, init_managed},
     reconcile::{self, ConflictDir},
     secret::Secret,
     self_path::current_lib_path,
@@ -102,7 +102,12 @@ impl Component for Manager {
                 })
                 .collect();
             async_manager::run_on_main_thread(async move {
-                init_managed(&subs);
+                // Catchup phase: subs already loaded at host-Init time return
+                // AlreadyLoaded and are silently skipped. Subs the deferred
+                // pass freshly installed get Init + OnNewMap + OnNewMapLoaded
+                // since the host already dispatched those against an empty
+                // LOADED before this future ran.
+                init_managed(&subs, LifecyclePhase::Catchup);
             })
             .await;
         });

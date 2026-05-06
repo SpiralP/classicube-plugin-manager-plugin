@@ -1,10 +1,18 @@
-use std::{collections::BTreeMap, fs, panic};
+use std::{
+    collections::BTreeMap,
+    fs, panic, ptr,
+    sync::{
+        Mutex,
+        atomic::{AtomicU32, Ordering},
+    },
+};
 
+use classicube_sys::IGameComponent;
 use tempfile::{NamedTempFile, tempdir};
 
 use super::{
-    ApiVersionCheck, LoadOutcome, check_api_version, classify_early, detect_plugins_dir_conflict,
-    with_breadcrumb_at,
+    ApiVersionCheck, LifecyclePhase, LoadOutcome, check_api_version, classify_early,
+    detect_plugins_dir_conflict, run_init_sequence_at, with_breadcrumb_at,
 };
 use crate::config::{self, Config, Subscription};
 
@@ -268,4 +276,95 @@ fn classify_early_normal_sub_returns_none() {
     // Falls through to the FFI/LOADED/filesystem checks in the full load_one.
     let sub = Subscription::default();
     assert!(classify_early("octocat", "hello-world", &sub).is_none());
+}
+
+// run_init_sequence dispatch tests. The "real Init must only call Init"
+// invariant is the entire point of LifecyclePhase::Startup - if a future
+// refactor reintroduces the OnNewMap / OnNewMapLoaded calls in the Startup
+// branch, managed plugins would see those events fired twice (once early,
+// once when the Loader component forwards the host's real dispatch). These
+// tests are the regression guard.
+
+// Single mutex serializes the two callback-counter tests below so they
+// can coexist under `cargo test` (nextest already process-isolates, but
+// this keeps the tests safe under either runner).
+static CALLBACK_TEST_LOCK: Mutex<()> = Mutex::new(());
+static INIT_CALLS: AtomicU32 = AtomicU32::new(0);
+static ON_NEW_MAP_CALLS: AtomicU32 = AtomicU32::new(0);
+static ON_NEW_MAP_LOADED_CALLS: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn fake_init() {
+    INIT_CALLS.fetch_add(1, Ordering::SeqCst);
+}
+extern "C" fn fake_on_new_map() {
+    ON_NEW_MAP_CALLS.fetch_add(1, Ordering::SeqCst);
+}
+extern "C" fn fake_on_new_map_loaded() {
+    ON_NEW_MAP_LOADED_CALLS.fetch_add(1, Ordering::SeqCst);
+}
+
+fn make_fake_component() -> IGameComponent {
+    IGameComponent {
+        Init: Some(fake_init),
+        Free: None,
+        Reset: None,
+        OnNewMap: Some(fake_on_new_map),
+        OnNewMapLoaded: Some(fake_on_new_map_loaded),
+        next: ptr::null_mut(),
+    }
+}
+
+fn reset_counters() {
+    INIT_CALLS.store(0, Ordering::SeqCst);
+    ON_NEW_MAP_CALLS.store(0, Ordering::SeqCst);
+    ON_NEW_MAP_LOADED_CALLS.store(0, Ordering::SeqCst);
+}
+
+#[test]
+fn startup_phase_only_fires_init() {
+    // Hard rule from the "init managed on manager Init" change: the host's
+    // own Init callback must NOT pre-fire OnNewMap or OnNewMapLoaded. The
+    // Loader component's forwarders deliver those when the host dispatches
+    // them for real.
+    let _guard = CALLBACK_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let f = NamedTempFile::new().unwrap();
+    config_with_one_sub(f.path(), "octocat", "hello-world");
+    reset_counters();
+
+    let mut component = make_fake_component();
+    run_init_sequence_at(
+        f.path(),
+        &mut component,
+        "octocat",
+        "hello-world",
+        LifecyclePhase::Startup,
+    );
+
+    assert_eq!(INIT_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(ON_NEW_MAP_CALLS.load(Ordering::SeqCst), 0);
+    assert_eq!(ON_NEW_MAP_LOADED_CALLS.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn catchup_phase_fires_all_three_callbacks() {
+    // Mid-session loads (deferred update pass, /load) need full catchup
+    // because the host has already dispatched OnNewMap / first
+    // OnNewMapLoaded against an empty LOADED before we got here.
+    let _guard = CALLBACK_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let f = NamedTempFile::new().unwrap();
+    config_with_one_sub(f.path(), "octocat", "hello-world");
+    reset_counters();
+
+    let mut component = make_fake_component();
+    run_init_sequence_at(
+        f.path(),
+        &mut component,
+        "octocat",
+        "hello-world",
+        LifecyclePhase::Catchup,
+    );
+
+    assert_eq!(INIT_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(ON_NEW_MAP_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(ON_NEW_MAP_LOADED_CALLS.load(Ordering::SeqCst), 1);
 }

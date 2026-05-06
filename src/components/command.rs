@@ -30,7 +30,7 @@ use crate::{
         self, MANAGED_DIR, PLUGINS_DIR, cleanup_previous_managed, download_self,
         download_to_managed_dir, mark_previous_self_aside,
     },
-    loader::{self, LoadOutcome, UnloadOutcome},
+    loader::{self, LifecyclePhase, LoadOutcome, UnloadOutcome},
     reconcile,
     secret::Secret,
     self_path::current_lib_path,
@@ -1341,7 +1341,7 @@ async fn run_update_with_release(
             if loader::is_loaded(&owner_s, &repo_s) {
                 loader::unload_one(&owner_s, &repo_s);
             }
-            let outcome = loader::load_one(&owner_s, &repo_s, &sub);
+            let outcome = loader::load_one(&owner_s, &repo_s, &sub, LifecyclePhase::Catchup);
             chat_post_update_load_outcome(&id, &outcome);
         })
         .await;
@@ -1478,7 +1478,7 @@ fn handle_load(spec: &str) {
 
         async_manager::run_on_main_thread(async move {
             let id = format!("{}/{}", owner, repo);
-            let outcome = loader::load_one(&owner, &repo, &sub);
+            let outcome = loader::load_one(&owner, &repo, &sub, LifecyclePhase::Catchup);
             match outcome {
                 LoadOutcome::Loaded => {}
                 LoadOutcome::Disabled => print_wrapped(format!(
