@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs, panic, ptr,
     sync::{
         Mutex,
@@ -11,10 +11,11 @@ use classicube_sys::IGameComponent;
 use tempfile::{NamedTempFile, tempdir};
 
 use super::{
-    ApiVersionCheck, LifecyclePhase, LoadOutcome, check_api_version, classify_early,
-    detect_plugins_dir_conflict, run_init_sequence_at, with_breadcrumb_at,
+    ApiVersionCheck, LifecyclePhase, LoadOutcome, SKIPPED_CARRYOVER, check_api_version,
+    classify_carryover_at, classify_early, clear_carryover_skip, detect_plugins_dir_conflict,
+    run_init_sequence_at, with_breadcrumb_at,
 };
-use crate::config::{self, Config, Subscription};
+use crate::config::{self, Config, Subscription, SubscriptionState};
 
 #[test]
 fn missing_dir_returns_none() {
@@ -367,4 +368,187 @@ fn catchup_phase_fires_all_three_callbacks() {
     assert_eq!(INIT_CALLS.load(Ordering::SeqCst), 1);
     assert_eq!(ON_NEW_MAP_CALLS.load(Ordering::SeqCst), 1);
     assert_eq!(ON_NEW_MAP_LOADED_CALLS.load(Ordering::SeqCst), 1);
+}
+
+// classify_carryover_at tests. SKIPPED_CARRYOVER is a thread_local set that
+// the production code populates from Startup and consults from later phases;
+// tests run on the same test thread, so we serialize on a Mutex AND drain
+// the set up front for a clean baseline. The set is private to loader::mod
+// — accessed here via super::SKIPPED_CARRYOVER for test-only inspection.
+
+static CARRYOVER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn reset_carryover_state() {
+    SKIPPED_CARRYOVER.with_borrow_mut(HashSet::clear);
+}
+
+fn carryover_contains(owner: &str, repo: &str) -> bool {
+    SKIPPED_CARRYOVER.with_borrow(|s| s.contains(&(owner.to_owned(), repo.to_owned())))
+}
+
+fn config_with_breadcrumb(path: &std::path::Path, owner: &str, repo: &str, callback: &str) {
+    let mut repos = BTreeMap::new();
+    repos.insert(
+        repo.into(),
+        Subscription {
+            state: SubscriptionState {
+                in_callback: Some(callback.into()),
+                ..SubscriptionState::default()
+            },
+            ..Subscription::default()
+        },
+    );
+    let mut subscriptions = BTreeMap::new();
+    subscriptions.insert(owner.into(), repos);
+    Config { subscriptions }.save_to(path).unwrap();
+}
+
+fn load_sub(path: &std::path::Path, owner: &str, repo: &str) -> Subscription {
+    Config::load_from(path)
+        .unwrap()
+        .subscriptions
+        .remove(owner)
+        .and_then(|mut m| m.remove(repo))
+        .expect("sub present")
+}
+
+#[test]
+fn startup_phase_records_carryover_and_clears_disk() {
+    // Real carry-over from a previous-session crash: Startup must mark the
+    // sub in SKIPPED_CARRYOVER (so Catchup respects the skip) AND clear the
+    // disk breadcrumb (so the *next* session can auto-retry rather than
+    // staying stuck forever).
+    let _guard = CARRYOVER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    reset_carryover_state();
+    let f = NamedTempFile::new().unwrap();
+    config_with_breadcrumb(f.path(), "octocat", "hello-world", "OnNewMapLoaded");
+    let sub = load_sub(f.path(), "octocat", "hello-world");
+
+    let outcome = classify_carryover_at(
+        f.path(),
+        "octocat",
+        "hello-world",
+        &sub,
+        LifecyclePhase::Startup,
+    );
+
+    assert!(matches!(
+        outcome,
+        Some(LoadOutcome::CrashCarryover { ref previous }) if previous == "OnNewMapLoaded"
+    ));
+    assert!(carryover_contains("octocat", "hello-world"));
+    assert!(read_in_callback(f.path(), "octocat", "hello-world").is_none());
+}
+
+#[test]
+fn catchup_phase_does_not_read_disk_breadcrumb() {
+    // The race regression guard: a worker-thread Config::load() can land
+    // mid-flicker and snapshot in_callback=Some. Catchup must NOT treat
+    // that as a carry-over — the disk breadcrumb is only the source of
+    // truth at Startup.
+    let _guard = CARRYOVER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    reset_carryover_state();
+    let f = NamedTempFile::new().unwrap();
+    config_with_breadcrumb(f.path(), "octocat", "hello-world", "OnNewMapLoaded");
+    let sub = load_sub(f.path(), "octocat", "hello-world");
+
+    let outcome = classify_carryover_at(
+        f.path(),
+        "octocat",
+        "hello-world",
+        &sub,
+        LifecyclePhase::Catchup,
+    );
+
+    assert!(outcome.is_none(), "Catchup must fall through");
+    assert!(!carryover_contains("octocat", "hello-world"));
+    assert_eq!(
+        read_in_callback(f.path(), "octocat", "hello-world").as_deref(),
+        Some("OnNewMapLoaded"),
+        "disk breadcrumb must be left alone on Catchup",
+    );
+}
+
+#[test]
+fn catchup_phase_respects_skipped_carryover_set() {
+    // Startup-decision-preserved-into-Catchup: once Startup recorded the
+    // skip (via real carry-over OR a hand-populated set in this test),
+    // later phases short-circuit to SkippedFromCarryover regardless of
+    // what the disk breadcrumb says.
+    let _guard = CARRYOVER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    reset_carryover_state();
+    SKIPPED_CARRYOVER.with_borrow_mut(|s| {
+        s.insert(("octocat".into(), "hello-world".into()));
+    });
+    let f = NamedTempFile::new().unwrap();
+    config_with_one_sub(f.path(), "octocat", "hello-world");
+    let sub = load_sub(f.path(), "octocat", "hello-world");
+
+    let outcome = classify_carryover_at(
+        f.path(),
+        "octocat",
+        "hello-world",
+        &sub,
+        LifecyclePhase::Catchup,
+    );
+
+    assert!(matches!(outcome, Some(LoadOutcome::SkippedFromCarryover)));
+}
+
+#[test]
+fn clear_carryover_skip_allows_subsequent_attempt() {
+    // Explicit-retry path (`/load`, post-`/update` reload): clearing the
+    // skip must let the next classify_carryover_at fall through.
+    let _guard = CARRYOVER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    reset_carryover_state();
+    SKIPPED_CARRYOVER.with_borrow_mut(|s| {
+        s.insert(("octocat".into(), "hello-world".into()));
+    });
+    clear_carryover_skip("octocat", "hello-world");
+    assert!(!carryover_contains("octocat", "hello-world"));
+
+    let f = NamedTempFile::new().unwrap();
+    config_with_one_sub(f.path(), "octocat", "hello-world");
+    let sub = load_sub(f.path(), "octocat", "hello-world");
+    let outcome = classify_carryover_at(
+        f.path(),
+        "octocat",
+        "hello-world",
+        &sub,
+        LifecyclePhase::Catchup,
+    );
+    assert!(outcome.is_none());
+}
+
+#[test]
+fn startup_phase_falls_through_when_no_breadcrumb() {
+    // Common path on a clean previous session: no disk breadcrumb, no
+    // entry in SKIPPED_CARRYOVER → classify returns None and load_one
+    // proceeds to dlopen.
+    let _guard = CARRYOVER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    reset_carryover_state();
+    let f = NamedTempFile::new().unwrap();
+    config_with_one_sub(f.path(), "octocat", "hello-world");
+    let sub = load_sub(f.path(), "octocat", "hello-world");
+
+    let outcome = classify_carryover_at(
+        f.path(),
+        "octocat",
+        "hello-world",
+        &sub,
+        LifecyclePhase::Startup,
+    );
+
+    assert!(outcome.is_none());
+    assert!(!carryover_contains("octocat", "hello-world"));
 }

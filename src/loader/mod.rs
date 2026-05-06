@@ -5,6 +5,7 @@ mod tests;
 
 use std::{
     cell::RefCell,
+    collections::HashSet,
     env, fs, io,
     os::raw::{c_int, c_void},
     path::{Path, PathBuf},
@@ -56,6 +57,19 @@ thread_local!(
     static LOADED: RefCell<Vec<LoadedPlugin>> = const { RefCell::new(Vec::new()) };
 );
 
+// Subs that the Startup carry-over check decided to skip this session.
+// The disk `in_callback` breadcrumb is the source of truth ONLY at Startup,
+// before any callback has fired and started flickering it on/off; after
+// that, a worker-thread `Config::load()` from the deferred update pass can
+// land mid-`with_breadcrumb_at` and see a transient `Some` that has nothing
+// to do with last session's crash. So we read the disk breadcrumb only at
+// Startup, copy "skip this sub" into this set, and have all later phases
+// (Catchup, the deferred pass's auto-load) consult the set instead. Tests
+// rely on the loader running on the test thread, hence `thread_local!`.
+thread_local!(
+    static SKIPPED_CARRYOVER: RefCell<HashSet<(String, String)>> = RefCell::default();
+);
+
 /// Which lifecycle callbacks to invoke after a successful `dlopen` + `Init`.
 ///
 /// `Startup` is the host-`Init` path (`Loader::init`): the host hasn't yet
@@ -92,10 +106,19 @@ pub enum LoadOutcome {
     Disabled,
     /// `(owner, repo)` is the manager itself - the game already owns its handle.
     IsSelf,
-    /// Previous session left an `in_callback` breadcrumb on this sub. The
-    /// breadcrumb has been cleared on disk so the next `/load` (or next
-    /// startup) can try again; the carry-over name is returned for chat.
+    /// Previous session left an `in_callback` breadcrumb on this sub, just
+    /// detected by the Startup pass. The disk breadcrumb is cleared so the
+    /// next session can auto-retry, and the sub is recorded in
+    /// `SKIPPED_CARRYOVER` so any subsequent auto-load attempt this session
+    /// (e.g. the deferred pass's Catchup) returns `SkippedFromCarryover`
+    /// without re-chatting. The carry-over name is returned for chat.
     CrashCarryover { previous: String },
+    /// Startup already detected and chatted a carry-over for this sub; a
+    /// later auto-load attempt is honoring that decision silently. The
+    /// caller does NOT chat. Explicit user-driven retry paths (`/load`,
+    /// post-`/update` reload) clear the entry first via
+    /// `clear_carryover_skip` and so never see this variant.
+    SkippedFromCarryover,
     /// `sub.state.installed_asset` is None - nothing to dlopen yet.
     NotInstalled,
     /// An entry for `(owner, repo)` was already in `LOADED`.
@@ -138,6 +161,62 @@ fn classify_early(owner: &str, repo: &str, sub: &Subscription) -> Option<LoadOut
     None
 }
 
+/// Carry-over classification, split out of `load_one` so tests can drive it
+/// against a temp config without pulling `plugin::try_load` symbols into the
+/// test link graph. Returns `Some(_)` when load should short-circuit.
+///
+/// Two ways to short-circuit:
+/// 1. `SKIPPED_CARRYOVER` already contains `(owner, repo)` (any phase) -
+///    Startup detected a carry-over earlier this session. Returns
+///    `SkippedFromCarryover` (silent).
+/// 2. `phase == Startup` and `sub.state.in_callback` is `Some(_)` on disk -
+///    last session crashed. Records the sub in `SKIPPED_CARRYOVER`, clears
+///    the disk breadcrumb (so next session auto-retries), returns
+///    `CrashCarryover { previous }`.
+///
+/// Catchup intentionally does NOT read the disk breadcrumb: at that point
+/// the host is firing managed-plugin callbacks on the main thread and
+/// `with_breadcrumb_at` is flickering `in_callback` on/off; a worker-thread
+/// `Config::load()` can land between the set and clear and produce a
+/// false-positive carry-over.
+fn classify_carryover_at(
+    path: &Path,
+    owner: &str,
+    repo: &str,
+    sub: &Subscription,
+    phase: LifecyclePhase,
+) -> Option<LoadOutcome> {
+    let key = (owner.to_owned(), repo.to_owned());
+    if SKIPPED_CARRYOVER.with_borrow(|s| s.contains(&key)) {
+        return Some(LoadOutcome::SkippedFromCarryover);
+    }
+    if phase == LifecyclePhase::Startup
+        && let Some(prev) = sub.state.in_callback.as_deref()
+    {
+        let previous = prev.to_owned();
+        SKIPPED_CARRYOVER.with_borrow_mut(|s| {
+            s.insert(key);
+        });
+        if let Err(e) = config::set_in_callback_to(path, owner, repo, None) {
+            warn!("clearing carry-over breadcrumb for {owner}/{repo}: {e:#}");
+        }
+        return Some(LoadOutcome::CrashCarryover { previous });
+    }
+    None
+}
+
+/// Drop `(owner, repo)` from the in-process carry-over skip set so a
+/// subsequent `load_one` can attempt the dlopen even if the Startup pass
+/// previously declared this sub crashed-this-session. Used by explicit
+/// user-driven retry paths (`/load`, post-`/update` reload). The deferred
+/// update pass's auto-load does NOT call this - Startup-skipped subs stay
+/// skipped until the user opts in via one of those commands.
+pub fn clear_carryover_skip(owner: &str, repo: &str) {
+    SKIPPED_CARRYOVER.with_borrow_mut(|s| {
+        s.remove(&(owner.to_owned(), repo.to_owned()));
+    });
+}
+
 /// Load one subscription's managed binary into the running process, mirroring
 /// what `init_managed` does at startup. Mutates `LOADED` and (for the
 /// carry-over case) the on-disk config. Chats "Loading {id}" right before
@@ -148,17 +227,10 @@ pub fn load_one(owner: &str, repo: &str, sub: &Subscription, phase: LifecyclePha
     if let Some(o) = classify_early(owner, repo, sub) {
         return o;
     }
-    let id = format!("{owner}/{repo}");
-    if let Some(prev) = sub.state.in_callback.as_deref() {
-        // Last session's breadcrumb survived. Treat it as "this sub crashed
-        // inside `prev` last run". Clear the breadcrumb on disk so retries
-        // aren't blocked forever, then return the carry-over name for chat.
-        let previous = prev.to_owned();
-        if let Err(e) = config::set_in_callback_to(config_path(), owner, repo, None) {
-            warn!("clearing carry-over breadcrumb for {id}: {e:#}");
-        }
-        return LoadOutcome::CrashCarryover { previous };
+    if let Some(o) = classify_carryover_at(config_path(), owner, repo, sub, phase) {
+        return o;
     }
+    let id = format!("{owner}/{repo}");
     let Some(asset) = sub.state.installed_asset.as_deref() else {
         return LoadOutcome::NotInstalled;
     };
@@ -263,7 +335,8 @@ fn report_init_outcome(owner: &str, repo: &str, outcome: &LoadOutcome) {
         | LoadOutcome::Disabled
         | LoadOutcome::IsSelf
         | LoadOutcome::NotInstalled
-        | LoadOutcome::AlreadyLoaded => {}
+        | LoadOutcome::AlreadyLoaded
+        | LoadOutcome::SkippedFromCarryover => {}
         LoadOutcome::CrashCarryover { previous } => {
             warn!("{id} crashed inside {previous} last session; skipping this run");
             print_wrapped(format!(

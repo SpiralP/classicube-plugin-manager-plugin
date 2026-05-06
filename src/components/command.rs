@@ -1412,6 +1412,10 @@ async fn run_update_with_release(
             if loader::is_loaded(&owner_s, &repo_s) {
                 loader::unload_one(&owner_s, &repo_s);
             }
+            // The user just got a fresh binary; honor "load it now" intent
+            // and drop any session-skip flag the Startup pass set for this
+            // sub so the dlopen actually happens.
+            loader::clear_carryover_skip(&owner_s, &repo_s);
             let outcome = loader::load_one(&owner_s, &repo_s, &sub, LifecyclePhase::Catchup);
             chat_post_update_load_outcome(&id, &outcome);
         })
@@ -1431,10 +1435,13 @@ fn chat_post_update_load_outcome(id: &str, outcome: &LoadOutcome) {
         LoadOutcome::Disabled
         | LoadOutcome::IsSelf
         | LoadOutcome::NotInstalled
-        | LoadOutcome::AlreadyLoaded => {
+        | LoadOutcome::AlreadyLoaded
+        | LoadOutcome::SkippedFromCarryover => {
             // Disabled: user opted out; don't auto-load. IsSelf: never reached
             // (caller skips the swap for self). NotInstalled / AlreadyLoaded:
             // shouldn't happen post-install; stay silent.
+            // SkippedFromCarryover: caller cleared the skip set before the
+            // load_one call, so this is unreachable; stay silent.
         }
         LoadOutcome::CrashCarryover { previous } => print_wrapped(format!(
             "{}{id} crashed inside {}{previous}{} last session; cleared the breadcrumb. Try again.",
@@ -1549,6 +1556,9 @@ fn handle_load(spec: &str) {
 
         async_manager::run_on_main_thread(async move {
             let id = format!("{}/{}", owner, repo);
+            // /load is the explicit-retry path: drop any session-skip flag
+            // Startup set so the dlopen actually happens.
+            loader::clear_carryover_skip(&owner, &repo);
             let outcome = loader::load_one(&owner, &repo, &sub, LifecyclePhase::Catchup);
             match outcome {
                 LoadOutcome::Loaded => {}
@@ -1565,6 +1575,11 @@ fn handle_load(spec: &str) {
                     color::LIME,
                     color::YELLOW,
                 )),
+                // Reachable only if the disk breadcrumb was set AFTER we
+                // cleared the skip set above (e.g. another callback wrote
+                // it mid-flight); in practice load_one's classify_carryover
+                // only reads disk under Startup, so this arm is effectively
+                // dead from /load. Keep it for completeness.
                 LoadOutcome::CrashCarryover { previous } => print_wrapped(format!(
                     "{}{id} crashed inside {}{previous}{} last session; cleared the breadcrumb. \
                      Try again.",
@@ -1572,6 +1587,8 @@ fn handle_load(spec: &str) {
                     color::LIME,
                     color::YELLOW,
                 )),
+                // /load cleared the skip set above, so this should not fire.
+                LoadOutcome::SkippedFromCarryover => {}
                 LoadOutcome::NotInstalled => print_wrapped(format!(
                     "{}{id} {}has no installed binary; use {}/client Manager update {id}{} first",
                     color::LIME,
