@@ -287,6 +287,17 @@ pub fn load_one(owner: &str, repo: &str, sub: &Subscription, phase: LifecyclePha
     }
 }
 
+/// Pure pre-flight check for `unload_one`. Mirrors `classify_early` on the
+/// load side: returns `Some(_)` for outcomes decidable without FFI / `LOADED`
+/// access, extracted so tests can exercise the IsSelf branch without pulling
+/// `print_wrapped` / `Chat_Add` into the test-binary link graph.
+fn classify_early_unload(owner: &str, repo: &str) -> Option<UnloadOutcome> {
+    if config::is_self(owner, repo) {
+        return Some(UnloadOutcome::IsSelf);
+    }
+    None
+}
+
 /// Unload the running copy of `(owner, repo)`: drop it from `LOADED` and
 /// call the component's `Free` wrapped in a breadcrumb so it deregisters
 /// host-side state. The library stays mapped - see module comment about
@@ -295,8 +306,8 @@ pub fn load_one(owner: &str, repo: &str, sub: &Subscription, phase: LifecyclePha
 /// deadlocking. Chats "Unloading {id}" right before the `Free` call (and
 /// only when there's actually a `Free` to invoke).
 pub fn unload_one(owner: &str, repo: &str) -> UnloadOutcome {
-    if config::is_self(owner, repo) {
-        return UnloadOutcome::IsSelf;
+    if let Some(o) = classify_early_unload(owner, repo) {
+        return o;
     }
     let plugin = LOADED.with_borrow_mut(|loaded| {
         loaded

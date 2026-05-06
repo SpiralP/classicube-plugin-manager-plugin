@@ -11,9 +11,9 @@ use classicube_sys::IGameComponent;
 use tempfile::{NamedTempFile, tempdir};
 
 use super::{
-    ApiVersionCheck, LifecyclePhase, LoadOutcome, SKIPPED_CARRYOVER, check_api_version,
-    classify_carryover_at, classify_early, clear_carryover_skip, detect_plugins_dir_conflict,
-    run_init_sequence_at, with_breadcrumb_at,
+    ApiVersionCheck, LifecyclePhase, LoadOutcome, SKIPPED_CARRYOVER, UnloadOutcome,
+    check_api_version, classify_carryover_at, classify_early, classify_early_unload,
+    clear_carryover_skip, detect_plugins_dir_conflict, run_init_sequence_at, with_breadcrumb_at,
 };
 use crate::config::{self, Config, Subscription, SubscriptionState};
 
@@ -277,6 +277,23 @@ fn classify_early_normal_sub_returns_none() {
     // Falls through to the FFI/LOADED/filesystem checks in the full load_one.
     let sub = Subscription::default();
     assert!(classify_early("octocat", "hello-world", &sub).is_none());
+}
+
+#[test]
+fn classify_early_unload_self_returns_is_self() {
+    // Mirror of classify_early_self_returns_is_self on the unload side: even
+    // if the user's config has the self sub enabled and "installed", /unload
+    // self must refuse - the game owns the manager's handle, not us.
+    assert!(matches!(
+        classify_early_unload(config::SELF_OWNER, config::SELF_REPO),
+        Some(UnloadOutcome::IsSelf)
+    ));
+}
+
+#[test]
+fn classify_early_unload_normal_sub_returns_none() {
+    // Falls through to the LOADED lookup in the full unload_one.
+    assert!(classify_early_unload("octocat", "hello-world").is_none());
 }
 
 // run_init_sequence dispatch tests. The "real Init must only call Init"
