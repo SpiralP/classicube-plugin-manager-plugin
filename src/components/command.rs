@@ -226,6 +226,49 @@ fn channel_matches_installed(channel: &Channel, installed: Option<&str>) -> bool
     matches!(channel, Channel::Tag(v) if installed == Some(v.as_str()))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum AddUpdateDecision {
+    NoChanges,
+    Modified {
+        channel_changed: bool,
+        token_changed: bool,
+    },
+}
+
+/// Apply a re-run of `/add` to an existing subscription. Mutates `sub` in
+/// place to absorb a new channel and/or token, reusing `apply_channel_switch`
+/// to invalidate cached release fields when the channel actually changes.
+/// Returns `NoChanges` when the requested values match what's already stored,
+/// so the caller can print a friendly no-op instead of a misleading "Updated".
+/// `new_token == None` is "user didn't pass a token" - never interpreted as
+/// "clear the existing token"; removing a token still requires hand-editing
+/// the TOML.
+fn apply_add_update(
+    sub: &mut Subscription,
+    new_channel: Channel,
+    new_token: Option<String>,
+) -> AddUpdateDecision {
+    let channel_changed = sub.channel != new_channel;
+    let token_changed = match (&new_token, &sub.token) {
+        (Some(new), Some(existing)) => new != existing.expose(),
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    if !channel_changed && !token_changed {
+        return AddUpdateDecision::NoChanges;
+    }
+    if channel_changed {
+        apply_channel_switch(sub, new_channel);
+    }
+    if let Some(t) = new_token {
+        sub.token = Some(Secret::new(t));
+    }
+    AddUpdateDecision::Modified {
+        channel_changed,
+        token_changed,
+    }
+}
+
 /// Decide which `Channel::Tag` value to switch to when `/pause` is invoked.
 /// Returns the pinned channel on success, or a chat-ready reason for refusing
 /// (no installed version yet, or the subscription is already pinned).
@@ -373,29 +416,13 @@ fn handle_add(spec: &str, channel: Channel, token: Option<String>) {
                 return;
             }
         };
+        let exists = find_subscription(&config, &candidates).is_some();
+        drop(config);
 
-        if let Some((existing_owner, existing_repo, _)) = find_subscription(&config, &candidates) {
-            let token_note = if token.is_some() {
-                format!(
-                    " {}(token ignored; edit plugins/plugin-manager.toml to change it)",
-                    color::YELLOW,
-                )
-            } else {
-                String::new()
-            };
-            print_async(format!(
-                "{}Already added: {}{existing_owner}/{existing_repo} {}(use {}/client Manager \
-                 channel{} to switch channels){token_note}",
-                color::YELLOW,
-                color::LIME,
-                color::YELLOW,
-                color::LIME,
-                color::YELLOW,
-            ))
-            .await;
+        if exists {
+            update_existing_subscription(candidates, channel, token).await;
             return;
         }
-        drop(config);
 
         let install_token = token.clone();
         let Some((owner, repo, release)) =
@@ -413,6 +440,84 @@ fn handle_add(spec: &str, channel: Channel, token: Option<String>) {
         .await;
         run_update_task_with_release(owner, repo, install_token, release).await;
     });
+}
+
+/// Re-run of `/add owner/repo ...` against a subscription that already
+/// exists. Acts as an upsert for the user-editable fields the command
+/// supports (channel + token), so users can set/replace a private-repo PAT
+/// without hand-editing `plugins/plugin-manager.toml`. Per design, any
+/// non-trivial change kicks off an install task - the typical reason to
+/// re-`/add` a tokened sub is "fix my failing private-repo download".
+async fn update_existing_subscription(
+    candidates: Vec<(String, String)>,
+    new_channel: Channel,
+    new_token: Option<String>,
+) {
+    enum Outcome {
+        NoChanges {
+            owner: String,
+            repo: String,
+            channel: Channel,
+        },
+        Modified {
+            owner: String,
+            repo: String,
+            channel: Channel,
+            token_for_install: Option<String>,
+        },
+    }
+    let outcome = Config::modify_at(config_path(), move |config| {
+        let (owner, repo, sub) =
+            find_subscription_mut(config, &candidates).expect("subscription existed at probe time");
+        match apply_add_update(sub, new_channel, new_token) {
+            AddUpdateDecision::NoChanges => Outcome::NoChanges {
+                owner,
+                repo,
+                channel: sub.channel.clone(),
+            },
+            AddUpdateDecision::Modified { .. } => Outcome::Modified {
+                owner,
+                repo,
+                channel: sub.channel.clone(),
+                token_for_install: sub.token.as_ref().map(|s| s.expose().to_owned()),
+            },
+        }
+    });
+    match outcome {
+        Err(e) => print_save_error(&e).await,
+        Ok(Outcome::NoChanges {
+            owner,
+            repo,
+            channel,
+        }) => {
+            print_async(format!(
+                "{}Already added: {}{owner}/{repo} {}(no changes; on channel {}{}{})",
+                color::YELLOW,
+                color::LIME,
+                color::YELLOW,
+                color::PINK,
+                channel.pretty(),
+                color::YELLOW,
+            ))
+            .await;
+        }
+        Ok(Outcome::Modified {
+            owner,
+            repo,
+            channel,
+            token_for_install,
+        }) => {
+            print_async(format!(
+                "{}Updated {}{owner}/{repo}{}{}, installing...",
+                color::PINK,
+                color::LIME,
+                channel_suffix(&channel),
+                color::PINK,
+            ))
+            .await;
+            run_update_task(owner, repo, channel, token_for_install).await;
+        }
+    }
 }
 
 /// Resolve `candidates` to a canonical `(owner, repo)` by probing GitHub

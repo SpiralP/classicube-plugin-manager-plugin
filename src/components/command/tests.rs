@@ -309,6 +309,152 @@ fn channel_matches_installed_prerelease_never_matches() {
 }
 
 #[test]
+fn apply_add_update_no_changes_when_same_channel_and_no_token() {
+    let mut s = Subscription {
+        channel: Channel::Stable,
+        ..empty_sub()
+    };
+    let before = s.clone();
+    assert_eq!(
+        apply_add_update(&mut s, Channel::Stable, None),
+        AddUpdateDecision::NoChanges,
+    );
+    assert_eq!(s, before);
+}
+
+#[test]
+fn apply_add_update_token_added_on_tokenless_sub() {
+    let mut s = Subscription {
+        channel: Channel::Stable,
+        state: SubscriptionState {
+            cached_tag: Some("v1.0.0".into()),
+            cached_at: Some(100),
+            cached_published_at: Some(50),
+            installed_version: Some("v1.0.0".into()),
+            ..SubscriptionState::default()
+        },
+        ..empty_sub()
+    };
+    assert_eq!(
+        apply_add_update(&mut s, Channel::Stable, Some("ghp_abc".into())),
+        AddUpdateDecision::Modified {
+            channel_changed: false,
+            token_changed: true,
+        },
+    );
+    assert_eq!(s.token.as_ref().map(|t| t.expose()), Some("ghp_abc"));
+    // Channel unchanged, so cache stays put.
+    assert_eq!(s.state.cached_tag.as_deref(), Some("v1.0.0"));
+    assert_eq!(s.state.cached_at, Some(100));
+    assert_eq!(s.state.installed_version.as_deref(), Some("v1.0.0"));
+}
+
+#[test]
+fn apply_add_update_token_replaced_when_different() {
+    let mut s = Subscription {
+        channel: Channel::Stable,
+        token: Some(Secret::new("ghp_old".into())),
+        ..empty_sub()
+    };
+    assert_eq!(
+        apply_add_update(&mut s, Channel::Stable, Some("ghp_new".into())),
+        AddUpdateDecision::Modified {
+            channel_changed: false,
+            token_changed: true,
+        },
+    );
+    assert_eq!(s.token.as_ref().map(|t| t.expose()), Some("ghp_new"));
+}
+
+#[test]
+fn apply_add_update_matching_token_is_no_op() {
+    let mut s = Subscription {
+        channel: Channel::Stable,
+        token: Some(Secret::new("ghp_abc".into())),
+        ..empty_sub()
+    };
+    assert_eq!(
+        apply_add_update(&mut s, Channel::Stable, Some("ghp_abc".into())),
+        AddUpdateDecision::NoChanges,
+    );
+    assert_eq!(s.token.as_ref().map(|t| t.expose()), Some("ghp_abc"));
+}
+
+#[test]
+fn apply_add_update_no_token_arg_preserves_existing_token() {
+    // Re-running `/add foo/bar prerelease` on a tokened sub must not strip
+    // the token. Removing a token still requires hand-editing the TOML.
+    let mut s = Subscription {
+        channel: Channel::Stable,
+        token: Some(Secret::new("ghp_keep".into())),
+        ..empty_sub()
+    };
+    assert_eq!(
+        apply_add_update(&mut s, Channel::Prerelease, None),
+        AddUpdateDecision::Modified {
+            channel_changed: true,
+            token_changed: false,
+        },
+    );
+    assert_eq!(s.token.as_ref().map(|t| t.expose()), Some("ghp_keep"));
+}
+
+#[test]
+fn apply_add_update_channel_change_clears_cache_preserves_install() {
+    let mut s = Subscription {
+        channel: Channel::Stable,
+        state: SubscriptionState {
+            cached_tag: Some("v1.0.0".into()),
+            cached_at: Some(100),
+            cached_published_at: Some(50),
+            installed_version: Some("v1.0.0".into()),
+            installed_asset: Some("a.so".into()),
+            ..SubscriptionState::default()
+        },
+        ..empty_sub()
+    };
+    assert_eq!(
+        apply_add_update(&mut s, Channel::Prerelease, None),
+        AddUpdateDecision::Modified {
+            channel_changed: true,
+            token_changed: false,
+        },
+    );
+    assert_eq!(s.channel, Channel::Prerelease);
+    assert!(s.state.cached_tag.is_none());
+    assert!(s.state.cached_at.is_none());
+    assert!(s.state.cached_published_at.is_none());
+    // installed_* describes what's on disk; channel switch must not touch it.
+    assert_eq!(s.state.installed_version.as_deref(), Some("v1.0.0"));
+    assert_eq!(s.state.installed_asset.as_deref(), Some("a.so"));
+}
+
+#[test]
+fn apply_add_update_channel_and_token_change_together() {
+    let mut s = Subscription {
+        channel: Channel::Stable,
+        token: Some(Secret::new("ghp_old".into())),
+        state: SubscriptionState {
+            cached_tag: Some("v1.0.0".into()),
+            cached_at: Some(100),
+            ..SubscriptionState::default()
+        },
+        ..empty_sub()
+    };
+    assert_eq!(
+        apply_add_update(&mut s, Channel::Prerelease, Some("ghp_new".into())),
+        AddUpdateDecision::Modified {
+            channel_changed: true,
+            token_changed: true,
+        },
+    );
+    assert_eq!(s.channel, Channel::Prerelease);
+    assert_eq!(s.token.as_ref().map(|t| t.expose()), Some("ghp_new"));
+    assert!(s.state.cached_tag.is_none());
+    assert!(s.state.cached_at.is_none());
+}
+
+#[test]
 fn parse_channel_args_rejects_extra_args() {
     assert!(parse_channel_args(&["stable", "extra"]).is_err());
     assert!(parse_channel_args(&["tag", "v1", "extra"]).is_err());
