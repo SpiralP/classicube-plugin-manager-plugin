@@ -9,6 +9,7 @@ use reqwest::{
     header::{AUTHORIZATION, HeaderValue},
 };
 use serde::{Deserialize, Deserializer, de::Error as DeError};
+use serde_json::Value;
 use tracing::warn;
 
 use crate::{config::Channel, installer::parse_sha256_digest};
@@ -68,10 +69,7 @@ pub async fn get_release_for_channel(
     token: Option<&str>,
 ) -> Result<GitHubRelease> {
     match channel {
-        Channel::Stable => {
-            let url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
-            fetch_one(&url, token).await
-        }
+        Channel::Stable => fetch_stable_release(owner, repo, token).await,
         Channel::Prerelease => fetch_newest_release(owner, repo, token).await,
         Channel::Tag(tag) => {
             let url = format!("https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}");
@@ -83,6 +81,65 @@ pub async fn get_release_for_channel(
 async fn fetch_one(url: &str, token: Option<&str>) -> Result<GitHubRelease> {
     let bytes = send(url, token).await?;
     Ok::<_, Error>(serde_json::from_slice::<GitHubRelease>(&bytes)?)
+}
+
+/// Fetch the latest stable release. On 404, distinguishes "repo doesn't
+/// exist / is private" from "repo exists but has no releases yet" (or has
+/// only prereleases) by probing the list endpoint - the original 404
+/// against `/releases/latest` doesn't tell those cases apart.
+async fn fetch_stable_release(
+    owner: &str,
+    repo: &str,
+    token: Option<&str>,
+) -> Result<GitHubRelease> {
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
+    let resolved = resolve_auth_token(token);
+    let had_token = resolved.is_some();
+    let (status, body) = send_raw(&url, resolved.as_deref()).await?;
+    if status.is_success() {
+        return Ok(serde_json::from_slice::<GitHubRelease>(&body)?);
+    }
+    if status != StatusCode::NOT_FOUND {
+        return Err(classify_error(status, had_token, &body));
+    }
+
+    let probe_url = format!("https://api.github.com/repos/{owner}/{repo}/releases?per_page=1");
+    let (probe_status, probe_body) = send_raw(&probe_url, resolved.as_deref()).await?;
+    Err(classify_stable_404_probe(
+        owner,
+        repo,
+        probe_status,
+        &probe_body,
+        had_token,
+    ))
+}
+
+/// Pure half of `fetch_stable_release`'s 404 fallback - takes the probe
+/// response and shapes the chat-facing error. Extracted so it can be
+/// unit-tested without spinning up an HTTP server.
+pub(crate) fn classify_stable_404_probe(
+    owner: &str,
+    repo: &str,
+    probe_status: StatusCode,
+    probe_body: &[u8],
+    had_token: bool,
+) -> Error {
+    if !probe_status.is_success() {
+        // Probe also failed - repo really is missing or private. Defer to
+        // the generic classifier so the token hint still appears for
+        // anonymous 404s.
+        return classify_error(probe_status, had_token, probe_body);
+    }
+    match serde_json::from_slice::<Value>(probe_body) {
+        Ok(Value::Array(arr)) if arr.is_empty() => {
+            anyhow!("{owner}/{repo} exists but has no published releases yet")
+        }
+        Ok(Value::Array(_)) => anyhow!(
+            "{owner}/{repo} has no stable release (only prereleases); try `channel {owner}/{repo} \
+             prerelease`"
+        ),
+        _ => anyhow!("HTTP {probe_status} from list-releases probe (unexpected body)"),
+    }
 }
 
 async fn fetch_newest_release(
@@ -113,11 +170,26 @@ pub(crate) fn resolve_auth_token(per_sub: Option<&str>) -> Option<String> {
 /// chat output — including a hint when an anonymous 404 is likely a private
 /// repo, and when an authed 401/403 likely means a stale token.
 pub(crate) async fn send(url: &str, token: Option<&str>) -> Result<Vec<u8>> {
-    let token = resolve_auth_token(token);
-    let had_token = token.is_some();
+    let resolved = resolve_auth_token(token);
+    let had_token = resolved.is_some();
+    let (status, body) = send_raw(url, resolved.as_deref()).await?;
+    if status.is_success() {
+        return Ok(body);
+    }
+    Err(classify_error(status, had_token, &body))
+}
 
+/// Send a GET and return `(status, body)` for any HTTP response - including
+/// non-2xx. Transport / auth-header construction failures still bubble up
+/// as errors. Callers that need to react to a specific status (e.g. probe
+/// on 404) use this; callers that just want the body use `send`.
+///
+/// Token handling differs from `send`: this takes the already-resolved
+/// token (so callers chaining multiple requests can resolve once and reuse
+/// the same effective auth across both).
+pub(crate) async fn send_raw(url: &str, token: Option<&str>) -> Result<(StatusCode, Vec<u8>)> {
     let mut request = make_client().get(url);
-    if let Some(t) = &token {
+    if let Some(t) = token {
         let mut header_value = HeaderValue::from_str(&format!("Bearer {t}"))
             .map_err(|e| anyhow!("invalid token characters: {e}"))?;
         header_value.set_sensitive(true);
@@ -127,11 +199,7 @@ pub(crate) async fn send(url: &str, token: Option<&str>) -> Result<Vec<u8>> {
     let resp = request.send().await?;
     let status = resp.status();
     let body = resp.bytes().await?.to_vec();
-
-    if status.is_success() {
-        return Ok(body);
-    }
-    Err(classify_error(status, had_token, &body))
+    Ok((status, body))
 }
 
 /// Map a non-success GitHub response to a chat-friendly error. Extracted so
@@ -146,6 +214,15 @@ pub(crate) fn classify_error(status: StatusCode, had_token: bool, body: &[u8]) -
             "not found (if this repo is private, retry with `add <owner>/<repo> token \
              github_pat_...` or add `token = \"github_pat_...\"` to its entry in \
              plugin-manager.toml)"
+        ),
+        // 404 with a token attached has two real causes: repo is gone, or
+        // the token can't see it. Fine-grained PATs return 404 (not 403)
+        // for repos they aren't scoped to, so the second case is silent
+        // unless we spell it out.
+        StatusCode::NOT_FOUND if had_token => anyhow!(
+            "not found ({}) - either the repo is missing/renamed, or your token lacks `Contents: \
+             Read` access to it (fine-grained PATs return 404 for repos they can't see)",
+            api_msg.unwrap_or_else(|| "Not Found".to_string())
         ),
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN if had_token => anyhow!(
             "auth failed (token may be expired or lack `Contents: Read` on this repo): {}",

@@ -14,21 +14,21 @@ fn picks_unique_match() {
         asset("plugin_linux_x86_64.so"),
         asset("plugin_windows_x86_64.dll"),
     ];
-    let got = pick_asset(&assets, "x86_64", ".so").unwrap();
+    let got = pick_asset("v1.0.0", &assets, "x86_64", ".so").unwrap();
     assert_eq!(got.name, "plugin_linux_x86_64.so");
 }
 
 #[test]
 fn matches_amd64_alias_for_x86_64() {
     let assets = [asset("plugin_amd64.so")];
-    let got = pick_asset(&assets, "x86_64", ".so").unwrap();
+    let got = pick_asset("v1.0.0", &assets, "x86_64", ".so").unwrap();
     assert_eq!(got.name, "plugin_amd64.so");
 }
 
 #[test]
 fn matches_arm64_alias_for_aarch64() {
     let assets = [asset("plugin_arm64.dylib")];
-    let got = pick_asset(&assets, "aarch64", ".dylib").unwrap();
+    let got = pick_asset("v1.0.0", &assets, "aarch64", ".dylib").unwrap();
     assert_eq!(got.name, "plugin_arm64.dylib");
 }
 
@@ -41,7 +41,7 @@ fn picks_macos_dylib_over_other_suffixes() {
         asset("plugin_windows_aarch64.dll"),
         asset("plugin_macos_aarch64.dylib"),
     ];
-    let got = pick_asset(&assets, "aarch64", ".dylib").unwrap();
+    let got = pick_asset("v1.0.0", &assets, "aarch64", ".dylib").unwrap();
     assert_eq!(got.name, "plugin_macos_aarch64.dylib");
 }
 
@@ -50,7 +50,7 @@ fn picks_self_update_naming() {
     // Locks in the self-update path against this repo's own release naming
     // (see `.github/workflows/build.yml` mac job).
     let assets = [asset("classicube_plugin_manager_macos_aarch64.dylib")];
-    let got = pick_asset(&assets, "aarch64", ".dylib").unwrap();
+    let got = pick_asset("v1.0.0", &assets, "aarch64", ".dylib").unwrap();
     assert_eq!(got.name, "classicube_plugin_manager_macos_aarch64.dylib");
 }
 
@@ -60,27 +60,32 @@ fn matches_darwin_arm64_naming() {
     // any explicit `darwin` alias — the `arm64` arch token already aliases
     // `aarch64`, and `.dylib` discriminates macOS.
     let assets = [asset("plugin_darwin_arm64.dylib")];
-    let got = pick_asset(&assets, "aarch64", ".dylib").unwrap();
+    let got = pick_asset("v1.0.0", &assets, "aarch64", ".dylib").unwrap();
     assert_eq!(got.name, "plugin_darwin_arm64.dylib");
 }
 
 #[test]
 fn case_insensitive() {
     let assets = [asset("Plugin_X86_64.SO")];
-    let got = pick_asset(&assets, "x86_64", ".so").unwrap();
+    let got = pick_asset("v1.0.0", &assets, "x86_64", ".so").unwrap();
     assert_eq!(got.name, "Plugin_X86_64.SO");
 }
 
 #[test]
 fn empty_assets_errors() {
-    let err = pick_asset(&[], "x86_64", ".so").unwrap_err();
-    assert!(format!("{err}").contains("no assets"));
+    let err = pick_asset("v1.2.3", &[], "x86_64", ".so").unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("no assets"), "{msg}");
+    // The tag should appear so the user knows which release is empty -
+    // a release with zero uploaded assets is usually a draft / mid-CI
+    // window, not a misconfigured arch.
+    assert!(msg.contains("v1.2.3"), "{msg}");
 }
 
 #[test]
 fn no_suffix_match_errors() {
     let assets = [asset("plugin.dll"), asset("plugin.dylib")];
-    let err = pick_asset(&assets, "x86_64", ".so").unwrap_err();
+    let err = pick_asset("v1.0.0", &assets, "x86_64", ".so").unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains(".so"), "{msg}");
     assert!(msg.contains("plugin.dll"), "{msg}");
@@ -89,7 +94,7 @@ fn no_suffix_match_errors() {
 #[test]
 fn suffix_matches_but_arch_does_not() {
     let assets = [asset("plugin_aarch64.so")];
-    let err = pick_asset(&assets, "x86_64", ".so").unwrap_err();
+    let err = pick_asset("v1.0.0", &assets, "x86_64", ".so").unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("arch"), "{msg}");
     assert!(msg.contains("plugin_aarch64.so"), "{msg}");
@@ -98,7 +103,7 @@ fn suffix_matches_but_arch_does_not() {
 #[test]
 fn ambiguous_match_errors_with_candidates() {
     let assets = [asset("plugin_x86_64.so"), asset("plugin_x86_64-debug.so")];
-    let err = pick_asset(&assets, "x86_64", ".so").unwrap_err();
+    let err = pick_asset("v1.0.0", &assets, "x86_64", ".so").unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("ambiguous"), "{msg}");
     assert!(msg.contains("plugin_x86_64.so"), "{msg}");
@@ -111,7 +116,7 @@ fn x86_does_not_match_x86_64_asset() {
     // `x86` makes it a different token), so a 32-bit user shouldn't get
     // a 64-bit binary.
     let assets = [asset("plugin_x86_64.so")];
-    let err = pick_asset(&assets, "x86", ".so").unwrap_err();
+    let err = pick_asset("v1.0.0", &assets, "x86", ".so").unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("arch"), "{msg}");
 }
@@ -119,21 +124,21 @@ fn x86_does_not_match_x86_64_asset() {
 #[test]
 fn x86_matches_i686_asset() {
     let assets = [asset("plugin_i686.so")];
-    let got = pick_asset(&assets, "x86", ".so").unwrap();
+    let got = pick_asset("v1.0.0", &assets, "x86", ".so").unwrap();
     assert_eq!(got.name, "plugin_i686.so");
 }
 
 #[test]
 fn arm_matches_armv7_asset() {
     let assets = [asset("plugin_armv7.so")];
-    let got = pick_asset(&assets, "arm", ".so").unwrap();
+    let got = pick_asset("v1.0.0", &assets, "arm", ".so").unwrap();
     assert_eq!(got.name, "plugin_armv7.so");
 }
 
 #[test]
 fn unsupported_arch_errors() {
     let assets = [asset("plugin.so")];
-    let err = pick_asset(&assets, "riscv64", ".so").unwrap_err();
+    let err = pick_asset("v1.0.0", &assets, "riscv64", ".so").unwrap_err();
     assert!(format!("{err}").contains("unsupported arch"));
 }
 
@@ -142,7 +147,7 @@ fn arm_token_does_not_partial_match_armv8() {
     // Word-bounded: arch="arm" should not match an "armv8" asset because
     // 'v' after "arm" is alphanumeric (no word boundary).
     let assets = [asset("plugin_armv8.so")];
-    let err = pick_asset(&assets, "arm", ".so").unwrap_err();
+    let err = pick_asset("v1.0.0", &assets, "arm", ".so").unwrap_err();
     assert!(format!("{err}").contains("arch"));
 }
 

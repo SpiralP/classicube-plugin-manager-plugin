@@ -259,22 +259,26 @@ async fn run_initial_pass() -> Result<()> {
                 },
             };
 
-            let asset =
-                match pick_asset(&release.assets, env::consts::ARCH, env::consts::DLL_SUFFIX) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        warn!("asset match {owner}/{repo}: {e:#}");
-                        print_async(format!(
-                            "{}No suitable asset for {}{owner}/{repo}{}: {}{e}",
-                            color::RED,
-                            color::LIME,
-                            color::RED,
-                            color::WHITE,
-                        ))
-                        .await;
-                        continue;
-                    }
-                };
+            let asset = match pick_asset(
+                &release.tag_name,
+                &release.assets,
+                env::consts::ARCH,
+                env::consts::DLL_SUFFIX,
+            ) {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!("asset match {owner}/{repo}: {e:#}");
+                    print_async(format!(
+                        "{}No suitable asset for {}{owner}/{repo}{}: {}{e}",
+                        color::RED,
+                        color::LIME,
+                        color::RED,
+                        color::WHITE,
+                    ))
+                    .await;
+                    continue;
+                }
+            };
 
             print_async(format!(
                 "{}Installing {}{} {}for {}{owner}/{repo} {}({}{}{})",

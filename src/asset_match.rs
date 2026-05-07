@@ -6,12 +6,13 @@ use anyhow::{Result, anyhow, bail};
 use crate::github_release::GitHubReleaseAsset;
 
 pub fn pick_asset<'a>(
+    release_tag: &str,
     assets: &'a [GitHubReleaseAsset],
     arch: &str,
     dll_suffix: &str,
 ) -> Result<&'a GitHubReleaseAsset> {
     if assets.is_empty() {
-        bail!("release has no assets");
+        bail!("release `{release_tag}` has no assets uploaded yet");
     }
 
     let suffix_lc = dll_suffix.to_ascii_lowercase();
@@ -22,7 +23,7 @@ pub fn pick_asset<'a>(
 
     if by_suffix.is_empty() {
         bail!(
-            "no asset ending in `{dll_suffix}` (available: {})",
+            "release `{release_tag}`: no asset ending in `{dll_suffix}` (available: {})",
             list_names(assets)
         );
     }
@@ -55,12 +56,13 @@ pub fn pick_asset<'a>(
     match by_arch.as_slice() {
         [a] => Ok(*a),
         [] => Err(anyhow!(
-            "no asset matched arch `{arch}` (looked for tokens {:?}); available: {}",
+            "release `{release_tag}`: no asset matched arch `{arch}` (looked for tokens {:?}); \
+             available: {}",
             tokens,
             list_names(assets),
         )),
         many => Err(anyhow!(
-            "{} assets matched arch `{arch}`, ambiguous: {}",
+            "release `{release_tag}`: {} assets matched arch `{arch}`, ambiguous: {}",
             many.len(),
             list_names_iter(many.iter().copied()),
         )),

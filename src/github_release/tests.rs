@@ -173,17 +173,22 @@ fn classify_anonymous_404_hints_private_repo() {
 }
 
 #[test]
-fn classify_authed_404_does_not_show_private_hint() {
-    // If the user already has a token attached and it still 404s, the repo
-    // really is missing (or the token doesn't have access — but that surfaces
-    // as 401/403, not 404). Don't suggest the token workflow they're already
-    // using.
+fn classify_authed_404_mentions_token_access() {
+    // 404 with a token attached has two real causes: the repo is gone, or
+    // the token can't see it (fine-grained PATs return 404 for repos
+    // they aren't scoped to). Don't repeat the anonymous "add a token"
+    // hint - they have one - but do mention the access possibility so a
+    // misconfigured fine-grained PAT isn't invisible.
     let body = br#"{"message":"Not Found"}"#;
     let err = classify_error(StatusCode::NOT_FOUND, true, body);
     let msg = format!("{err:#}");
     assert!(
         !msg.contains("private"),
-        "should not nag about private with a token already set: {msg}",
+        "should not repeat the anonymous private-repo hint: {msg}",
+    );
+    assert!(
+        msg.contains("lacks") && msg.contains("access"),
+        "expected token-access wording in: {msg}",
     );
     assert!(msg.contains("Not Found"), "expected api message in: {msg}");
 }
@@ -227,6 +232,92 @@ fn classify_falls_back_to_status_for_non_json_body() {
     let err = classify_error(StatusCode::BAD_GATEWAY, false, b"<html>nope</html>");
     let msg = format!("{err}");
     assert!(msg.contains("502"), "expected status in fallback: {msg}");
+}
+
+#[test]
+fn stable_404_probe_empty_list_says_no_releases() {
+    // Stable channel hit /releases/latest -> 404, then probe of
+    // /releases?per_page=1 returned 200 []. Repo exists, just has nothing
+    // published yet. Message must not nag about a token (which wouldn't
+    // help here).
+    let err = classify_stable_404_probe(
+        "owner",
+        "repo",
+        StatusCode::OK,
+        b"[]",
+        false, // anonymous - if we still showed the private-repo hint, it'd be wrong
+    );
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("no published releases"),
+        "expected no-releases message: {msg}"
+    );
+    assert!(msg.contains("owner/repo"), "expected repo in: {msg}");
+    assert!(
+        !msg.contains("private"),
+        "should not show private-repo hint when probe shows repo exists: {msg}"
+    );
+    assert!(
+        !msg.contains("token"),
+        "should not show token hint when probe shows repo exists: {msg}"
+    );
+}
+
+#[test]
+fn stable_404_probe_nonempty_list_suggests_prerelease_channel() {
+    // Stable hit 404, but probe found at least one release - meaning the
+    // repo has only prereleases / drafts. Suggest the prerelease channel
+    // instead of the token hint.
+    let body = br#"[{"tag_name":"v1.0.0-rc1","published_at":"2024-12-15T12:34:56Z"}]"#;
+    let err = classify_stable_404_probe("owner", "repo", StatusCode::OK, body, false);
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("prerelease"),
+        "expected prerelease hint: {msg}"
+    );
+    assert!(msg.contains("owner/repo"), "expected repo in: {msg}");
+    assert!(!msg.contains("private"), "{msg}");
+}
+
+#[test]
+fn stable_404_probe_falls_back_to_classify_when_probe_also_404s() {
+    // Probe also 404'd - the repo really is missing or private. Defer to
+    // the standard classifier so the anonymous-404 token hint still shows.
+    let body = br#"{"message":"Not Found"}"#;
+    let err = classify_stable_404_probe("owner", "repo", StatusCode::NOT_FOUND, body, false);
+    let msg = format!("{err:#}");
+    assert!(msg.contains("private"), "expected token hint: {msg}");
+    assert!(msg.contains("token"), "expected token hint: {msg}");
+}
+
+#[test]
+fn stable_404_probe_authed_probe_404_keeps_authed_message() {
+    // Authed and probe still 404s -> defer to classify_error, which spells
+    // out both possibilities (repo missing OR token lacks access) because
+    // fine-grained PATs return 404 for repos they can't see. Still
+    // suppress the anonymous "add a token" hint.
+    let body = br#"{"message":"Not Found"}"#;
+    let err = classify_stable_404_probe("owner", "repo", StatusCode::NOT_FOUND, body, true);
+    let msg = format!("{err:#}");
+    assert!(!msg.contains("private"), "{msg}");
+    assert!(
+        msg.contains("lacks") && msg.contains("access"),
+        "expected token-access wording in: {msg}",
+    );
+    assert!(msg.contains("Not Found"), "expected api message: {msg}");
+}
+
+#[test]
+fn stable_404_probe_unexpected_body_does_not_panic() {
+    // Probe returned 200 but the body wasn't a JSON array - unexpected,
+    // but we want a chat-shaped error rather than a parse panic.
+    let err =
+        classify_stable_404_probe("owner", "repo", StatusCode::OK, b"<html>...</html>", false);
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("probe"),
+        "expected probe-shaped message: {msg}"
+    );
 }
 
 #[test]

@@ -519,7 +519,12 @@ async fn probe_release(
     // token inline; pass it through so private-repo probes succeed instead
     // of failing with the "may be private - add a token" hint.
     let release = get_release_for_channel(owner, repo, channel, token).await?;
-    pick_asset(&release.assets, env::consts::ARCH, env::consts::DLL_SUFFIX)?;
+    pick_asset(
+        &release.tag_name,
+        &release.assets,
+        env::consts::ARCH,
+        env::consts::DLL_SUFFIX,
+    )?;
     Ok(release)
 }
 
@@ -1191,7 +1196,12 @@ async fn run_update_with_release(
     token: Option<&str>,
     release: GitHubRelease,
 ) -> Result<()> {
-    let asset = pick_asset(&release.assets, env::consts::ARCH, env::consts::DLL_SUFFIX)?;
+    let asset = pick_asset(
+        &release.tag_name,
+        &release.assets,
+        env::consts::ARCH,
+        env::consts::DLL_SUFFIX,
+    )?;
     let is_self = config::is_self(owner, repo);
 
     // Snapshot what the sub thinks it owns on disk *before* we touch
