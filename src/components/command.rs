@@ -57,8 +57,9 @@ fn expand_candidates(input: &str) -> Option<Vec<(String, String)>> {
     // Curated shorthand wins over the generic `classicube-$name-plugin`
     // expansion: bare input only (no slash) — owner-prefixed input always
     // means "I know what I want" and skips the curated lookup. A hit returns
-    // a single canonical candidate, so callers like `handle_add` skip
-    // `resolve_canonical`'s speculative 404 probe.
+    // a single canonical candidate, so `resolve_canonical` only has to probe
+    // GitHub once instead of trying both literal and `classicube-*-plugin`
+    // forms.
     if !input.contains('/')
         && let Some(entry) = discover::lookup_shorthand(input)
     {
@@ -397,7 +398,9 @@ fn handle_add(spec: &str, channel: Channel, token: Option<String>) {
         drop(config);
 
         let install_token = token.clone();
-        let Some((owner, repo)) = add_subscription(&spec, candidates, &channel, token).await else {
+        let Some((owner, repo, release)) =
+            add_subscription(&spec, candidates, &channel, token).await
+        else {
             return;
         };
         print_async(format!(
@@ -408,43 +411,42 @@ fn handle_add(spec: &str, channel: Channel, token: Option<String>) {
             color::PINK,
         ))
         .await;
-        run_update_task(owner, repo, channel, install_token).await;
+        run_update_task_with_release(owner, repo, install_token, release).await;
     });
 }
 
-/// Resolve `candidates` to a canonical `(owner, repo)`, insert a fresh
-/// subscription on `channel`, and persist. Shared by explicit
-/// `/add` and the implicit-add paths in `/update`, `/enable`,
-/// `/channel`. Single-candidate inputs skip the probe - callers
-/// that go on to install (`run_update`) hit GitHub anyway. Returns
-/// `None` on probe-resolve failure or save failure, after printing
-/// a chat-ready error. Caller must already have verified that no
-/// subscription matches `candidates`.
+/// Resolve `candidates` to a canonical `(owner, repo)` by probing GitHub
+/// for a release on `channel` with an OS-matching asset, insert a fresh
+/// subscription, and persist. Shared by explicit `/add` and the
+/// implicit-add paths in `/update`, `/enable`, `/channel`. The probed
+/// release is returned alongside the canonical pair so callers can
+/// install from it without a second GitHub round-trip. Returns `None` on
+/// probe failure, conflict, or save failure, after printing a chat-ready
+/// error. Caller must already have verified that no subscription matches
+/// `candidates`.
 async fn add_subscription(
     spec: &str,
     candidates: Vec<(String, String)>,
     channel: &Channel,
     token: Option<String>,
-) -> Option<(String, String)> {
-    let (owner, repo) = if candidates.len() == 1 {
-        candidates.into_iter().next().unwrap()
-    } else {
+) -> Option<(String, String, GitHubRelease)> {
+    let (owner, repo, release) =
         match resolve_canonical(&candidates, channel, token.as_deref()).await {
-            Ok(pair) => pair,
+            Ok(triple) => triple,
             Err(e) => {
+                // Per-candidate labels in `e` already identify what was tried,
+                // so don't repeat `spec` in the outer wrapper - the user's
+                // typed `owner/repo` would otherwise collide with the first
+                // candidate label and read as "Failed to resolve X: X: ...".
                 print_async(format!(
-                    "{}Failed to resolve {}{}{}: {}{e}",
-                    color::RED,
-                    color::LIME,
-                    spec,
+                    "{}Failed to resolve: {}{e}",
                     color::RED,
                     color::WHITE,
                 ))
                 .await;
                 return None;
             }
-        }
-    };
+        };
 
     // For the self repo the running binary's filename is a legitimate match
     // and must be skipped; everything else flagged here would create a
@@ -485,22 +487,22 @@ async fn add_subscription(
         print_save_error(&e).await;
         return None;
     }
-    Some((owner, repo))
+    Some((owner, repo, release))
 }
 
 /// Probe each candidate against the GitHub API and OS asset filter; return
-/// the first `(owner, repo)` whose release for `channel` has a matching
-/// asset for our platform. Errors aggregate the per-candidate failure
-/// messages.
+/// the first `(owner, repo, release)` whose release for `channel` has a
+/// matching asset for our platform. Errors aggregate the per-candidate
+/// failure messages.
 async fn resolve_canonical(
     candidates: &[(String, String)],
     channel: &Channel,
     token: Option<&str>,
-) -> Result<(String, String)> {
+) -> Result<(String, String, GitHubRelease)> {
     let mut errors: Vec<String> = Vec::new();
     for (owner, repo) in candidates {
         match probe_release(owner, repo, channel, token).await {
-            Ok(()) => return Ok((owner.clone(), repo.clone())),
+            Ok(release) => return Ok((owner.clone(), repo.clone(), release)),
             Err(e) => errors.push(format!("{owner}/{repo}: {e}")),
         }
     }
@@ -512,13 +514,13 @@ async fn probe_release(
     repo: &str,
     channel: &Channel,
     token: Option<&str>,
-) -> Result<()> {
+) -> Result<GitHubRelease> {
     // The subscription doesn't exist yet, but `/add` may have supplied a
     // token inline; pass it through so private-repo probes succeed instead
     // of failing with the "may be private - add a token" hint.
     let release = get_release_for_channel(owner, repo, channel, token).await?;
     pick_asset(&release.assets, env::consts::ARCH, env::consts::DLL_SUFFIX)?;
-    Ok(())
+    Ok(release)
 }
 
 /// Implicit-add path for commands whose user intent reads as "I want
@@ -527,7 +529,8 @@ async fn probe_release(
 /// hands off to the existing install path. Caller has already checked
 /// that no subscription exists for `candidates`.
 async fn auto_add_and_install(spec: &str, candidates: Vec<(String, String)>, channel: Channel) {
-    let Some((owner, repo)) = add_subscription(spec, candidates, &channel, None).await else {
+    let Some((owner, repo, release)) = add_subscription(spec, candidates, &channel, None).await
+    else {
         return;
     };
     print_async(format!(
@@ -538,7 +541,7 @@ async fn auto_add_and_install(spec: &str, candidates: Vec<(String, String)>, cha
         color::PINK,
     ))
     .await;
-    run_update_task(owner, repo, channel, None).await;
+    run_update_task_with_release(owner, repo, None, release).await;
 }
 
 fn handle_remove(spec: &str) {
