@@ -48,6 +48,12 @@ impl Component for Manager {
         }
     }
 
+    fn free(&mut self) {
+        // The deferred update pass is one-shot per init cycle. Reset so a
+        // hot-reload's next on_new_map_loaded re-runs it.
+        CHECKED.set(false);
+    }
+
     fn on_new_map_loaded(&mut self) {
         if CHECKED.get() {
             return;

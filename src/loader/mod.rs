@@ -456,6 +456,12 @@ fn run_init_sequence_at(
 }
 
 pub fn free() {
+    // Don't carry skip decisions across a hot-reload boundary. The next
+    // Startup will repopulate from the on-disk breadcrumb if the previous
+    // session actually crashed; stale entries from this cycle would otherwise
+    // suppress a legitimate retry after the user reloads us.
+    SKIPPED_CARRYOVER.with_borrow_mut(HashSet::clear);
+
     let drained: Vec<LoadedPlugin> =
         LOADED.with_borrow_mut(|loaded| loaded.drain(..).rev().collect());
     for plugin in &drained {

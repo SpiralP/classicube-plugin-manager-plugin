@@ -1529,6 +1529,14 @@ fn unix_now() -> u64 {
 }
 
 extern "C" fn c_callback(args: *const cc_string, args_count: c_int) {
+    // ClassiCube has no Commands_Unregister, so this callback can fire
+    // between Free and the next Init. Bail when the dispatcher hasn't
+    // re-armed - touching torn-down state (config I/O, async_manager
+    // after shutdown, etc.) panics or crashes.
+    if !crate::component::is_plugin_active() {
+        return;
+    }
+
     let args = unsafe { slice::from_raw_parts(args, args_count as usize) };
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     let args: Vec<&str> = args.iter().map(AsRef::as_ref).collect();
@@ -1755,15 +1763,21 @@ impl Component for Command {
 
     fn init(&mut self) {
         COMMAND.with(|cell| {
+            // Register exactly once per process. ClassiCube has no
+            // Commands_Unregister, so re-registering on hot-reload would
+            // either insert a duplicate entry (the old one wins for exact
+            // name matches) or - if we dropped the previous OwnedChatCommand
+            // - leave the C list pointing at freed memory.
+            if cell.borrow().is_some() {
+                return;
+            }
             let mut cmd = OwnedChatCommand::new("Manager", c_callback, false, USAGE_LINES.to_vec());
             cmd.register();
             *cell.borrow_mut() = Some(cmd);
         });
     }
 
-    fn free(&mut self) {
-        COMMAND.with(|cell| {
-            cell.borrow_mut().take();
-        });
-    }
+    // No `free()` impl: dropping the OwnedChatCommand would free heap memory
+    // still referenced by ClassiCube's command linked list. The c_callback
+    // bails on `!is_plugin_active()` while the dispatcher is torn down.
 }

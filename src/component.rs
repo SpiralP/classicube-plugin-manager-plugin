@@ -1,4 +1,8 @@
-use std::{cell::RefCell, os::raw::c_int, ptr};
+use std::{
+    cell::{Cell, RefCell},
+    os::raw::c_int,
+    ptr,
+};
 
 use classicube_sys::IGameComponent;
 use tracing::debug;
@@ -19,12 +23,19 @@ pub trait Component {
 
 type Inner = RefCell<Box<dyn Component>>;
 thread_local!(
-    static COMPONENTS: RefCell<Vec<Inner>> = {
-        let mut components = init_components();
-        let refcell_components = components.drain(..).map(RefCell::new).collect::<Vec<_>>();
-        RefCell::new(refcell_components)
-    };
+    static COMPONENTS: RefCell<Vec<Inner>> = const { RefCell::new(Vec::new()) };
 );
+
+// Permanent callbacks (chat command `c_callback`, anything else we can't
+// unregister) outlive `Free`. Gate them on this so they bail between Free
+// and the next Init instead of touching torn-down state.
+thread_local!(
+    static PLUGIN_ACTIVE: Cell<bool> = const { Cell::new(false) };
+);
+
+pub fn is_plugin_active() -> bool {
+    PLUGIN_ACTIVE.with(Cell::get)
+}
 
 fn with_components<R, F: FnOnce(&mut Vec<Inner>) -> R>(f: F) -> R {
     COMPONENTS.with_borrow_mut(|components| f(components))
@@ -32,15 +43,20 @@ fn with_components<R, F: FnOnce(&mut Vec<Inner>) -> R>(f: F) -> R {
 
 extern "C" fn init() {
     with_components(|components| {
+        if components.is_empty() {
+            *components = init_components().into_iter().map(RefCell::new).collect();
+        }
         for component in components {
             let mut component = component.borrow_mut();
             debug!("init {}", component.name());
             component.init();
         }
     });
+    PLUGIN_ACTIVE.with(|c| c.set(true));
 }
 
 extern "C" fn free() {
+    PLUGIN_ACTIVE.with(|c| c.set(false));
     with_components(|components| {
         for component in components.iter().rev() {
             let mut component = component.borrow_mut();
