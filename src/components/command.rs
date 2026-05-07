@@ -746,8 +746,15 @@ fn set_disabled(spec: &str, disabled: bool) {
         enum SetDisabledOutcome {
             NoSub,
             RefuseSelf(String),
-            AlreadyMatched { owner: String, repo: String },
-            Toggled { owner: String, repo: String },
+            AlreadyMatched {
+                owner: String,
+                repo: String,
+            },
+            Toggled {
+                owner: String,
+                repo: String,
+                sub: Subscription,
+            },
         }
         let outcome = Config::modify_at(config_path(), |config| {
             let Some((owner, repo, sub)) = find_subscription_mut(config, &candidates) else {
@@ -760,7 +767,11 @@ fn set_disabled(spec: &str, disabled: bool) {
                 return SetDisabledOutcome::AlreadyMatched { owner, repo };
             }
             sub.disabled = disabled;
-            SetDisabledOutcome::Toggled { owner, repo }
+            SetDisabledOutcome::Toggled {
+                owner,
+                repo,
+                sub: sub.clone(),
+            }
         });
         match outcome {
             Err(e) => print_save_error(&e).await,
@@ -774,7 +785,7 @@ fn set_disabled(spec: &str, disabled: bool) {
                 ))
                 .await;
             }
-            Ok(SetDisabledOutcome::Toggled { owner, repo }) => {
+            Ok(SetDisabledOutcome::Toggled { owner, repo, sub }) => {
                 let word = if disabled { "Disabled" } else { "Enabled" };
                 print_async(format!(
                     "{}{word} {}{owner}/{repo}",
@@ -784,6 +795,8 @@ fn set_disabled(spec: &str, disabled: bool) {
                 .await;
                 if disabled {
                     run_unload_followup(owner, repo).await;
+                } else {
+                    run_load_followup(owner, repo, sub).await;
                 }
             }
             Ok(SetDisabledOutcome::NoSub) => {
@@ -1487,6 +1500,23 @@ fn chat_post_update_load_outcome(id: &str, outcome: &LoadOutcome) {
 async fn run_unload_followup(owner: String, repo: String) {
     async_manager::run_on_main_thread(async move {
         loader::unload_one(&owner, &repo);
+    })
+    .await;
+}
+
+/// Symmetric counterpart to `run_unload_followup` for `/enable`: after the
+/// "Enabled" chat, dlopen the managed binary on the main thread so the
+/// in-process LOADED map matches the just-persisted config. Mirrors the
+/// post-`/update` reload (clear the carry-over skip set as an explicit
+/// retry, then load_one with Catchup phase). `load_one` returns silently
+/// for NotInstalled / AlreadyLoaded via `chat_post_update_load_outcome`,
+/// so no extra guards needed here.
+async fn run_load_followup(owner: String, repo: String, sub: Subscription) {
+    async_manager::run_on_main_thread(async move {
+        let id = format!("{owner}/{repo}");
+        loader::clear_carryover_skip(&owner, &repo);
+        let outcome = loader::load_one(&owner, &repo, &sub, LifecyclePhase::Catchup);
+        chat_post_update_load_outcome(&id, &outcome);
     })
     .await;
 }
