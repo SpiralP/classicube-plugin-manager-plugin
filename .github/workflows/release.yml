@@ -2,18 +2,21 @@ name: release
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master, alpha, beta]
   workflow_dispatch:
 
 permissions:
   contents: read # for build's checkout
 
 jobs:
+  # Release-build smoke test before letting semantic-release push a
+  # chore(release) commit. build.yml is also dispatched on the release tag
+  # later via `build-workflow`, but at that point a chore(release) commit is
+  # already on main; running the same release build here first stops broken
+  # commits from getting that far.
   build:
     uses: ./.github/workflows/build.yml
     if: "${{ ! startsWith(github.event.head_commit.message, 'chore(release): ') }}"
-    with:
-      release: true
 
   release:
     uses: SpiralP/github-reusable-workflows/.github/workflows/release.yml@03d584fb4fd838f16e8a599911e31da41fe98a0e # main
@@ -30,6 +33,12 @@ jobs:
         Cargo.lock
         Cargo.toml
       assets: "*.{so,dll,dylib}"
+      # Dispatch build.yml on the just-pushed release tag during the publish
+      # phase (before the GH release is created), so binaries are compiled
+      # against the bumped commit and attached to the release atomically.
+      # `gh workflow run --ref <tag>` checks out the tagged commit by default,
+      # so no extra inputs are needed on the dispatched workflow.
+      build-workflow: build.yml
     secrets:
       app-client-id: ${{ secrets.APP_CLIENT_ID }}
       app-private-key: ${{ secrets.APP_PRIVATE_KEY }}
