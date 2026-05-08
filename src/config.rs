@@ -62,6 +62,19 @@ pub fn is_self(owner: &str, repo: &str) -> bool {
     owner == SELF_OWNER && repo == SELF_REPO
 }
 
+/// Whether the manager's own subscription is present and marked `disabled`.
+/// `/disable` on self acts as a kill-switch: when true, both `Loader::init`
+/// (host-Init managed-load) and the manager's deferred initial pass
+/// (auto-update + Catchup managed-load) bail out, leaving the manager binary
+/// loaded but otherwise dormant. Returns false when the entry is absent
+/// (pre-`ensure_self` startup window).
+pub fn is_self_disabled(cfg: &Config) -> bool {
+    cfg.subscriptions
+        .get(SELF_OWNER)
+        .and_then(|repos| repos.get(SELF_REPO))
+        .is_some_and(|s| s.disabled)
+}
+
 /// One-shot v3 -> v4 rename: if the legacy `plugins/plugin-updater.toml`
 /// exists and the new path is absent, rename the file and rewrite a
 /// `SpiralP/classicube-plugin-updater-plugin` self subscription to the new

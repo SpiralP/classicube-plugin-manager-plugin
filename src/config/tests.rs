@@ -404,6 +404,53 @@ fn is_self_is_case_sensitive() {
 }
 
 #[test]
+fn is_self_disabled_false_when_entry_missing() {
+    // Pre-`ensure_self` startup window: no self entry yet -> not disabled.
+    let cfg = Config::default();
+    assert!(!super::is_self_disabled(&cfg));
+}
+
+#[test]
+fn is_self_disabled_false_when_self_enabled() {
+    let cfg = one_sub_config(
+        SELF_OWNER,
+        SELF_REPO,
+        Subscription {
+            disabled: false,
+            ..sub()
+        },
+    );
+    assert!(!super::is_self_disabled(&cfg));
+}
+
+#[test]
+fn is_self_disabled_true_when_self_disabled() {
+    let cfg = one_sub_config(
+        SELF_OWNER,
+        SELF_REPO,
+        Subscription {
+            disabled: true,
+            ..sub()
+        },
+    );
+    assert!(super::is_self_disabled(&cfg));
+}
+
+#[test]
+fn is_self_disabled_ignores_other_disabled_subs() {
+    // A disabled OTHER subscription must not look like self being disabled.
+    let cfg = one_sub_config(
+        "octocat",
+        "classicube-foo-plugin",
+        Subscription {
+            disabled: true,
+            ..sub()
+        },
+    );
+    assert!(!super::is_self_disabled(&cfg));
+}
+
+#[test]
 fn ensure_self_adds_when_missing() {
     let mut cfg = Config::default();
     assert!(cfg.ensure_self());

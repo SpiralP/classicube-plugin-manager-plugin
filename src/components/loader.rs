@@ -1,8 +1,8 @@
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     component::Component,
-    config::{Config, Subscription},
+    config::{self, Config, Subscription},
     loader::{self, LifecyclePhase},
 };
 
@@ -31,6 +31,14 @@ impl Component for Loader {
                 return;
             }
         };
+        // Honor /disable on the manager's own subscription: skip loading any
+        // managed plugins this session. The deferred initial pass in
+        // Manager::on_new_map_loaded checks the same flag and bails out, so
+        // no Catchup load runs either.
+        if config::is_self_disabled(&cfg) {
+            info!("manager subscription is disabled; skipping startup managed-load");
+            return;
+        }
         let subs: Vec<(String, String, Subscription)> = cfg
             .subscriptions
             .into_iter()

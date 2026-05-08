@@ -283,10 +283,10 @@ fn pause_target(sub: &Subscription) -> Result<Channel, String> {
 }
 
 /// Returns a chat-ready refusal message when `(owner, repo)` is the manager's
-/// own subscription. Used by mutating handlers that would otherwise leave the
-/// user in a half-state (entry removed but binary still loaded, or
-/// self-updates silently disabled). `action` is the verb shown in the message
-/// (e.g. `"remove"`, `"disable"`).
+/// own subscription. Used by `/remove` to avoid leaving the user with the
+/// manager binary still loaded but no config entry tracking it. `/disable` on
+/// self is allowed (and meaningful: dormant-manager mode), so it does NOT use
+/// this. `action` is the verb shown in the message (currently `"remove"`).
 fn refuse_self_mutation(owner: &str, repo: &str, action: &str) -> Option<String> {
     if !config::is_self(owner, repo) {
         return None;
@@ -855,7 +855,6 @@ fn set_disabled(spec: &str, disabled: bool) {
     async_manager::spawn(async move {
         enum SetDisabledOutcome {
             NoSub,
-            RefuseSelf(String),
             AlreadyMatched {
                 owner: String,
                 repo: String,
@@ -870,9 +869,6 @@ fn set_disabled(spec: &str, disabled: bool) {
             let Some((owner, repo, sub)) = find_subscription_mut(config, &candidates) else {
                 return SetDisabledOutcome::NoSub;
             };
-            if disabled && let Some(msg) = refuse_self_mutation(&owner, &repo, "disable") {
-                return SetDisabledOutcome::RefuseSelf(msg);
-            }
             if sub.disabled == disabled {
                 return SetDisabledOutcome::AlreadyMatched { owner, repo };
             }
@@ -885,7 +881,6 @@ fn set_disabled(spec: &str, disabled: bool) {
         });
         match outcome {
             Err(e) => print_save_error(&e).await,
-            Ok(SetDisabledOutcome::RefuseSelf(msg)) => print_async(msg).await,
             Ok(SetDisabledOutcome::AlreadyMatched { owner, repo }) => {
                 let word = if disabled { "disabled" } else { "enabled" };
                 print_async(format!(

@@ -83,6 +83,19 @@ impl Component for Manager {
                     return;
                 }
             };
+            // Same self-disabled kill-switch as Loader::init: if the user
+            // has disabled the manager's own subscription, skip the orphan
+            // sweep AND the Catchup managed-load. run_initial_pass already
+            // bailed before any installs, so there's nothing fresh on disk
+            // to pick up here, and the user expects total dormancy (no
+            // surprise file deletions in plugins/managed/).
+            if config::is_self_disabled(&cfg) {
+                info!(
+                    "manager subscription is disabled; skipping orphan sweep + Catchup \
+                     managed-load"
+                );
+                return;
+            }
             // Drop any file in plugins/managed/ that no live subscription
             // claims as its installed_asset. Runs AFTER the update pass (so
             // newly written versioned files are already claimed) and BEFORE
@@ -127,6 +140,16 @@ impl Component for Manager {
 async fn run_initial_pass() -> Result<()> {
     cleanup_self_old();
     ensure_self_subscription().await;
+
+    // Honor /disable on the manager's own subscription: skip reconcile, the
+    // per-sub update loop, and (via the early-return in on_new_map_loaded)
+    // the orphan sweep + Catchup managed-load. Explicit user commands like
+    // /update or /load still work; this only short-circuits the auto-pass.
+    if config::is_self_disabled(&Config::load()?) {
+        info!("manager subscription is disabled; skipping initial update pass");
+        return Ok(());
+    }
+
     run_reconcile_and_warn().await;
 
     let subs = Config::load()?.subscriptions;

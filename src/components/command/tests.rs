@@ -629,7 +629,6 @@ fn refuse_self_mutation_blocks_self_owner_repo() {
 #[test]
 fn refuse_self_mutation_allows_other_repo() {
     assert!(refuse_self_mutation("octocat", "classicube-foo-plugin", "remove").is_none());
-    assert!(refuse_self_mutation("octocat", "classicube-foo-plugin", "disable").is_none());
 }
 
 #[test]
@@ -637,14 +636,12 @@ fn refuse_self_mutation_is_case_sensitive() {
     // Handlers feed in the *stored* keys returned by find_subscription_mut,
     // so user-typed casing is normalized away before this check sees it.
     // Only TOML-on-disk casing reaches us, and config::is_self is exact-match.
-    assert!(refuse_self_mutation("spiralp", SELF_REPO, "disable").is_none());
+    assert!(refuse_self_mutation("spiralp", SELF_REPO, "remove").is_none());
 }
 
 #[test]
 fn refuse_self_mutation_message_is_ascii() {
     let msg = refuse_self_mutation(SELF_OWNER, SELF_REPO, "remove").unwrap();
-    assert!(msg.is_ascii(), "chat output must be ASCII: {msg:?}");
-    let msg = refuse_self_mutation(SELF_OWNER, SELF_REPO, "disable").unwrap();
     assert!(msg.is_ascii(), "chat output must be ASCII: {msg:?}");
 }
 
