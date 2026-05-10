@@ -13,15 +13,6 @@ concurrency:
 permissions:
   contents: read # for checkout
 
-env:
-  # cargo cdylib output stem (package name with hyphens -> underscores).
-  # Linux/macOS prepend `lib`; Windows does not.
-  LIB_NAME: classicube_plugin_manager_plugin
-  # Release-asset basename: package name with the trailing `-plugin` dropped
-  # and hyphens -> underscores. Per-job OS+arch tokens get appended. Must
-  # match the shape `asset_match::pick_asset` expects.
-  ASSET_PREFIX: classicube_plugin_manager
-
 jobs:
   linux_nix:
     # Skip when dispatched from release.yml's publish phase: that job runs on
@@ -32,100 +23,35 @@ jobs:
     with:
       runs-on: self-hosted
 
-  windows_x86:
-    name: Build Windows ${{ matrix.config.arch }}
-    runs-on: windows-2025
-    strategy:
-      fail-fast: false
-      matrix:
-        config:
-          - arch: x86_64
-            target: x86_64-pc-windows-msvc
-          # - arch: i686
-          #   target: i686-pc-windows-msvc
-
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Add rust target
-        run: rustup target add ${{ matrix.config.target }}
-
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          key: ${{ matrix.config.target }}
-
-      - name: Build
-        run: |
-          cargo build --target ${{ matrix.config.target }} --release
-
-      - uses: taiki-e/install-action@db5fb34fa772531a3ece57ca434f579eb334e0fb # v2.75.30
-        with:
-          tool: cargo-nextest
-
-      - name: Test
-        run: |
-          cargo nextest run --target ${{ matrix.config.target }} --release --no-capture
-          Move-Item `
-            -Path 'target\${{ matrix.config.target }}\release\${{ env.LIB_NAME }}.dll' `
-            -Destination '.\${{ env.ASSET_PREFIX }}_windows_${{ matrix.config.arch }}.dll'
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ${{ env.ASSET_PREFIX }}_windows_${{ matrix.config.arch }}
-          path: ${{ env.ASSET_PREFIX }}_windows_${{ matrix.config.arch }}.dll
-
-  linux_x86:
+  linux:
     name: Build Linux ${{ matrix.config.arch }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         config:
-          - arch: x86_64
-            target: x86_64-unknown-linux-gnu
-          # - arch: i686
-          #   target: i686-unknown-linux-gnu
-
+          - { arch: x86_64, target: x86_64-unknown-linux-gnu }
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Install i686 deps
-        if: ${{ matrix.config.arch == 'i686' }}
-        run: |
-          sudo dpkg --add-architecture i386
-          sudo apt-get -y update
-          sudo apt-get -y install pkg-config:i386 \
-            gcc-multilib g++-multilib \
-            libssl-dev:i386 \
-            libssl3:i386
-          echo "PKG_CONFIG_ALLOW_CROSS=1" >> "$GITHUB_ENV"
-
-      - name: Add rust target
-        run: rustup target add ${{ matrix.config.target }}
-
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: SpiralP/github-reusable-workflows/.github/actions/build-classicube-plugin@01bb20b8dc6617fd150ac625e6cbf00467306fb7 # main
         with:
-          key: ${{ matrix.config.target }}
+          arch: ${{ matrix.config.arch }}
+          target: ${{ matrix.config.target }}
 
-      - name: Build
-        run: |
-          cargo build --target ${{ matrix.config.target }} --release
-          file 'target/${{ matrix.config.target }}/release/lib${{ env.LIB_NAME }}.so'
-
-      - uses: taiki-e/install-action@db5fb34fa772531a3ece57ca434f579eb334e0fb # v2.75.30
+  windows:
+    name: Build Windows ${{ matrix.config.arch }}
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - { arch: x86_64, target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: SpiralP/github-reusable-workflows/.github/actions/build-classicube-plugin@01bb20b8dc6617fd150ac625e6cbf00467306fb7 # main
         with:
-          tool: cargo-nextest
-
-      - name: Test
-        run: |
-          cargo nextest run --target ${{ matrix.config.target }} --release --no-capture
-          mv 'target/${{ matrix.config.target }}/release/lib${{ env.LIB_NAME }}.so' \
-            './${{ env.ASSET_PREFIX }}_linux_${{ matrix.config.arch }}.so'
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ${{ env.ASSET_PREFIX }}_linux_${{ matrix.config.arch }}
-          path: ${{ env.ASSET_PREFIX }}_linux_${{ matrix.config.arch }}.so
+          arch: ${{ matrix.config.arch }}
+          target: ${{ matrix.config.target }}
 
   mac:
     name: Build MacOS ${{ matrix.config.arch }}
@@ -134,37 +60,10 @@ jobs:
       fail-fast: false
       matrix:
         config:
-          - arch: aarch64
-            target: aarch64-apple-darwin
-          # - arch: x86_64
-          #   target: x86_64-apple-darwin
-
+          - { arch: aarch64, target: aarch64-apple-darwin }
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Add rust target
-        run: rustup target add ${{ matrix.config.target }}
-
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: SpiralP/github-reusable-workflows/.github/actions/build-classicube-plugin@01bb20b8dc6617fd150ac625e6cbf00467306fb7 # main
         with:
-          key: ${{ matrix.config.target }}
-
-      - name: Build
-        run: |
-          cargo build --target ${{ matrix.config.target }} --release
-          file 'target/${{ matrix.config.target }}/release/lib${{ env.LIB_NAME }}.dylib'
-
-      - uses: taiki-e/install-action@db5fb34fa772531a3ece57ca434f579eb334e0fb # v2.75.30
-        with:
-          tool: cargo-nextest
-
-      - name: Test
-        run: |
-          cargo nextest run --target ${{ matrix.config.target }} --release --no-capture
-          mv 'target/${{ matrix.config.target }}/release/lib${{ env.LIB_NAME }}.dylib' \
-            '${{ env.ASSET_PREFIX }}_macos_${{ matrix.config.arch }}.dylib'
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ${{ env.ASSET_PREFIX }}_macos_${{ matrix.config.arch }}
-          path: ${{ env.ASSET_PREFIX }}_macos_${{ matrix.config.arch }}.dylib
+          arch: ${{ matrix.config.arch }}
+          target: ${{ matrix.config.target }}

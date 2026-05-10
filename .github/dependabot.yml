@@ -8,8 +8,6 @@ updates:
       github-actions:
         patterns:
           - "*"
-    ignore:
-      - dependency-name: taiki-e/install-action
   - package-ecosystem: cargo
     directory: /
     schedule:
