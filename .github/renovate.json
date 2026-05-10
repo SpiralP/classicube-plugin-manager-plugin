@@ -1,13 +1,4 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": [
-    "github>SpiralP/github-reusable-workflows//.github/renovate.json"
-  ],
-  "packageRules": [
-    {
-      "matchDepNames": ["taiki-e/install-action"],
-      "schedule": ["before 6am on monday"],
-      "automerge": true
-    }
-  ]
+  "extends": ["github>SpiralP/github-reusable-workflows//.github/renovate.json"]
 }
