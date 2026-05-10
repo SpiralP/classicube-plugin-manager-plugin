@@ -19,7 +19,7 @@ jobs:
     if: "${{ ! startsWith(github.event.head_commit.message, 'chore(release): ') }}"
 
   release:
-    uses: SpiralP/github-reusable-workflows/.github/workflows/release.yml@03d584fb4fd838f16e8a599911e31da41fe98a0e # main
+    uses: SpiralP/github-reusable-workflows/.github/workflows/release.yml@01bb20b8dc6617fd150ac625e6cbf00467306fb7 # main
     needs: build
     concurrency:
       group: release-${{ github.ref }}
