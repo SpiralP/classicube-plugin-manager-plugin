@@ -1,6 +1,6 @@
 [package]
 name = "classicube-plugin-manager-plugin"
-version = "0.7.0"
+version = "0.7.1-beta.1"
 edition = "2024"
 publish = false
 
