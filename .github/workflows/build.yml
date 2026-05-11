@@ -28,7 +28,7 @@ jobs:
     # the only self-hosted runner and waits for this workflow to finish, so
     # linux_nix (also self-hosted) would queue forever behind it.
     if: ${{ github.event_name != 'workflow_dispatch' }}
-    uses: SpiralP/github-reusable-workflows/.github/workflows/build.yml@7b70a3d7de05fca25ab90201a8081287a713d3bd # main
+    uses: SpiralP/github-reusable-workflows/.github/workflows/build.yml@836549c286c5fbf8b8bcf6cded0cd58259711a39 # main
     with:
       runs-on: self-hosted
 
