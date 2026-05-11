@@ -5,8 +5,7 @@ on:
     branches: [main, master, alpha, beta]
   workflow_dispatch:
 
-permissions:
-  contents: read # for build's checkout
+permissions: {} # both jobs declare their own
 
 jobs:
   # Release-build smoke test before letting semantic-release push a
@@ -17,9 +16,13 @@ jobs:
   build:
     uses: ./.github/workflows/build.yml
     if: "${{ ! startsWith(github.event.head_commit.message, 'chore(release): ') }}"
+    permissions:
+      contents: read # for build's checkout
+      id-token: write # for build-classicube-plugin's attest step
+      attestations: write # ditto
 
   release:
-    uses: SpiralP/github-reusable-workflows/.github/workflows/release.yml@836549c286c5fbf8b8bcf6cded0cd58259711a39 # main
+    uses: SpiralP/github-reusable-workflows/.github/workflows/release.yml@dd7556a6905c9e8fa54f9907194f55f887f5db0d # main
     needs: build
     concurrency:
       group: release-${{ github.ref }}
