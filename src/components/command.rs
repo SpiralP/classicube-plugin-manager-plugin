@@ -1644,6 +1644,10 @@ extern "C" fn c_callback(args: *const cc_string, args_count: c_int) {
     // re-armed - touching torn-down state (config I/O, async_manager
     // after shutdown, etc.) panics or crashes.
     if !crate::component::is_plugin_active() {
+        print_wrapped(format!(
+            "{}Manager: plugin not active (between hot-reload Free/Init); ignoring command",
+            color::YELLOW,
+        ));
         return;
     }
 
@@ -1879,6 +1883,11 @@ impl Component for Command {
             // name matches) or - if we dropped the previous OwnedChatCommand
             // - leave the C list pointing at freed memory.
             if cell.borrow().is_some() {
+                print_wrapped(format!(
+                    "{}Manager: /client Manager already registered (skipping re-registration on \
+                     hot reload)",
+                    color::YELLOW,
+                ));
                 return;
             }
             let mut cmd = OwnedChatCommand::new("Manager", c_callback, false, USAGE_LINES.to_vec());
