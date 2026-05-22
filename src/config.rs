@@ -3,7 +3,7 @@ mod tests;
 
 use std::{
     collections::BTreeMap,
-    fs::{self, OpenOptions},
+    fs,
     io::{self, Write},
     path::Path,
     str::FromStr,
@@ -12,6 +12,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
+use tempfile::NamedTempFile;
 
 use crate::secret::Secret;
 
@@ -347,12 +348,15 @@ impl Config {
         Ok(r)
     }
 
-    /// Serialize and write the config via a `<path>.tmp` -> rename dance,
-    /// then `fsync` the parent directory so the rename itself is durable.
-    /// The atomic rename means concurrent readers always see either the
-    /// old or the new file - never a truncated mid-state. The crash-recovery
-    /// breadcrumb relies on writes surviving an immediately-following
-    /// process death; the tmp file is fsynced before the rename.
+    /// Serialize and write the config via a uniquely-named tmp file +
+    /// rename dance, then `fsync` the parent directory so the rename
+    /// itself is durable. The random suffix is what prevents two
+    /// ClassiCube instances sharing the same config from truncating and
+    /// writing into the same tmp file concurrently; the atomic rename
+    /// means concurrent readers always see either the old or the new
+    /// file - never a truncated mid-state. The crash-recovery breadcrumb
+    /// relies on writes surviving an immediately-following process death;
+    /// the tmp file is fsynced before the rename.
     ///
     /// The output is split into two regions: every `[owner.repo]` table comes
     /// first, then a single `STATE_DIVIDER` comment, then every
@@ -391,29 +395,19 @@ impl Config {
             out.push_str(&toml::to_string_pretty(&state_map).context("serializing state view")?);
         }
 
-        let tmp_path = match path.file_name() {
-            Some(name) => {
-                let mut tmp_name = name.to_owned();
-                tmp_name.push(".tmp");
-                path.with_file_name(tmp_name)
-            }
-            None => bail!("config path has no file name: {}", path.display()),
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
         };
-
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)
-            .with_context(|| format!("opening {}", tmp_path.display()))?;
-        f.write_all(out.as_bytes())
-            .with_context(|| format!("writing {}", tmp_path.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", tmp_path.display()))?;
-        drop(f);
-
-        fs::rename(&tmp_path, path)
-            .with_context(|| format!("renaming {} -> {}", tmp_path.display(), path.display()))?;
+        let mut tmp = NamedTempFile::new_in(parent)
+            .with_context(|| format!("creating tmp file in {}", parent.display()))?;
+        tmp.write_all(out.as_bytes())
+            .with_context(|| format!("writing {}", tmp.path().display()))?;
+        tmp.as_file()
+            .sync_all()
+            .with_context(|| format!("fsync {}", tmp.path().display()))?;
+        tmp.persist(path)
+            .with_context(|| format!("renaming tmp -> {}", path.display()))?;
 
         // Best-effort parent-dir fsync so the rename itself survives power
         // loss on filesystems that need it (ext4, xfs). The rename was
