@@ -1,6 +1,8 @@
 use std::{
-    collections::{BTreeMap, HashSet},
-    fs, panic, ptr,
+    collections::HashSet,
+    fs, panic,
+    path::{Path, PathBuf},
+    ptr,
     sync::{
         Mutex,
         atomic::{AtomicU32, Ordering},
@@ -8,14 +10,15 @@ use std::{
 };
 
 use classicube_sys::IGameComponent;
-use tempfile::{NamedTempFile, tempdir};
+use tempfile::tempdir;
 
 use super::{
-    ApiVersionCheck, LifecyclePhase, LoadOutcome, SKIPPED_CARRYOVER, UnloadOutcome,
+    ApiVersionCheck, CARRYOVERS, LifecyclePhase, LoadOutcome, SKIPPED_CARRYOVER, UnloadOutcome,
     check_api_version, classify_carryover_at, classify_early, classify_early_unload,
-    clear_carryover_skip, detect_plugins_dir_conflict, run_init_sequence_at, with_breadcrumb_at,
+    clear_carryover_skip, detect_plugins_dir_conflict, prime_carryover_scan_at,
+    run_init_sequence_at, with_breadcrumb_at,
 };
-use crate::config::{self, Config, Subscription, SubscriptionState};
+use crate::config::{self, Subscription};
 
 #[test]
 fn missing_dir_returns_none() {
@@ -168,35 +171,37 @@ fn api_version_plugin_higher_means_host_outdated() {
     assert_eq!(check_api_version(1, 2), ApiVersionCheck::HostOutdated);
 }
 
-fn config_with_one_sub(path: &std::path::Path, owner: &str, repo: &str) {
-    let mut repos = BTreeMap::new();
-    repos.insert(repo.into(), Subscription::default());
-    let mut subscriptions = BTreeMap::new();
-    subscriptions.insert(owner.into(), repos);
-    Config { subscriptions }.save_to(path).unwrap();
+/// Path math for the per-process breadcrumb file, duplicated here so the
+/// loader tests don't have to leak the `breadcrumb` module's internals.
+/// Kept in sync with `breadcrumb::breadcrumb_path`.
+fn breadcrumb_file(dir: &Path, pid: u32) -> PathBuf {
+    let ns = crate::breadcrumb::current_ns_inode();
+    dir.join(format!("{ns}-{pid}.toml"))
 }
 
-fn read_in_callback(path: &std::path::Path, owner: &str, repo: &str) -> Option<String> {
-    Config::load_from(path)
-        .unwrap()
-        .subscriptions
-        .get(owner)
-        .and_then(|m| m.get(repo))
-        .and_then(|s| s.state.in_callback.clone())
-}
+/// Fixed PID used to seed a "previous-session crashed" breadcrumb file
+/// in tests. The scan is consume-everything now, so the PID doesn't
+/// need to be one the OS reports as dead - any number will do.
+const SEED_PID: u32 = 12_345;
 
 #[test]
 fn breadcrumb_set_during_call_and_cleared_after() {
-    let f = NamedTempFile::new().unwrap();
-    config_with_one_sub(f.path(), "octocat", "hello-world");
+    let dir = tempdir().unwrap();
+    let our_file = breadcrumb_file(dir.path(), std::process::id());
 
-    let mid_call = std::cell::Cell::new(None::<String>);
-    with_breadcrumb_at(f.path(), "octocat", "hello-world", "OnNewMap", || {
-        mid_call.set(read_in_callback(f.path(), "octocat", "hello-world"));
+    let mid_call = std::cell::Cell::new(false);
+    with_breadcrumb_at(dir.path(), "octocat", "hello-world", "OnNewMap", || {
+        mid_call.set(our_file.exists());
     });
 
-    assert_eq!(mid_call.into_inner().as_deref(), Some("OnNewMap"));
-    assert!(read_in_callback(f.path(), "octocat", "hello-world").is_none());
+    assert!(
+        mid_call.into_inner(),
+        "breadcrumb file should exist mid-call"
+    );
+    assert!(
+        !our_file.exists(),
+        "breadcrumb file should be cleared after"
+    );
 }
 
 #[test]
@@ -204,28 +209,28 @@ fn breadcrumb_survives_panic_in_closure() {
     // The whole point of the breadcrumb is to survive a crash inside the
     // managed callback. A panic is the closest in-process analog: if `f`
     // panics, the post-call clear must not run, and the on-disk breadcrumb
-    // must remain set so the next-startup carry-over check can fire.
-    let f = NamedTempFile::new().unwrap();
-    config_with_one_sub(f.path(), "octocat", "hello-world");
+    // file must remain so the next-startup carry-over check can fire.
+    let dir = tempdir().unwrap();
+    let our_file = breadcrumb_file(dir.path(), std::process::id());
 
-    let path = f.path().to_owned();
+    let dir_for_closure = dir.path().to_owned();
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        with_breadcrumb_at(&path, "octocat", "hello-world", "Init", || {
+        with_breadcrumb_at(&dir_for_closure, "octocat", "hello-world", "Init", || {
             panic!("simulated crash");
         })
     }));
     assert!(result.is_err(), "expected panic to propagate");
-    assert_eq!(
-        read_in_callback(f.path(), "octocat", "hello-world").as_deref(),
-        Some("Init"),
+    assert!(
+        our_file.exists(),
+        "breadcrumb file should remain after panic: {}",
+        our_file.display()
     );
 }
 
 #[test]
 fn breadcrumb_returns_closure_value() {
-    let f = NamedTempFile::new().unwrap();
-    config_with_one_sub(f.path(), "octocat", "hello-world");
-    let n = with_breadcrumb_at(f.path(), "octocat", "hello-world", "Reset", || 42);
+    let dir = tempdir().unwrap();
+    let n = with_breadcrumb_at(dir.path(), "octocat", "hello-world", "Reset", || 42);
     assert_eq!(n, 42);
 }
 
@@ -345,13 +350,12 @@ fn startup_phase_only_fires_init() {
     // Loader component's forwarders deliver those when the host dispatches
     // them for real.
     let _guard = CALLBACK_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let f = NamedTempFile::new().unwrap();
-    config_with_one_sub(f.path(), "octocat", "hello-world");
+    let dir = tempdir().unwrap();
     reset_counters();
 
     let mut component = make_fake_component();
     run_init_sequence_at(
-        f.path(),
+        dir.path(),
         &mut component,
         "octocat",
         "hello-world",
@@ -369,13 +373,12 @@ fn catchup_phase_fires_all_three_callbacks() {
     // because the host has already dispatched OnNewMap / first
     // OnNewMapLoaded against an empty LOADED before we got here.
     let _guard = CALLBACK_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let f = NamedTempFile::new().unwrap();
-    config_with_one_sub(f.path(), "octocat", "hello-world");
+    let dir = tempdir().unwrap();
     reset_counters();
 
     let mut component = make_fake_component();
     run_init_sequence_at(
-        f.path(),
+        dir.path(),
         &mut component,
         "octocat",
         "hello-world",
@@ -387,67 +390,57 @@ fn catchup_phase_fires_all_three_callbacks() {
     assert_eq!(ON_NEW_MAP_LOADED_CALLS.load(Ordering::SeqCst), 1);
 }
 
-// classify_carryover_at tests. SKIPPED_CARRYOVER is a thread_local set that
-// the production code populates from Startup and consults from later phases;
-// tests run on the same test thread, so we serialize on a Mutex AND drain
-// the set up front for a clean baseline. The set is private to loader::mod
-// — accessed here via super::SKIPPED_CARRYOVER for test-only inspection.
+// classify_carryover_at tests. SKIPPED_CARRYOVER is a thread_local set of
+// "we already decided this run, stay quiet" entries; CARRYOVERS is the
+// per-process cache of the on-disk-derived dead-PID scan. Both are
+// populated by the production code; tests run on the same test thread, so
+// we serialize on a Mutex AND drain both up front for a clean baseline.
 
 static CARRYOVER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn reset_carryover_state() {
     SKIPPED_CARRYOVER.with_borrow_mut(HashSet::clear);
+    CARRYOVERS.with_borrow_mut(|slot| *slot = None);
 }
 
 fn carryover_contains(owner: &str, repo: &str) -> bool {
     SKIPPED_CARRYOVER.with_borrow(|s| s.contains(&(owner.to_owned(), repo.to_owned())))
 }
 
-fn config_with_breadcrumb(path: &std::path::Path, owner: &str, repo: &str, callback: &str) {
-    let mut repos = BTreeMap::new();
-    repos.insert(
-        repo.into(),
-        Subscription {
-            state: SubscriptionState {
-                in_callback: Some(callback.into()),
-                ..SubscriptionState::default()
-            },
-            ..Subscription::default()
-        },
-    );
-    let mut subscriptions = BTreeMap::new();
-    subscriptions.insert(owner.into(), repos);
-    Config { subscriptions }.save_to(path).unwrap();
-}
-
-fn load_sub(path: &std::path::Path, owner: &str, repo: &str) -> Subscription {
-    Config::load_from(path)
-        .unwrap()
-        .subscriptions
-        .remove(owner)
-        .and_then(|mut m| m.remove(repo))
-        .expect("sub present")
+/// Drop a `<ns>-<pid>.toml` file in `dir` so the production
+/// `breadcrumb::collect_dead` scan picks it up. Returns the path for
+/// follow-up assertions.
+fn seed_breadcrumb_file(dir: &Path, pid: u32, owner: &str, repo: &str, callback: &str) -> PathBuf {
+    fs::create_dir_all(dir).unwrap();
+    let body = format!("owner = \"{owner}\"\nrepo = \"{repo}\"\ncallback = \"{callback}\"\n");
+    let path = breadcrumb_file(dir, pid);
+    fs::write(&path, body).unwrap();
+    path
 }
 
 #[test]
-fn startup_phase_records_carryover_and_clears_disk() {
+fn startup_phase_records_carryover_and_consumes_disk_file() {
     // Real carry-over from a previous-session crash: Startup must mark the
-    // sub in SKIPPED_CARRYOVER (so Catchup respects the skip) AND clear the
-    // disk breadcrumb (so the *next* session can auto-retry rather than
-    // staying stuck forever).
+    // sub in SKIPPED_CARRYOVER (so Catchup respects the skip) AND unlink
+    // the on-disk breadcrumb file (so the *next* session can auto-retry
+    // rather than staying stuck forever).
     let _guard = CARRYOVER_TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     reset_carryover_state();
-    let f = NamedTempFile::new().unwrap();
-    config_with_breadcrumb(f.path(), "octocat", "hello-world", "OnNewMapLoaded");
-    let sub = load_sub(f.path(), "octocat", "hello-world");
-
-    let outcome = classify_carryover_at(
-        f.path(),
+    let dir = tempdir().unwrap();
+    let bc = seed_breadcrumb_file(
+        dir.path(),
+        SEED_PID,
         "octocat",
         "hello-world",
-        &sub,
+        "OnNewMapLoaded",
+    );
+
+    let outcome = classify_carryover_at(
+        dir.path(),
+        "octocat",
+        "hello-world",
         LifecyclePhase::Startup,
     );
 
@@ -456,46 +449,44 @@ fn startup_phase_records_carryover_and_clears_disk() {
         Some(LoadOutcome::CrashCarryover { ref previous }) if previous == "OnNewMapLoaded"
     ));
     assert!(carryover_contains("octocat", "hello-world"));
-    assert!(read_in_callback(f.path(), "octocat", "hello-world").is_none());
+    assert!(!bc.exists(), "{} should be unlinked", bc.display());
 }
 
 #[test]
-fn catchup_phase_does_not_read_disk_breadcrumb() {
-    // The race regression guard: a worker-thread Config::load() can land
-    // mid-flicker and snapshot in_callback=Some. Catchup must NOT treat
-    // that as a carry-over — the disk breadcrumb is only the source of
-    // truth at Startup.
+fn catchup_phase_does_not_scan_disk() {
+    // A breadcrumb file on disk must NOT count as a carry-over on
+    // Catchup: Startup is the only phase that consults the scan. The
+    // file must be left alone for a *future* Startup to pick up.
     let _guard = CARRYOVER_TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     reset_carryover_state();
-    let f = NamedTempFile::new().unwrap();
-    config_with_breadcrumb(f.path(), "octocat", "hello-world", "OnNewMapLoaded");
-    let sub = load_sub(f.path(), "octocat", "hello-world");
-
-    let outcome = classify_carryover_at(
-        f.path(),
+    let dir = tempdir().unwrap();
+    let bc = seed_breadcrumb_file(
+        dir.path(),
+        SEED_PID,
         "octocat",
         "hello-world",
-        &sub,
+        "OnNewMapLoaded",
+    );
+
+    let outcome = classify_carryover_at(
+        dir.path(),
+        "octocat",
+        "hello-world",
         LifecyclePhase::Catchup,
     );
 
     assert!(outcome.is_none(), "Catchup must fall through");
     assert!(!carryover_contains("octocat", "hello-world"));
-    assert_eq!(
-        read_in_callback(f.path(), "octocat", "hello-world").as_deref(),
-        Some("OnNewMapLoaded"),
-        "disk breadcrumb must be left alone on Catchup",
-    );
+    assert!(bc.exists(), "Catchup must leave the disk file alone");
 }
 
 #[test]
 fn catchup_phase_respects_skipped_carryover_set() {
     // Startup-decision-preserved-into-Catchup: once Startup recorded the
     // skip (via real carry-over OR a hand-populated set in this test),
-    // later phases short-circuit to SkippedFromCarryover regardless of
-    // what the disk breadcrumb says.
+    // later phases short-circuit to SkippedFromCarryover.
     let _guard = CARRYOVER_TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -503,15 +494,12 @@ fn catchup_phase_respects_skipped_carryover_set() {
     SKIPPED_CARRYOVER.with_borrow_mut(|s| {
         s.insert(("octocat".into(), "hello-world".into()));
     });
-    let f = NamedTempFile::new().unwrap();
-    config_with_one_sub(f.path(), "octocat", "hello-world");
-    let sub = load_sub(f.path(), "octocat", "hello-world");
+    let dir = tempdir().unwrap();
 
     let outcome = classify_carryover_at(
-        f.path(),
+        dir.path(),
         "octocat",
         "hello-world",
-        &sub,
         LifecyclePhase::Catchup,
     );
 
@@ -521,7 +509,9 @@ fn catchup_phase_respects_skipped_carryover_set() {
 #[test]
 fn clear_carryover_skip_allows_subsequent_attempt() {
     // Explicit-retry path (`/load`, post-`/update` reload): clearing the
-    // skip must let the next classify_carryover_at fall through.
+    // skip must let the next classify_carryover_at fall through, both the
+    // in-process SKIPPED_CARRYOVER set AND any cached CARRYOVERS entry
+    // (otherwise re-classify would re-fire the carry-over outcome).
     let _guard = CARRYOVER_TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -529,17 +519,24 @@ fn clear_carryover_skip_allows_subsequent_attempt() {
     SKIPPED_CARRYOVER.with_borrow_mut(|s| {
         s.insert(("octocat".into(), "hello-world".into()));
     });
+    CARRYOVERS.with_borrow_mut(|slot| {
+        let mut m = std::collections::HashMap::new();
+        m.insert(("octocat".into(), "hello-world".into()), "Init".into());
+        *slot = Some(m);
+    });
+
     clear_carryover_skip("octocat", "hello-world");
     assert!(!carryover_contains("octocat", "hello-world"));
+    CARRYOVERS.with_borrow(|slot| {
+        let m = slot.as_ref().unwrap();
+        assert!(!m.contains_key(&("octocat".to_owned(), "hello-world".to_owned())));
+    });
 
-    let f = NamedTempFile::new().unwrap();
-    config_with_one_sub(f.path(), "octocat", "hello-world");
-    let sub = load_sub(f.path(), "octocat", "hello-world");
+    let dir = tempdir().unwrap();
     let outcome = classify_carryover_at(
-        f.path(),
+        dir.path(),
         "octocat",
         "hello-world",
-        &sub,
         LifecyclePhase::Catchup,
     );
     assert!(outcome.is_none());
@@ -547,25 +544,89 @@ fn clear_carryover_skip_allows_subsequent_attempt() {
 
 #[test]
 fn startup_phase_falls_through_when_no_breadcrumb() {
-    // Common path on a clean previous session: no disk breadcrumb, no
-    // entry in SKIPPED_CARRYOVER → classify returns None and load_one
-    // proceeds to dlopen.
+    // Common path on a clean previous session: no on-disk breadcrumb
+    // file, no entry in SKIPPED_CARRYOVER -> classify returns None and
+    // load_one proceeds to dlopen.
     let _guard = CARRYOVER_TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     reset_carryover_state();
-    let f = NamedTempFile::new().unwrap();
-    config_with_one_sub(f.path(), "octocat", "hello-world");
-    let sub = load_sub(f.path(), "octocat", "hello-world");
+    let dir = tempdir().unwrap();
 
     let outcome = classify_carryover_at(
-        f.path(),
+        dir.path(),
         "octocat",
         "hello-world",
-        &sub,
         LifecyclePhase::Startup,
     );
 
     assert!(outcome.is_none());
     assert!(!carryover_contains("octocat", "hello-world"));
+}
+
+#[test]
+fn prime_carryover_scan_unlinks_files_even_with_no_subs() {
+    // The "user has zero subscriptions" / "all subs disabled" / "only-self"
+    // cases never reach classify_carryover_at, so the lazy in-classify scan
+    // would never fire. The eager prime call from Loader::init must clean
+    // up leftover breadcrumb files anyway.
+    let _guard = CARRYOVER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    reset_carryover_state();
+    let dir = tempdir().unwrap();
+    let bc = seed_breadcrumb_file(dir.path(), SEED_PID, "octocat", "ghost-plugin", "OnNewMap");
+
+    prime_carryover_scan_at(dir.path());
+
+    assert!(!bc.exists(), "{} should be unlinked", bc.display());
+    // The entry remains in CARRYOVERS for any later classify_carryover_at
+    // call to pick up, even though no current sub references it.
+    CARRYOVERS.with_borrow(|slot| {
+        let m = slot.as_ref().expect("scan must populate slot");
+        assert_eq!(
+            m.get(&("octocat".to_owned(), "ghost-plugin".to_owned()))
+                .map(String::as_str),
+            Some("OnNewMap")
+        );
+    });
+}
+
+#[test]
+fn prime_carryover_scan_is_idempotent() {
+    // Second call must not re-scan / replace the slot - that would resurrect
+    // entries already consumed by classify_carryover_at's map.remove.
+    let _guard = CARRYOVER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    reset_carryover_state();
+    let dir = tempdir().unwrap();
+    seed_breadcrumb_file(dir.path(), SEED_PID, "octocat", "ghost", "Init");
+
+    prime_carryover_scan_at(dir.path());
+    // Simulate classify having consumed the entry.
+    CARRYOVERS.with_borrow_mut(|slot| {
+        slot.as_mut()
+            .unwrap()
+            .remove(&("octocat".into(), "ghost".into()));
+    });
+    // Re-seed (the first prime unlinked the original file, so we're
+    // writing a fresh file with new contents). If the second prime
+    // erroneously re-scanned, it would find this and insert
+    // (other, sub) into the map.
+    seed_breadcrumb_file(dir.path(), SEED_PID, "other", "sub", "Free");
+
+    prime_carryover_scan_at(dir.path());
+
+    CARRYOVERS.with_borrow(|slot| {
+        let m = slot.as_ref().unwrap();
+        assert!(
+            !m.contains_key(&("octocat".to_owned(), "ghost".to_owned())),
+            "consumed entry must stay consumed"
+        );
+        assert!(
+            !m.contains_key(&("other".to_owned(), "sub".to_owned())),
+            "second prime must not re-scan"
+        );
+    });
 }

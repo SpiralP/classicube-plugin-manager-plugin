@@ -1,4 +1,5 @@
 mod asset_match;
+mod breadcrumb;
 mod chat;
 mod component;
 mod components;

@@ -150,7 +150,6 @@ fn round_trip_populated_subscription() {
                 cached_tag: Some("v1.2.4".into()),
                 cached_at: Some(1_700_000_500),
                 cached_published_at: Some(1_700_000_400),
-                in_callback: None,
             },
             ..sub()
         },
@@ -618,126 +617,6 @@ fn token_skipped_when_absent() {
 }
 
 #[test]
-fn in_callback_round_trip() {
-    let cfg = one_sub_config(
-        "octocat",
-        "hello-world",
-        Subscription {
-            state: SubscriptionState {
-                in_callback: Some("OnNewMap".into()),
-                ..SubscriptionState::default()
-            },
-            ..sub()
-        },
-    );
-    let f = NamedTempFile::new().unwrap();
-    cfg.save_to(f.path()).unwrap();
-    let on_disk = fs::read_to_string(f.path()).unwrap();
-    assert!(
-        on_disk.contains("in_callback = \"OnNewMap\""),
-        "expected breadcrumb line in: {on_disk}",
-    );
-    let loaded = Config::load_from(f.path()).unwrap();
-    assert_eq!(loaded, cfg);
-}
-
-#[test]
-fn in_callback_alone_keeps_state_subtable() {
-    // The breadcrumb has to render even when nothing else is in `state` —
-    // otherwise the field is lost across save/reload and the carry-over
-    // check on next startup never fires.
-    let s = SubscriptionState {
-        in_callback: Some("Init".into()),
-        ..SubscriptionState::default()
-    };
-    assert!(!s.is_empty());
-
-    let cfg = one_sub_config("octocat", "hello-world", Subscription { state: s, ..sub() });
-    let f = NamedTempFile::new().unwrap();
-    cfg.save_to(f.path()).unwrap();
-    let on_disk = fs::read_to_string(f.path()).unwrap();
-    assert!(
-        on_disk.contains("[octocat.hello-world.state]"),
-        "expected state subtable in: {on_disk}",
-    );
-}
-
-#[test]
-fn set_in_callback_to_persists() {
-    let f = NamedTempFile::new().unwrap();
-    one_sub_config("octocat", "hello-world", sub())
-        .save_to(f.path())
-        .unwrap();
-
-    super::set_in_callback_to(f.path(), "octocat", "hello-world", Some("Init".into())).unwrap();
-    let loaded = Config::load_from(f.path()).unwrap();
-    let (_, _, s) = first_sub(&loaded);
-    assert_eq!(s.state.in_callback.as_deref(), Some("Init"));
-
-    super::set_in_callback_to(f.path(), "octocat", "hello-world", None).unwrap();
-    let loaded = Config::load_from(f.path()).unwrap();
-    let (_, _, s) = first_sub(&loaded);
-    assert!(s.state.in_callback.is_none());
-}
-
-#[test]
-fn set_in_callback_to_preserves_other_fields() {
-    // The breadcrumb writer must not stomp on existing install/cache state —
-    // a crash during a callback shouldn't lose the installed_version or
-    // cached_at that other code paths wrote earlier.
-    let prepared = Subscription {
-        channel: Channel::Prerelease,
-        disabled: false,
-        token: Some(Secret::new("github_pat_xyz".into())),
-        state: SubscriptionState {
-            installed_version: Some("v1.2.3".into()),
-            installed_asset: Some("plugin.so".into()),
-            installed_at: Some(1_700_000_000),
-            cached_tag: Some("v1.2.4".into()),
-            cached_at: Some(1_700_000_500),
-            cached_published_at: Some(1_700_000_400),
-            in_callback: None,
-        },
-    };
-    let f = NamedTempFile::new().unwrap();
-    one_sub_config("octocat", "hello-world", prepared.clone())
-        .save_to(f.path())
-        .unwrap();
-
-    super::set_in_callback_to(f.path(), "octocat", "hello-world", Some("OnNewMap".into())).unwrap();
-    let loaded = Config::load_from(f.path()).unwrap();
-    let (_, _, s) = first_sub(&loaded);
-    assert_eq!(s.channel, prepared.channel);
-    assert_eq!(s.token, prepared.token);
-    assert_eq!(s.state.installed_version, prepared.state.installed_version);
-    assert_eq!(s.state.installed_asset, prepared.state.installed_asset);
-    assert_eq!(s.state.installed_at, prepared.state.installed_at);
-    assert_eq!(s.state.cached_tag, prepared.state.cached_tag);
-    assert_eq!(s.state.cached_at, prepared.state.cached_at);
-    assert_eq!(
-        s.state.cached_published_at,
-        prepared.state.cached_published_at
-    );
-    assert_eq!(s.state.in_callback.as_deref(), Some("OnNewMap"));
-}
-
-#[test]
-fn set_in_callback_to_unknown_sub_is_noop() {
-    // The (owner, repo) might not exist if the user `/unsubscribe`d between
-    // breadcrumb-set and breadcrumb-clear; the writer must not invent a
-    // subscription out of thin air just to record a breadcrumb.
-    let f = NamedTempFile::new().unwrap();
-    one_sub_config("octocat", "hello-world", sub())
-        .save_to(f.path())
-        .unwrap();
-
-    super::set_in_callback_to(f.path(), "ghost", "missing", Some("Init".into())).unwrap();
-    let loaded = Config::load_from(f.path()).unwrap();
-    assert!(!loaded.subscriptions.contains_key("ghost"));
-    assert!(loaded.subscriptions.contains_key("octocat"));
-}
-
-#[test]
 fn debug_subscription_redacts_token() {
     // Subscription derives Debug; the token field's `Secret` newtype must
     // redact rather than leak the literal PAT into a `tracing` emit or a
@@ -927,7 +806,6 @@ fn fields_render_in_alphabetical_order() {
                 cached_at: Some(2),
                 cached_published_at: Some(3),
                 cached_tag: Some("t".into()),
-                in_callback: Some("Init".into()),
                 installed_asset: Some("a.so".into()),
                 installed_at: Some(1),
                 installed_version: Some("v".into()),
@@ -946,18 +824,16 @@ fn fields_render_in_alphabetical_order() {
     assert!(p_disabled < p_token, "disabled before token");
 
     // SubscriptionState: cached_at < cached_published_at < cached_tag <
-    // in_callback < installed_asset < installed_at < installed_version.
+    // installed_asset < installed_at < installed_version.
     let p_cached_at = on_disk.find("cached_at = ").unwrap();
     let p_cached_published_at = on_disk.find("cached_published_at = ").unwrap();
     let p_cached_tag = on_disk.find("cached_tag = ").unwrap();
-    let p_in_callback = on_disk.find("in_callback = ").unwrap();
     let p_installed_asset = on_disk.find("installed_asset = ").unwrap();
     let p_installed_at = on_disk.find("installed_at = ").unwrap();
     let p_installed_version = on_disk.find("installed_version = ").unwrap();
     assert!(p_cached_at < p_cached_published_at);
     assert!(p_cached_published_at < p_cached_tag);
-    assert!(p_cached_tag < p_in_callback);
-    assert!(p_in_callback < p_installed_asset);
+    assert!(p_cached_tag < p_installed_asset);
     assert!(p_installed_asset < p_installed_at);
     assert!(p_installed_at < p_installed_version);
 }
@@ -1144,8 +1020,7 @@ fn migrate_legacy_config_keeps_new_self_when_both_keys_present() {
 /// concurrently. Without `Config::modify_at`'s lock, the later writer's
 /// `load -> mutate -> save` chain could clobber the earlier writer's
 /// change because both load+save are non-atomic together. With the lock,
-/// both fields land on disk regardless of order. This is the regression
-/// guard for the cef-loader stale-breadcrumb race.
+/// both fields land on disk regardless of order.
 #[test]
 fn modify_at_serializes_concurrent_writers() {
     let f = NamedTempFile::new().unwrap();
@@ -1157,32 +1032,32 @@ fn modify_at_serializes_concurrent_writers() {
     let iters = 64;
     let barrier = Arc::new(Barrier::new(2));
 
-    let writer_breadcrumb = {
+    let writer_install = {
         let path = path.clone();
         let barrier = barrier.clone();
         thread::spawn(move || {
             barrier.wait();
             for i in 0..iters {
-                let tag = format!("Init-{i}");
+                let asset = format!("plugin-{i}.so");
                 Config::modify_at(&path, |cfg| {
                     let sub = cfg
                         .subscriptions
                         .get_mut("octocat")
                         .and_then(|m| m.get_mut("hello-world"))
                         .unwrap();
-                    sub.state.in_callback = Some(tag.clone());
-                })
-                .unwrap();
-                Config::modify_at(&path, |cfg| {
-                    let sub = cfg
-                        .subscriptions
-                        .get_mut("octocat")
-                        .and_then(|m| m.get_mut("hello-world"))
-                        .unwrap();
-                    sub.state.in_callback = None;
+                    sub.state.installed_asset = Some(asset.clone());
                 })
                 .unwrap();
             }
+            Config::modify_at(&path, |cfg| {
+                let sub = cfg
+                    .subscriptions
+                    .get_mut("octocat")
+                    .and_then(|m| m.get_mut("hello-world"))
+                    .unwrap();
+                sub.state.installed_asset = None;
+            })
+            .unwrap();
         })
     };
 
@@ -1206,16 +1081,16 @@ fn modify_at_serializes_concurrent_writers() {
         })
     };
 
-    writer_breadcrumb.join().unwrap();
+    writer_install.join().unwrap();
     writer_cache.join().unwrap();
 
     let final_cfg = Config::load_from(&path).unwrap();
     let (_, _, s) = first_sub(&final_cfg);
-    // breadcrumb writer ends with None.
+    // install writer ends with None.
     assert!(
-        s.state.in_callback.is_none(),
-        "stale breadcrumb after concurrent writers: {:?}",
-        s.state.in_callback,
+        s.state.installed_asset.is_none(),
+        "stale installed_asset after concurrent writers: {:?}",
+        s.state.installed_asset,
     );
     // cache writer ends with the last iter's value.
     assert_eq!(s.state.cached_at, Some(iters - 1));

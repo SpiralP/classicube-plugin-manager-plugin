@@ -21,6 +21,7 @@ use crate::{
 
 pub const PLUGINS_DIR: &str = "plugins";
 pub const MANAGED_DIR: &str = "plugins/managed";
+pub const BREADCRUMB_DIR: &str = "plugins/managed/breadcrumbs";
 
 /// Build the on-disk filename for a managed plugin binary. Including the
 /// version tag in the filename gives every release a distinct path, which is

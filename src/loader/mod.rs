@@ -5,7 +5,7 @@ mod tests;
 
 use std::{
     cell::RefCell,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, fs, io,
     os::raw::{c_int, c_void},
     path::{Path, PathBuf},
@@ -16,11 +16,11 @@ use classicube_sys::IGameComponent;
 use tracing::{debug, error, warn};
 
 use crate::{
-    asset_match,
+    asset_match, breadcrumb,
     chat::print_wrapped,
     component::Plugin_ApiVersion,
-    config::{self, Subscription, config_path},
-    installer::{MANAGED_DIR, PLUGINS_DIR},
+    config::{self, Subscription},
+    installer::{BREADCRUMB_DIR, MANAGED_DIR, PLUGINS_DIR},
 };
 
 // Why we don't `dlclose` / `FreeLibrary` managed plugins on unload:
@@ -58,16 +58,19 @@ thread_local!(
 );
 
 // Subs that the Startup carry-over check decided to skip this session.
-// The disk `in_callback` breadcrumb is the source of truth ONLY at Startup,
-// before any callback has fired and started flickering it on/off; after
-// that, a worker-thread `Config::load()` from the deferred update pass can
-// land mid-`with_breadcrumb_at` and see a transient `Some` that has nothing
-// to do with last session's crash. So we read the disk breadcrumb only at
-// Startup, copy "skip this sub" into this set, and have all later phases
-// (Catchup, the deferred pass's auto-load) consult the set instead. Tests
-// rely on the loader running on the test thread, hence `thread_local!`.
+// `CARRYOVERS` is the on-disk-derived map populated once at the first
+// Startup-phase `classify_carryover_at` call by scanning for
+// breadcrumb files; `SKIPPED_CARRYOVER` is the in-process
+// "we've already chatted about this one, keep silent" set used by
+// later phases (Catchup, the deferred pass's auto-load) so they don't
+// re-rescan the disk during a session. Tests rely on the loader
+// running on the test thread, hence `thread_local!`.
 thread_local!(
     static SKIPPED_CARRYOVER: RefCell<HashSet<(String, String)>> = RefCell::default();
+);
+thread_local!(
+    static CARRYOVERS: RefCell<Option<HashMap<(String, String), String>>> =
+        const { RefCell::new(None) };
 );
 
 /// Which lifecycle callbacks to invoke after a successful `dlopen` + `Init`.
@@ -106,12 +109,13 @@ pub enum LoadOutcome {
     Disabled,
     /// `(owner, repo)` is the manager itself - the game already owns its handle.
     IsSelf,
-    /// Previous session left an `in_callback` breadcrumb on this sub, just
-    /// detected by the Startup pass. The disk breadcrumb is cleared so the
-    /// next session can auto-retry, and the sub is recorded in
-    /// `SKIPPED_CARRYOVER` so any subsequent auto-load attempt this session
-    /// (e.g. the deferred pass's Catchup) returns `SkippedFromCarryover`
-    /// without re-chatting. The carry-over name is returned for chat.
+    /// Previous session left a per-process breadcrumb file naming this
+    /// sub, just detected by the Startup pass. The disk breadcrumb is
+    /// cleared so the next session can auto-retry, and the sub is
+    /// recorded in `SKIPPED_CARRYOVER` so any subsequent auto-load
+    /// attempt this session (e.g. the deferred pass's Catchup) returns
+    /// `SkippedFromCarryover` without re-chatting. The carry-over
+    /// callback name is returned for chat.
     CrashCarryover { previous: String },
     /// Startup already detected and chatted a carry-over for this sub; a
     /// later auto-load attempt is honoring that decision silently. The
@@ -161,6 +165,34 @@ fn classify_early(owner: &str, repo: &str, sub: &Subscription) -> Option<LoadOut
     None
 }
 
+/// Populate `CARRYOVERS` from a breadcrumb-file scan if it hasn't
+/// been populated yet this session. Called eagerly from `Loader::init`
+/// before any of its early-return paths so leftover breadcrumb files
+/// get cleaned up even when the user has zero subscriptions, only
+/// `disabled` subs, or only the self sub (each of which would otherwise
+/// short-circuit `classify_carryover_at` and leave the lazy scan
+/// unfired). Idempotent: a populated slot is left untouched so consumed
+/// entries (via `map.remove`) aren't resurrected.
+pub fn prime_carryover_scan() {
+    prime_carryover_scan_at(Path::new(BREADCRUMB_DIR));
+}
+
+fn prime_carryover_scan_at(dir: &Path) {
+    CARRYOVERS.with_borrow_mut(|slot| {
+        if slot.is_some() {
+            return;
+        }
+        let map = match breadcrumb::collect_dead(dir) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("scanning crash-recovery breadcrumbs: {e:#}");
+                HashMap::new()
+            }
+        };
+        *slot = Some(map);
+    });
+}
+
 /// Carry-over classification, split out of `load_one` so tests can drive it
 /// against a temp config without pulling `plugin::try_load` symbols into the
 /// test link graph. Returns `Some(_)` when load should short-circuit.
@@ -169,51 +201,54 @@ fn classify_early(owner: &str, repo: &str, sub: &Subscription) -> Option<LoadOut
 /// 1. `SKIPPED_CARRYOVER` already contains `(owner, repo)` (any phase) -
 ///    Startup detected a carry-over earlier this session. Returns
 ///    `SkippedFromCarryover` (silent).
-/// 2. `phase == Startup` and `sub.state.in_callback` is `Some(_)` on disk -
-///    last session crashed. Records the sub in `SKIPPED_CARRYOVER`, clears
-///    the disk breadcrumb (so next session auto-retries), returns
-///    `CrashCarryover { previous }`.
+/// 2. `phase == Startup` and a breadcrumb file in `BREADCRUMB_DIR`
+///    reports `(owner, repo)` as the crash victim - last session
+///    crashed. The disk scan happens once per process (cached in
+///    `CARRYOVERS`), the consumed file is unlinked by
+///    `breadcrumb::collect_dead`, and the sub is recorded in
+///    `SKIPPED_CARRYOVER` so subsequent Catchup-phase attempts return
+///    `SkippedFromCarryover` silently.
 ///
-/// Catchup intentionally does NOT read the disk breadcrumb: at that point
-/// the host is firing managed-plugin callbacks on the main thread and
-/// `with_breadcrumb_at` is flickering `in_callback` on/off; a worker-thread
-/// `Config::load()` can land between the set and clear and produce a
-/// false-positive carry-over.
+/// Catchup intentionally does NOT re-scan: at that point a breadcrumb
+/// file we wrote ourselves mid-callback may be on disk, and a re-scan
+/// would consume it and false-positive a carry-over.
 fn classify_carryover_at(
-    path: &Path,
+    dir: &Path,
     owner: &str,
     repo: &str,
-    sub: &Subscription,
     phase: LifecyclePhase,
 ) -> Option<LoadOutcome> {
     let key = (owner.to_owned(), repo.to_owned());
     if SKIPPED_CARRYOVER.with_borrow(|s| s.contains(&key)) {
         return Some(LoadOutcome::SkippedFromCarryover);
     }
-    if phase == LifecyclePhase::Startup
-        && let Some(prev) = sub.state.in_callback.as_deref()
-    {
-        let previous = prev.to_owned();
-        SKIPPED_CARRYOVER.with_borrow_mut(|s| {
-            s.insert(key);
-        });
-        if let Err(e) = config::set_in_callback_to(path, owner, repo, None) {
-            warn!("clearing carry-over breadcrumb for {owner}/{repo}: {e:#}");
-        }
-        return Some(LoadOutcome::CrashCarryover { previous });
+    if phase != LifecyclePhase::Startup {
+        return None;
     }
-    None
+    prime_carryover_scan_at(dir);
+    let previous = CARRYOVERS.with_borrow_mut(|slot| slot.as_mut().and_then(|m| m.remove(&key)))?;
+    SKIPPED_CARRYOVER.with_borrow_mut(|s| {
+        s.insert(key);
+    });
+    Some(LoadOutcome::CrashCarryover { previous })
 }
 
-/// Drop `(owner, repo)` from the in-process carry-over skip set so a
-/// subsequent `load_one` can attempt the dlopen even if the Startup pass
-/// previously declared this sub crashed-this-session. Used by explicit
-/// user-driven retry paths (`/load`, post-`/update` reload). The deferred
-/// update pass's auto-load does NOT call this - Startup-skipped subs stay
-/// skipped until the user opts in via one of those commands.
+/// Drop `(owner, repo)` from the in-process carry-over skip set (and any
+/// cached `CARRYOVERS` entry) so a subsequent `load_one` can attempt the
+/// dlopen even if the Startup pass previously declared this sub
+/// crashed-this-session. Used by explicit user-driven retry paths
+/// (`/load`, post-`/update` reload). The deferred update pass's auto-load
+/// does NOT call this - Startup-skipped subs stay skipped until the user
+/// opts in via one of those commands.
 pub fn clear_carryover_skip(owner: &str, repo: &str) {
+    let key = (owner.to_owned(), repo.to_owned());
     SKIPPED_CARRYOVER.with_borrow_mut(|s| {
-        s.remove(&(owner.to_owned(), repo.to_owned()));
+        s.remove(&key);
+    });
+    CARRYOVERS.with_borrow_mut(|slot| {
+        if let Some(map) = slot.as_mut() {
+            map.remove(&key);
+        }
     });
 }
 
@@ -227,7 +262,7 @@ pub fn load_one(owner: &str, repo: &str, sub: &Subscription, phase: LifecyclePha
     if let Some(o) = classify_early(owner, repo, sub) {
         return o;
     }
-    if let Some(o) = classify_carryover_at(config_path(), owner, repo, sub, phase) {
+    if let Some(o) = classify_carryover_at(Path::new(BREADCRUMB_DIR), owner, repo, phase) {
         return o;
     }
     let id = format!("{owner}/{repo}");
@@ -422,11 +457,11 @@ fn run_init_sequence(
     repo: &str,
     phase: LifecyclePhase,
 ) {
-    run_init_sequence_at(config_path(), component, owner, repo, phase);
+    run_init_sequence_at(Path::new(BREADCRUMB_DIR), component, owner, repo, phase);
 }
 
 fn run_init_sequence_at(
-    path: &Path,
+    dir: &Path,
     component: *mut IGameComponent,
     owner: &str,
     repo: &str,
@@ -436,7 +471,7 @@ fn run_init_sequence_at(
     let component = unsafe { &mut *component };
     if let Some(f) = component.Init {
         debug!("calling Init on {id}");
-        with_breadcrumb_at(path, owner, repo, "Init", || unsafe { f() });
+        with_breadcrumb_at(dir, owner, repo, "Init", || unsafe { f() });
     }
     // Startup runs from the host's own Init callback - the host has NOT yet
     // dispatched OnNewMap or OnNewMapLoaded, so we must not pre-fire them.
@@ -447,20 +482,22 @@ fn run_init_sequence_at(
     }
     if let Some(f) = component.OnNewMap {
         debug!("calling OnNewMap on {id}");
-        with_breadcrumb_at(path, owner, repo, "OnNewMap", || unsafe { f() });
+        with_breadcrumb_at(dir, owner, repo, "OnNewMap", || unsafe { f() });
     }
     if let Some(f) = component.OnNewMapLoaded {
         debug!("calling OnNewMapLoaded on {id}");
-        with_breadcrumb_at(path, owner, repo, "OnNewMapLoaded", || unsafe { f() });
+        with_breadcrumb_at(dir, owner, repo, "OnNewMapLoaded", || unsafe { f() });
     }
 }
 
 pub fn free() {
     // Don't carry skip decisions across a hot-reload boundary. The next
-    // Startup will repopulate from the on-disk breadcrumb if the previous
-    // session actually crashed; stale entries from this cycle would otherwise
-    // suppress a legitimate retry after the user reloads us.
+    // Startup will repopulate from any dead-PID breadcrumb file on disk
+    // if the previous session actually crashed; stale entries from this
+    // cycle would otherwise suppress a legitimate retry after the user
+    // reloads us.
     SKIPPED_CARRYOVER.with_borrow_mut(HashSet::clear);
+    CARRYOVERS.with_borrow_mut(|slot| *slot = None);
 
     let drained: Vec<LoadedPlugin> =
         LOADED.with_borrow_mut(|loaded| loaded.drain(..).rev().collect());
@@ -470,6 +507,13 @@ pub fn free() {
             debug!("calling Free on {}/{}", plugin.owner, plugin.repo);
             with_breadcrumb(&plugin.owner, &plugin.repo, "Free", || unsafe { f() });
         }
+    }
+
+    // Graceful teardown: remove our own breadcrumb file so the next
+    // startup doesn't mistake it for a crash carry-over. A real crash
+    // skips this and leaves the file behind on purpose.
+    if let Err(e) = breadcrumb::clear(Path::new(BREADCRUMB_DIR)) {
+        warn!("clearing breadcrumb on free: {e:#}");
     }
 }
 
@@ -504,26 +548,26 @@ fn forward_callback(name: &str, pick: impl Fn(&IGameComponent) -> Option<unsafe 
 }
 
 fn with_breadcrumb<R>(owner: &str, repo: &str, callback: &str, f: impl FnOnce() -> R) -> R {
-    with_breadcrumb_at(config_path(), owner, repo, callback, f)
+    with_breadcrumb_at(Path::new(BREADCRUMB_DIR), owner, repo, callback, f)
 }
 
-/// Persist `in_callback = Some(name)` for `(owner, repo)`, run `f`, then
-/// clear `in_callback` and persist again. If `f` panics or the process dies
-/// mid-call, the breadcrumb survives — that's the entire point. The
+/// Write a per-process breadcrumb file naming `(owner, repo, callback)`,
+/// run `f`, then delete the file. If `f` panics or the process dies
+/// mid-call, the file survives - that's the entire point. The
 /// `let r = f(); clear; r` shape (rather than `Drop`) is deliberate so an
 /// unwind skips the clear and leaves the breadcrumb on disk.
 fn with_breadcrumb_at<R>(
-    path: &Path,
+    dir: &Path,
     owner: &str,
     repo: &str,
     callback: &str,
     f: impl FnOnce() -> R,
 ) -> R {
-    if let Err(e) = config::set_in_callback_to(path, owner, repo, Some(callback.into())) {
+    if let Err(e) = breadcrumb::write(dir, owner, repo, callback) {
         warn!("breadcrumb set for {owner}/{repo} {callback}: {e:#}");
     }
     let r = f();
-    if let Err(e) = config::set_in_callback_to(path, owner, repo, None) {
+    if let Err(e) = breadcrumb::clear(dir) {
         warn!("breadcrumb clear for {owner}/{repo} {callback}: {e:#}");
     }
     r

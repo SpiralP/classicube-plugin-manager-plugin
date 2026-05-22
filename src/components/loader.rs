@@ -15,6 +15,14 @@ impl Component for Loader {
     }
 
     fn init(&mut self) {
+        // Sweep stale per-process breadcrumb files (BREADCRUMB_DIR) from
+        // previous-session crashes BEFORE any of the early-return paths
+        // below. A user with zero subscriptions, an all-disabled config,
+        // or only the self sub (each of which short-circuits
+        // classify_carryover_at) would otherwise never trigger the lazy
+        // scan and dead-PID breadcrumb files would accumulate forever.
+        loader::prime_carryover_scan();
+
         // Load managed plugins from the host's own Init pass, BEFORE the
         // CPE handshake (Game.c calls component Init at lines 468-469, then
         // Server.BeginConnect at line 486). This gives managed plugins the

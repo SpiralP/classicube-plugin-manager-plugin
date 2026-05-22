@@ -17,14 +17,11 @@ use tempfile::NamedTempFile;
 use crate::secret::Secret;
 
 /// Process-wide lock around the load + mutate + save chain. Held for the
-/// entire body of [`Config::modify_at`] so concurrent writers from the
-/// main thread (breadcrumb writes wrapping each managed-plugin callback)
-/// and worker threads (the deferred update pass, chat-command handlers)
-/// can't interleave. Without this, a worker that loads stale state and
-/// saves later overwrites a main-thread write that landed in between -
-/// the symptom is a stale `in_callback` breadcrumb that survives a clean
-/// session and triggers a false-positive `crashed inside ...` warning on
-/// the next boot.
+/// entire body of [`Config::modify_at`] so the main thread and worker
+/// threads (the deferred update pass, chat-command handlers) can't
+/// interleave a read-modify-write cycle. Without this, a worker that
+/// loaded stale state could save later and silently overwrite an edit
+/// landed in between.
 static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 
 const CONFIG_PATH: &str = "plugins/plugin-manager.toml";
@@ -229,13 +226,6 @@ pub struct SubscriptionState {
     pub cached_published_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_tag: Option<String>,
-    /// Crash-recovery breadcrumb: the name of the managed-plugin
-    /// `IGameComponent` callback currently in flight. Set right before we
-    /// invoke a managed callback (and persisted to disk), cleared right after
-    /// it returns. If the game crashes during the callback, this field
-    /// survives the restart and tells us who to blame.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub in_callback: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installed_asset: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -249,7 +239,6 @@ impl SubscriptionState {
         self.cached_at.is_none()
             && self.cached_published_at.is_none()
             && self.cached_tag.is_none()
-            && self.in_callback.is_none()
             && self.installed_asset.is_none()
             && self.installed_at.is_none()
             && self.installed_version.is_none()
@@ -441,29 +430,6 @@ impl Config {
         }
         Ok(())
     }
-}
-
-/// Set or clear the crash-recovery breadcrumb for one subscription, then
-/// persist. Re-reads the on-disk config first so a concurrent cache write
-/// from the background manager task doesn't clobber the breadcrumb (and
-/// vice-versa) — same pattern as `persist_cache_updates_to`.
-///
-/// No-op if the subscription is no longer present.
-pub fn set_in_callback_to(
-    path: &Path,
-    owner: &str,
-    repo: &str,
-    value: Option<String>,
-) -> Result<()> {
-    Config::modify_at(path, |cfg| {
-        if let Some(sub) = cfg
-            .subscriptions
-            .get_mut(owner)
-            .and_then(|m| m.get_mut(repo))
-        {
-            sub.state.in_callback = value;
-        }
-    })
 }
 
 fn validate_segment(kind: &str, s: &str) -> Result<()> {
