@@ -46,6 +46,12 @@ impl Component for Manager {
         if let Err(e) = config::migrate_legacy_config() {
             warn!("legacy config migration failed: {e:#}");
         }
+        // v4 -> v5: lift `[owner.repo.state]` subtables out of the user
+        // file into `plugins/managed/state.toml`. Runs after the v3->v4
+        // rename so a v3 install gets renamed then split in a single boot.
+        if let Err(e) = config::migrate_state_into_sidecar() {
+            warn!("state sidecar migration failed: {e:#}");
+        }
     }
 
     fn free(&mut self) {

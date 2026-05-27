@@ -1,11 +1,11 @@
 use std::{
     collections::BTreeMap,
-    io::Write,
+    path::{Path, PathBuf},
     sync::{Arc, Barrier},
     thread,
 };
 
-use tempfile::{NamedTempFile, tempdir};
+use tempfile::{TempDir, tempdir};
 
 use super::*;
 
@@ -25,6 +25,32 @@ fn first_sub(cfg: &Config) -> (&str, &str, &Subscription) {
     let (owner, repos) = cfg.subscriptions.iter().next().unwrap();
     let (repo, sub) = repos.iter().next().unwrap();
     (owner, repo, sub)
+}
+
+/// Per-test scratch directory so the sidecar at `state_path_for(path)` is
+/// unique per test. Without this, parallel tests race on the same
+/// `/tmp/managed/state.toml` because `NamedTempFile::new()` places the file
+/// in the shared `/tmp` and the derived sidecar parent collapses to a single
+/// shared location.
+struct TempConfig {
+    _dir: TempDir,
+    path: PathBuf,
+}
+
+impl TempConfig {
+    fn new() -> Self {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("plugin-manager.toml");
+        Self { _dir: dir, path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn state_path(&self) -> PathBuf {
+        state_path_for(&self.path)
+    }
 }
 
 #[test]
@@ -122,8 +148,8 @@ fn load_missing_file_yields_default() {
 
 #[test]
 fn load_malformed_file_errors() {
-    let mut f = NamedTempFile::new().unwrap();
-    f.write_all(b"this is not = valid ::: toml [[[").unwrap();
+    let f = TempConfig::new();
+    fs::write(f.path(), b"this is not = valid ::: toml [[[").unwrap();
     let err = Config::load_from(f.path()).unwrap_err();
     let chain = format!("{err:#}");
     assert!(chain.contains("parsing"), "expected 'parsing' in: {chain}");
@@ -131,7 +157,7 @@ fn load_malformed_file_errors() {
 
 #[test]
 fn round_trip_default_config() {
-    let f = NamedTempFile::new().unwrap();
+    let f = TempConfig::new();
     Config::default().save_to(f.path()).unwrap();
     let loaded = Config::load_from(f.path()).unwrap();
     assert_eq!(loaded, Config::default());
@@ -154,7 +180,7 @@ fn round_trip_populated_subscription() {
             ..sub()
         },
     );
-    let f = NamedTempFile::new().unwrap();
+    let f = TempConfig::new();
     cfg.save_to(f.path()).unwrap();
     let loaded = Config::load_from(f.path()).unwrap();
     assert_eq!(loaded, cfg);
@@ -177,7 +203,7 @@ fn dotted_key_round_trip() {
     subscriptions.insert("SpiralP".into(), repos);
     let cfg = Config { subscriptions };
 
-    let f = NamedTempFile::new().unwrap();
+    let f = TempConfig::new();
     cfg.save_to(f.path()).unwrap();
     let on_disk = fs::read_to_string(f.path()).unwrap();
     assert!(
@@ -199,45 +225,22 @@ fn dotted_key_round_trip() {
 #[test]
 fn bare_subscription_skips_optional_fields_in_toml() {
     let cfg = one_sub_config("octocat", "hello-world", sub());
-    let f = NamedTempFile::new().unwrap();
+    let f = TempConfig::new();
     cfg.save_to(f.path()).unwrap();
     let on_disk = fs::read_to_string(f.path()).unwrap();
     assert!(!on_disk.contains("disabled"));
+    // State fields belong in the sidecar, never in the user file.
     assert!(!on_disk.contains("installed_version"));
     assert!(!on_disk.contains("installed_asset"));
     assert!(!on_disk.contains("installed_at"));
     assert!(!on_disk.contains("cached_tag"));
     assert!(!on_disk.contains("cached_at"));
     assert!(!on_disk.contains("cached_published_at"));
-    // The empty-state subtable is omitted entirely so a freshly-subscribed
-    // entry doesn't carry an empty `[octocat.hello-world.state]` header.
+    // No `[owner.repo.state]` subtables in the user file under the new
+    // layout - state moved to the sidecar.
     assert!(
         !on_disk.contains(".state]"),
-        "empty state subtable should be skipped: {on_disk}",
-    );
-    let loaded = Config::load_from(f.path()).unwrap();
-    assert_eq!(loaded, cfg);
-}
-
-#[test]
-fn state_subtable_round_trip() {
-    let cfg = one_sub_config(
-        "octocat",
-        "hello-world",
-        Subscription {
-            state: SubscriptionState {
-                installed_version: Some("v1.0.0".into()),
-                ..SubscriptionState::default()
-            },
-            ..sub()
-        },
-    );
-    let f = NamedTempFile::new().unwrap();
-    cfg.save_to(f.path()).unwrap();
-    let on_disk = fs::read_to_string(f.path()).unwrap();
-    assert!(
-        on_disk.contains("[octocat.hello-world.state]"),
-        "expected state subtable header in: {on_disk}",
+        "user file must not carry state subtables: {on_disk}",
     );
     let loaded = Config::load_from(f.path()).unwrap();
     assert_eq!(loaded, cfg);
@@ -253,7 +256,7 @@ fn disabled_round_trip() {
             ..sub()
         },
     );
-    let f = NamedTempFile::new().unwrap();
+    let f = TempConfig::new();
     cfg.save_to(f.path()).unwrap();
     let on_disk = fs::read_to_string(f.path()).unwrap();
     assert!(
@@ -346,7 +349,7 @@ fn channel_round_trip_in_subscription() {
     subscriptions.insert("a".into(), repos);
     let cfg = Config { subscriptions };
 
-    let f = NamedTempFile::new().unwrap();
+    let f = TempConfig::new();
     cfg.save_to(f.path()).unwrap();
     let on_disk = fs::read_to_string(f.path()).unwrap();
     // Default (stable) is skipped, others render as the agreed string form.
@@ -372,7 +375,7 @@ fn channel_round_trips_complex_tag() {
             ..sub()
         },
     );
-    let f = NamedTempFile::new().unwrap();
+    let f = TempConfig::new();
     cfg.save_to(f.path()).unwrap();
     let on_disk = fs::read_to_string(f.path()).unwrap();
     assert!(
@@ -520,7 +523,7 @@ fn keys_round_trip_in_alphabetical_order() {
         subscriptions.insert(owner.into(), repos);
     }
     let cfg = Config { subscriptions };
-    let f = NamedTempFile::new().unwrap();
+    let f = TempConfig::new();
     cfg.save_to(f.path()).unwrap();
     let loaded = Config::load_from(f.path()).unwrap();
     let owners: Vec<&String> = loaded.subscriptions.keys().collect();
@@ -536,8 +539,8 @@ fn rejects_repo_with_dot_on_load() {
     // the inner key name), so we have to reject it explicitly during
     // validation — without that, the loader would accept a repo name TOML
     // would later silently re-nest if the user removed the quotes.
-    let mut f = NamedTempFile::new().unwrap();
-    f.write_all(b"[a.\"b.c\"]\n").unwrap();
+    let f = TempConfig::new();
+    fs::write(f.path(), b"[a.\"b.c\"]\n").unwrap();
     let err = Config::load_from(f.path()).unwrap_err();
     let chain = format!("{err:#}");
     assert!(
@@ -549,8 +552,8 @@ fn rejects_repo_with_dot_on_load() {
 #[test]
 fn rejects_empty_owner_segment() {
     // Quoted empty TOML key — invalid for our schema even if TOML allows it.
-    let mut f = NamedTempFile::new().unwrap();
-    f.write_all(b"[\"\".\"some-repo\"]\n").unwrap();
+    let f = TempConfig::new();
+    fs::write(f.path(), b"[\"\".\"some-repo\"]\n").unwrap();
     let err = Config::load_from(f.path()).unwrap_err();
     let chain = format!("{err:#}");
     assert!(
@@ -561,8 +564,8 @@ fn rejects_empty_owner_segment() {
 
 #[test]
 fn rejects_whitespace_in_keys() {
-    let mut f = NamedTempFile::new().unwrap();
-    f.write_all(b"[\"some owner\".\"some-repo\"]\n").unwrap();
+    let f = TempConfig::new();
+    fs::write(f.path(), b"[\"some owner\".\"some-repo\"]\n").unwrap();
     let err = Config::load_from(f.path()).unwrap_err();
     let chain = format!("{err:#}");
     assert!(
@@ -590,7 +593,7 @@ fn token_round_trip() {
             ..sub()
         },
     );
-    let f = NamedTempFile::new().unwrap();
+    let f = TempConfig::new();
     cfg.save_to(f.path()).unwrap();
     let on_disk = fs::read_to_string(f.path()).unwrap();
     assert!(
@@ -607,7 +610,7 @@ fn token_skipped_when_absent() {
     // freshly-subscribed entries don't carry a stub field that looks like an
     // intentional empty-string token.
     let cfg = one_sub_config("octocat", "hello-world", sub());
-    let f = NamedTempFile::new().unwrap();
+    let f = TempConfig::new();
     cfg.save_to(f.path()).unwrap();
     let on_disk = fs::read_to_string(f.path()).unwrap();
     assert!(
@@ -637,10 +640,62 @@ fn debug_subscription_redacts_token() {
 }
 
 #[test]
-fn divider_groups_user_then_state_blocks() {
-    // Two subs, both with state: every user [owner.repo] header must appear
-    // above the single divider line, and every [owner.repo.state] header
-    // below it.
+fn user_fields_render_alphabetically() {
+    // channel < disabled < token. Same ordering check as before, but for the
+    // user file only now that state lives in the sidecar.
+    let cfg = one_sub_config(
+        "owner",
+        "repo",
+        Subscription {
+            channel: Channel::Prerelease,
+            disabled: true,
+            token: Some(Secret::new("tok".into())),
+            state: SubscriptionState::default(),
+        },
+    );
+    let f = TempConfig::new();
+    cfg.save_to(f.path()).unwrap();
+    let on_disk = fs::read_to_string(f.path()).unwrap();
+    let p_channel = on_disk.find("channel = ").unwrap();
+    let p_disabled = on_disk.find("disabled = ").unwrap();
+    let p_token = on_disk.find("token = ").unwrap();
+    assert!(p_channel < p_disabled, "channel before disabled");
+    assert!(p_disabled < p_token, "disabled before token");
+}
+
+#[test]
+fn user_headers_render_alphabetically() {
+    let mut subscriptions = BTreeMap::new();
+    for owner in ["b-owner", "a-owner"] {
+        let mut repos = BTreeMap::new();
+        repos.insert("z-repo".into(), sub());
+        repos.insert("m-repo".into(), sub());
+        subscriptions.insert(owner.into(), repos);
+    }
+    let cfg = Config { subscriptions };
+    let f = TempConfig::new();
+    cfg.save_to(f.path()).unwrap();
+    let on_disk = fs::read_to_string(f.path()).unwrap();
+    let order = [
+        on_disk.find("[a-owner.m-repo]").unwrap(),
+        on_disk.find("[a-owner.z-repo]").unwrap(),
+        on_disk.find("[b-owner.m-repo]").unwrap(),
+        on_disk.find("[b-owner.z-repo]").unwrap(),
+    ];
+    assert!(
+        order.windows(2).all(|w| w[0] < w[1]),
+        "user region not A-Z: {on_disk}"
+    );
+}
+
+// ---- state sidecar ----
+
+#[test]
+fn save_emits_state_sidecar_with_hoisted_keys() {
+    // Two subs, both with state. The sidecar must contain
+    // `[owner.repo]` headers (hoisted, no `.state` segment) carrying the
+    // state fields directly. The user file must contain only `[owner.repo]`
+    // headers with user-editable fields.
     let mut repos = BTreeMap::new();
     repos.insert(
         "alpha".into(),
@@ -668,47 +723,43 @@ fn divider_groups_user_then_state_blocks() {
     subscriptions.insert("owner".into(), repos);
     let cfg = Config { subscriptions };
 
-    let f = NamedTempFile::new().unwrap();
+    let f = TempConfig::new();
     cfg.save_to(f.path()).unwrap();
-    let on_disk = fs::read_to_string(f.path()).unwrap();
 
-    let divider = on_disk.find(STATE_DIVIDER).unwrap_or_else(|| {
-        panic!("expected divider in: {on_disk}");
-    });
-    assert_eq!(
-        on_disk.matches(STATE_DIVIDER).count(),
-        1,
-        "divider should appear exactly once: {on_disk}",
-    );
-
-    let user_alpha = on_disk.find("[owner.alpha]").unwrap();
-    let user_beta = on_disk.find("[owner.beta]").unwrap();
-    let state_alpha = on_disk.find("[owner.alpha.state]").unwrap();
-    let state_beta = on_disk.find("[owner.beta.state]").unwrap();
-
-    assert!(user_alpha < divider, "user [owner.alpha] above divider");
-    assert!(user_beta < divider, "user [owner.beta] above divider");
+    let user_disk = fs::read_to_string(f.path()).unwrap();
+    assert!(user_disk.contains("[owner.alpha]"));
+    assert!(user_disk.contains("[owner.beta]"));
+    // Hoisted layout: no `.state]` headers in either file.
     assert!(
-        state_alpha > divider,
-        "state [owner.alpha.state] below divider"
+        !user_disk.contains("state]"),
+        "user file must not carry state subtables: {user_disk}",
     );
+    assert!(!user_disk.contains("installed_version"));
+
+    let state_disk = fs::read_to_string(f.state_path()).unwrap();
     assert!(
-        state_beta > divider,
-        "state [owner.beta.state] below divider"
+        state_disk.contains("[owner.alpha]"),
+        "state file should use hoisted owner.repo headers: {state_disk}",
     );
+    assert!(state_disk.contains("[owner.beta]"));
+    assert!(
+        !state_disk.contains(".state]"),
+        "state file must not carry redundant .state nesting: {state_disk}",
+    );
+    assert!(state_disk.contains("installed_version = \"v1\""));
+    assert!(state_disk.contains("installed_version = \"v2\""));
 
     let loaded = Config::load_from(f.path()).unwrap();
     assert_eq!(loaded, cfg);
 }
 
 #[test]
-fn divider_with_mixed_state_and_no_state_subs() {
-    // One sub has state, one does not. The state-less sub still appears in
-    // the user region; only the state-bearing sub contributes a state block.
-    let mut repos = BTreeMap::new();
-    repos.insert("plain".into(), sub());
-    repos.insert(
-        "stateful".into(),
+fn save_creates_managed_dir_when_missing() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("plugin-manager.toml");
+    let cfg = one_sub_config(
+        "owner",
+        "repo",
         Subscription {
             state: SubscriptionState {
                 installed_version: Some("v1".into()),
@@ -717,91 +768,107 @@ fn divider_with_mixed_state_and_no_state_subs() {
             ..sub()
         },
     );
-    let mut subscriptions = BTreeMap::new();
-    subscriptions.insert("owner".into(), repos);
-    let cfg = Config { subscriptions };
-
-    let f = NamedTempFile::new().unwrap();
-    cfg.save_to(f.path()).unwrap();
-    let on_disk = fs::read_to_string(f.path()).unwrap();
-
-    let divider = on_disk.find(STATE_DIVIDER).expect("divider present");
-    let user_plain = on_disk.find("[owner.plain]").unwrap();
-    let user_stateful = on_disk.find("[owner.stateful]").unwrap();
-    let state_stateful = on_disk.find("[owner.stateful.state]").unwrap();
-
-    assert!(user_plain < divider);
-    assert!(user_stateful < divider);
-    assert!(state_stateful > divider);
+    cfg.save_to(&path).unwrap();
+    let state_path = state_path_for(&path);
     assert!(
-        !on_disk.contains("[owner.plain.state]"),
-        "stateless sub must not get a state block: {on_disk}",
+        state_path.parent().unwrap().is_dir(),
+        "managed/ should have been created"
     );
+    assert!(state_path.is_file(), "state.toml should exist");
+}
 
+#[test]
+fn load_drops_state_without_matching_user_entry() {
+    // Hand-craft a sidecar containing a row for an owner/repo the user
+    // file doesn't list. `load_from` should silently ignore the orphan
+    // state entry rather than fabricating a Subscription for it.
+    let f = TempConfig::new();
+    one_sub_config("real-owner", "real-repo", sub())
+        .save_to(f.path())
+        .unwrap();
+    // Overwrite the sidecar with both a real and an orphan entry.
+    fs::create_dir_all(f.state_path().parent().unwrap()).unwrap();
+    fs::write(
+        f.state_path(),
+        b"[real-owner.real-repo]\ninstalled_version = \"v1\"\n\n\
+          [ghost-owner.ghost-repo]\ninstalled_version = \"v9\"\n",
+    )
+    .unwrap();
     let loaded = Config::load_from(f.path()).unwrap();
-    assert_eq!(loaded, cfg);
-}
-
-#[test]
-fn divider_omitted_when_no_state_anywhere() {
-    let cfg = one_sub_config(
-        "octocat",
-        "hello-world",
-        Subscription {
-            channel: Channel::Prerelease,
-            ..sub()
-        },
-    );
-    let f = NamedTempFile::new().unwrap();
-    cfg.save_to(f.path()).unwrap();
-    let on_disk = fs::read_to_string(f.path()).unwrap();
-    assert!(
-        !on_disk.contains(STATE_DIVIDER),
-        "divider should be omitted with no state: {on_disk}",
+    assert!(!loaded.subscriptions.contains_key("ghost-owner"));
+    assert_eq!(
+        loaded
+            .subscriptions
+            .get("real-owner")
+            .and_then(|m| m.get("real-repo"))
+            .unwrap()
+            .state
+            .installed_version
+            .as_deref(),
+        Some("v1"),
     );
 }
 
 #[test]
-fn empty_user_fields_with_state_keeps_owner_repo_header() {
-    // All-default user fields + non-empty state must still emit an empty
-    // [owner.repo] header in the user region; otherwise the sub would
-    // disappear from the user-region listing.
-    let cfg = one_sub_config(
-        "octocat",
-        "hello-world",
-        Subscription {
-            state: SubscriptionState {
-                installed_version: Some("v1.0.0".into()),
-                ..SubscriptionState::default()
-            },
-            ..sub()
-        },
-    );
-    let f = NamedTempFile::new().unwrap();
-    cfg.save_to(f.path()).unwrap();
-    let on_disk = fs::read_to_string(f.path()).unwrap();
-
-    let user_header = on_disk.find("[octocat.hello-world]").unwrap();
-    let divider = on_disk.find(STATE_DIVIDER).unwrap();
-    let state_header = on_disk.find("[octocat.hello-world.state]").unwrap();
-    assert!(user_header < divider);
-    assert!(state_header > divider);
-
-    let loaded = Config::load_from(f.path()).unwrap();
-    assert_eq!(loaded, cfg);
-}
-
-#[test]
-fn fields_render_in_alphabetical_order() {
-    // Every populated field of UserView and SubscriptionState should render
-    // in A-Z order, so a hand-edit lands in a predictable column.
+fn load_with_missing_sidecar_yields_empty_state() {
+    // Fresh-install case: user file present, sidecar missing.
     let cfg = one_sub_config(
         "owner",
         "repo",
         Subscription {
             channel: Channel::Prerelease,
-            disabled: true,
-            token: Some(Secret::new("tok".into())),
+            ..sub()
+        },
+    );
+    let f = TempConfig::new();
+    cfg.save_to(f.path()).unwrap();
+    // Delete the sidecar that save_to wrote; mimic a hand-removed cache.
+    fs::remove_file(f.state_path()).unwrap();
+    let loaded = Config::load_from(f.path()).unwrap();
+    let (_, _, s) = first_sub(&loaded);
+    assert!(s.state.is_empty(), "sidecar gone -> empty state");
+    assert_eq!(s.channel, Channel::Prerelease);
+}
+
+#[test]
+fn sidecar_rewritten_when_state_clears() {
+    // Save with state, then save again with state cleared. The sidecar must
+    // shrink so a re-load returns a state-free Subscription.
+    let f = TempConfig::new();
+    let mut cfg = one_sub_config(
+        "owner",
+        "repo",
+        Subscription {
+            state: SubscriptionState {
+                installed_version: Some("v1".into()),
+                ..SubscriptionState::default()
+            },
+            ..sub()
+        },
+    );
+    cfg.save_to(f.path()).unwrap();
+    for sub in cfg.subscriptions.values_mut().flat_map(|r| r.values_mut()) {
+        sub.state = SubscriptionState::default();
+    }
+    cfg.save_to(f.path()).unwrap();
+
+    let loaded = Config::load_from(f.path()).unwrap();
+    let (_, _, s) = first_sub(&loaded);
+    assert!(s.state.is_empty(), "state should be cleared in sidecar");
+
+    let state_disk = fs::read_to_string(f.state_path()).unwrap();
+    assert!(
+        !state_disk.contains("installed_version"),
+        "stale state should be gone from sidecar: {state_disk}",
+    );
+}
+
+#[test]
+fn state_fields_render_alphabetically_in_sidecar() {
+    let cfg = one_sub_config(
+        "owner",
+        "repo",
+        Subscription {
             state: SubscriptionState {
                 cached_at: Some(2),
                 cached_published_at: Some(3),
@@ -810,27 +877,18 @@ fn fields_render_in_alphabetical_order() {
                 installed_at: Some(1),
                 installed_version: Some("v".into()),
             },
+            ..sub()
         },
     );
-    let f = NamedTempFile::new().unwrap();
+    let f = TempConfig::new();
     cfg.save_to(f.path()).unwrap();
-    let on_disk = fs::read_to_string(f.path()).unwrap();
-
-    // UserView: channel < disabled < token.
-    let p_channel = on_disk.find("channel = ").unwrap();
-    let p_disabled = on_disk.find("disabled = ").unwrap();
-    let p_token = on_disk.find("token = ").unwrap();
-    assert!(p_channel < p_disabled, "channel before disabled");
-    assert!(p_disabled < p_token, "disabled before token");
-
-    // SubscriptionState: cached_at < cached_published_at < cached_tag <
-    // installed_asset < installed_at < installed_version.
-    let p_cached_at = on_disk.find("cached_at = ").unwrap();
-    let p_cached_published_at = on_disk.find("cached_published_at = ").unwrap();
-    let p_cached_tag = on_disk.find("cached_tag = ").unwrap();
-    let p_installed_asset = on_disk.find("installed_asset = ").unwrap();
-    let p_installed_at = on_disk.find("installed_at = ").unwrap();
-    let p_installed_version = on_disk.find("installed_version = ").unwrap();
+    let state_disk = fs::read_to_string(f.state_path()).unwrap();
+    let p_cached_at = state_disk.find("cached_at = ").unwrap();
+    let p_cached_published_at = state_disk.find("cached_published_at = ").unwrap();
+    let p_cached_tag = state_disk.find("cached_tag = ").unwrap();
+    let p_installed_asset = state_disk.find("installed_asset = ").unwrap();
+    let p_installed_at = state_disk.find("installed_at = ").unwrap();
+    let p_installed_version = state_disk.find("installed_version = ").unwrap();
     assert!(p_cached_at < p_cached_published_at);
     assert!(p_cached_published_at < p_cached_tag);
     assert!(p_cached_tag < p_installed_asset);
@@ -839,66 +897,126 @@ fn fields_render_in_alphabetical_order() {
 }
 
 #[test]
-fn table_headers_render_in_alphabetical_order() {
-    // Subscriptions across multiple owners; both regions should list headers
-    // in lexicographic owner.repo order.
-    let mut subscriptions = BTreeMap::new();
-    for owner in ["b-owner", "a-owner"] {
-        let mut repos = BTreeMap::new();
-        repos.insert(
-            "z-repo".into(),
-            Subscription {
-                state: SubscriptionState {
-                    installed_version: Some("v".into()),
-                    ..SubscriptionState::default()
-                },
-                ..sub()
-            },
-        );
-        repos.insert(
-            "m-repo".into(),
-            Subscription {
-                state: SubscriptionState {
-                    installed_version: Some("v".into()),
-                    ..SubscriptionState::default()
-                },
-                ..sub()
-            },
-        );
-        subscriptions.insert(owner.into(), repos);
-    }
-    let cfg = Config { subscriptions };
-    let f = NamedTempFile::new().unwrap();
-    cfg.save_to(f.path()).unwrap();
-    let on_disk = fs::read_to_string(f.path()).unwrap();
+fn state_path_lives_under_managed_dir() {
+    let p = state_path_for(Path::new("plugins/plugin-manager.toml"));
+    assert_eq!(p, Path::new("plugins/managed/state.toml"));
+}
 
-    // User region order: a-owner.m-repo, a-owner.z-repo, b-owner.m-repo,
-    // b-owner.z-repo.
-    let order_user = [
-        on_disk.find("[a-owner.m-repo]").unwrap(),
-        on_disk.find("[a-owner.z-repo]").unwrap(),
-        on_disk.find("[b-owner.m-repo]").unwrap(),
-        on_disk.find("[b-owner.z-repo]").unwrap(),
-    ];
+// ---- v4 -> v5 split migration ----
+
+#[test]
+fn migrate_state_split_lifts_state_into_sidecar() {
+    let dir = tempdir().unwrap();
+    let user_path = dir.path().join("plugin-manager.toml");
+    let state_path = state_path_for(&user_path);
+
+    // Hand-write a v4-shape file: user fields + state subtable mixed in
+    // the same document with the legacy STATE_DIVIDER comment.
+    fs::write(
+        &user_path,
+        b"[octocat.hello-world]\n\
+          channel = \"prerelease\"\n\
+          disabled = true\n\n\
+          # ---- managed by plugin-manager (do not edit below) ----\n\n\
+          [octocat.hello-world.state]\n\
+          installed_version = \"v1.2.3\"\n\
+          installed_asset = \"hello-world.so\"\n",
+    )
+    .unwrap();
+
+    migrate_state_into_sidecar_at(&user_path).unwrap();
+
+    // User file must no longer carry the state subtable.
+    let user_disk = fs::read_to_string(&user_path).unwrap();
     assert!(
-        order_user.windows(2).all(|w| w[0] < w[1]),
-        "user region not A-Z: {on_disk}"
+        !user_disk.contains(".state]"),
+        "user file should be free of state subtables after migrate: {user_disk}",
     );
+    assert!(user_disk.contains("[octocat.hello-world]"));
+    assert!(user_disk.contains("channel = \"prerelease\""));
+    assert!(user_disk.contains("disabled = true"));
 
-    // State region same order, all below divider.
-    let divider = on_disk.find(STATE_DIVIDER).unwrap();
-    let order_state = [
-        on_disk.find("[a-owner.m-repo.state]").unwrap(),
-        on_disk.find("[a-owner.z-repo.state]").unwrap(),
-        on_disk.find("[b-owner.m-repo.state]").unwrap(),
-        on_disk.find("[b-owner.z-repo.state]").unwrap(),
-    ];
-    assert!(order_state.iter().all(|&p| p > divider));
+    // Sidecar must now hold the lifted state with hoisted [owner.repo].
+    let state_disk = fs::read_to_string(&state_path).unwrap();
+    assert!(state_disk.contains("[octocat.hello-world]"));
+    assert!(state_disk.contains("installed_version = \"v1.2.3\""));
+    assert!(state_disk.contains("installed_asset = \"hello-world.so\""));
+    // Round-trip preserves the merged shape.
+    let loaded = Config::load_from(&user_path).unwrap();
+    let s = loaded
+        .subscriptions
+        .get("octocat")
+        .and_then(|m| m.get("hello-world"))
+        .unwrap();
+    assert_eq!(s.channel, Channel::Prerelease);
+    assert!(s.disabled);
+    assert_eq!(s.state.installed_version.as_deref(), Some("v1.2.3"));
+    assert_eq!(s.state.installed_asset.as_deref(), Some("hello-world.so"));
+}
+
+#[test]
+fn migrate_state_split_is_noop_when_sidecar_exists() {
+    let dir = tempdir().unwrap();
+    let user_path = dir.path().join("plugin-manager.toml");
+    let state_path = state_path_for(&user_path);
+
+    fs::write(
+        &user_path,
+        b"[octocat.hello-world]\n\n\
+          [octocat.hello-world.state]\n\
+          installed_version = \"legacy\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+    fs::write(
+        &state_path,
+        b"[octocat.hello-world]\ninstalled_version = \"already-migrated\"\n",
+    )
+    .unwrap();
+
+    migrate_state_into_sidecar_at(&user_path).unwrap();
+
+    // User file untouched; sidecar untouched.
+    assert!(fs::read_to_string(&user_path).unwrap().contains(".state]"));
     assert!(
-        order_state.windows(2).all(|w| w[0] < w[1]),
-        "state region not A-Z: {on_disk}"
+        fs::read_to_string(&state_path)
+            .unwrap()
+            .contains("already-migrated"),
     );
 }
+
+#[test]
+fn migrate_state_split_is_noop_when_user_file_missing() {
+    let dir = tempdir().unwrap();
+    let user_path = dir.path().join("plugin-manager.toml");
+    let state_path = state_path_for(&user_path);
+
+    migrate_state_into_sidecar_at(&user_path).unwrap();
+
+    assert!(!user_path.exists());
+    assert!(!state_path.exists());
+}
+
+#[test]
+fn migrate_state_split_skips_writing_when_no_legacy_state() {
+    let dir = tempdir().unwrap();
+    let user_path = dir.path().join("plugin-manager.toml");
+    let state_path = state_path_for(&user_path);
+    // A file in the new shape (no state subtables) - migration should be
+    // idempotent and not create an empty sidecar.
+    fs::write(&user_path, b"[octocat.hello-world]\ndisabled = true\n").unwrap();
+
+    migrate_state_into_sidecar_at(&user_path).unwrap();
+
+    assert!(!state_path.exists(), "no state -> no sidecar written");
+    assert!(
+        fs::read_to_string(&user_path)
+            .unwrap()
+            .contains("disabled = true")
+    );
+}
+
+// ---- v3 -> v4 file-rename migration ----
 
 #[test]
 fn migrate_legacy_config_renames_file_and_self_key() {
@@ -1023,12 +1141,12 @@ fn migrate_legacy_config_keeps_new_self_when_both_keys_present() {
 /// both fields land on disk regardless of order.
 #[test]
 fn modify_at_serializes_concurrent_writers() {
-    let f = NamedTempFile::new().unwrap();
+    let f = TempConfig::new();
     one_sub_config("octocat", "hello-world", sub())
         .save_to(f.path())
         .unwrap();
 
-    let path: std::path::PathBuf = f.path().into();
+    let path: PathBuf = f.path().into();
     let iters = 64;
     let barrier = Arc::new(Barrier::new(2));
 

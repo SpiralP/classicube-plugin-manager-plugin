@@ -5,7 +5,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{self, Write},
-    path::Path,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::{Mutex, PoisonError},
 };
@@ -36,11 +36,16 @@ const LEGACY_CONFIG_PATH: &str = "plugins/plugin-updater.toml";
 /// so existing v3 users don't lose their subscription on upgrade.
 const LEGACY_SELF_REPO: &str = "classicube-plugin-updater-plugin";
 
-/// Comment line written between the user-editable region (every `[owner.repo]`
-/// table) and the plugin-managed region (every `[owner.repo.state]` table) on
-/// `save_to`. Comments are stripped on parse, so this is regenerated from
-/// scratch on every write.
-const STATE_DIVIDER: &str = "# ---- managed by plugin-manager (do not edit below) ----";
+/// Basename of the machine-managed state sidecar. Lives next to the breadcrumbs
+/// dir inside `plugins/managed/` so the directory holds everything the manager
+/// owns and a `rm -rf plugins/managed/` is a clean nuke-and-resubscribe. The
+/// orphan sweep and the reconcile pass both filter this basename out so
+/// neither classifies it as a stray plugin binary.
+pub const MANAGED_STATE_BASENAME: &str = "state.toml";
+
+/// Subdirectory under `plugins/` that holds managed plugin binaries, the
+/// per-process breadcrumb files, and the sidecar state file.
+const MANAGED_DIR_NAME: &str = "managed";
 
 /// Owner of this plugin's own repo. Used to identify the "self" subscription
 /// so the auto-update path can install over the loaded binary instead of
@@ -53,6 +58,24 @@ pub const SELF_REPO: &str = env!("CARGO_PKG_NAME");
 
 pub fn config_path() -> &'static Path {
     Path::new(CONFIG_PATH)
+}
+
+/// Derive the state-file path that pairs with `user_path`. Production code
+/// passes `config_path()` which yields `plugins/managed/state.toml`. Tests
+/// pass a tempfile path and get `<tempdir>/managed/state.toml`, so the
+/// sidecar moves with the user file in every test harness.
+///
+/// Path layout: take the user file's parent (or `.` for a bare filename),
+/// then descend into `managed/state.toml`. The user file's basename
+/// (`plugin-manager.toml` in production, anything in tests) is not part of
+/// the state path - the sidecar is named after its purpose, not after the
+/// file it pairs with.
+pub fn state_path_for(user_path: &Path) -> PathBuf {
+    let parent = match user_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    parent.join(MANAGED_DIR_NAME).join(MANAGED_STATE_BASENAME)
 }
 
 /// Whether `(owner, repo)` refers to this plugin itself.
@@ -106,6 +129,101 @@ fn rewrite_legacy_self_key(cfg: &mut Config) -> bool {
     };
     owner_map.entry(SELF_REPO.into()).or_insert(legacy_sub);
     true
+}
+
+/// One-shot v4 -> v5 split: if a v4 user file at `path` still carries
+/// `[owner.repo.state]` subtables and the new sidecar at
+/// `state_path_for(path)` doesn't exist yet, lift those state subtables
+/// into the sidecar and rewrite the user file without them. After the
+/// sidecar is in place this is a no-op.
+///
+/// We deliberately don't write an empty sidecar - if every legacy sub has
+/// an empty state, the file looks fresh-install enough that leaving it
+/// alone is correct (next save creates the sidecar naturally).
+///
+/// Errors are logged by the caller; a failed migration must not block
+/// startup.
+pub fn migrate_state_into_sidecar() -> Result<()> {
+    migrate_state_into_sidecar_at(config_path())
+}
+
+pub(crate) fn migrate_state_into_sidecar_at(user_path: &Path) -> Result<()> {
+    let state_path = state_path_for(user_path);
+    if state_path.exists() {
+        return Ok(());
+    }
+    let contents = match fs::read_to_string(user_path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", user_path.display())),
+    };
+    // Parse with the legacy schema (state subtable alive). A file already
+    // in the new shape (no [owner.repo.state] tables) parses too - every
+    // `state` field comes back default, which the "any state?" check
+    // below skips over.
+    let legacy: LegacyConfig = toml::from_str(&contents)
+        .with_context(|| format!("parsing legacy {}", user_path.display()))?;
+
+    let any_state = legacy
+        .subscriptions
+        .values()
+        .flat_map(|repos| repos.values())
+        .any(|s| !s.state.is_empty());
+    if !any_state {
+        return Ok(());
+    }
+
+    // Hand the lifted in-memory config off to `save_to`, which writes both
+    // the sidecar and the rewritten user file via the regular atomic-rename
+    // path. Sidecar first, user file second - the same crash-safety
+    // ordering as a normal save.
+    let modern = legacy.into_modern();
+    modern.save_to(user_path)?;
+    Ok(())
+}
+
+/// Parallel layout used only by [`migrate_state_into_sidecar_at`] to parse a
+/// v4 user file with its `[owner.repo.state]` subtables intact. Once parsed
+/// it converts straight into a modern [`Config`]; nothing else in the codebase
+/// touches this type.
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct LegacyConfig {
+    subscriptions: BTreeMap<String, BTreeMap<String, LegacySubscription>>,
+}
+
+#[derive(Deserialize)]
+struct LegacySubscription {
+    #[serde(default)]
+    channel: Channel,
+    #[serde(default)]
+    disabled: bool,
+    #[serde(default)]
+    token: Option<Secret>,
+    #[serde(default)]
+    state: SubscriptionState,
+}
+
+impl LegacyConfig {
+    fn into_modern(self) -> Config {
+        let mut subscriptions = BTreeMap::new();
+        for (owner, repos) in self.subscriptions {
+            let mut out = BTreeMap::new();
+            for (repo, sub) in repos {
+                out.insert(
+                    repo,
+                    Subscription {
+                        channel: sub.channel,
+                        disabled: sub.disabled,
+                        token: sub.token,
+                        state: sub.state,
+                    },
+                );
+            }
+            subscriptions.insert(owner, out);
+        }
+        Config { subscriptions }
+    }
 }
 
 /// Top-level config. The TOML document is the map directly: each subscription
@@ -195,10 +313,16 @@ impl<'de> Deserialize<'de> for Channel {
     }
 }
 
-/// User-editable subscription fields. Machine-managed install + cache fields
-/// live under the nested `state` table (`[owner.repo.state]` in TOML), so
-/// hand-edits to channel/disabled don't accidentally touch fields the plugin
-/// owns.
+/// In-memory subscription record. Two regions live side by side on the same
+/// struct so existing call sites can read `sub.channel` and `sub.state.X`
+/// the same way; on disk those two regions are persisted to **separate
+/// files** (`plugins/plugin-manager.toml` and `plugins/managed/state.toml`)
+/// so a hand-edit of the user file can never clobber machine-managed state.
+///
+/// The `state` field is marked `#[serde(skip)]` so the user file's
+/// `[owner.repo]` table only carries `channel` / `disabled` / `token`.
+/// `Config::load_from` re-populates `state` from the sidecar after parsing
+/// the user file; `Config::save_to` extracts it back into the sidecar.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Subscription {
     #[serde(default, skip_serializing_if = "Channel::is_default")]
@@ -210,14 +334,19 @@ pub struct Subscription {
     /// Wrapped in `Secret` so a stray `{:?}` doesn't leak it into logs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<Secret>,
-    #[serde(default, skip_serializing_if = "SubscriptionState::is_empty")]
+    /// Machine-managed state for this subscription. Persisted to the sidecar
+    /// (`plugins/managed/state.toml`), not the user file - serde skips this
+    /// field entirely on the `Subscription` round-trip, and the load/save
+    /// path zips it in/out around the user-file I/O.
+    #[serde(skip)]
     pub state: SubscriptionState,
 }
 
-/// Plugin-managed state for a subscription. Renders as a `[owner.repo.state]`
-/// subtable in TOML, omitted entirely when every field is `None`. Fields are
-/// declared in A-Z order so `toml::to_string_pretty` writes them in
-/// alphabetical order on disk.
+/// Plugin-managed state for a subscription. Renders into the sidecar
+/// `plugins/managed/state.toml` under a hoisted `[owner.repo]` header (no
+/// redundant `.state` nesting - the whole file is state). Fields are declared
+/// in A-Z order so `toml::to_string_pretty` writes them in alphabetical
+/// order on disk.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -261,28 +390,57 @@ impl Subscription {
     }
 }
 
-/// Serialize-only mirror of the user-editable half of `Subscription`. Renders
-/// the same `[owner.repo]` body as a full `Subscription` would, but with no
-/// nested `state` field, so the user region of the file contains nothing
-/// machine-managed. Fields are A-Z so `to_string_pretty` writes them in
-/// alphabetical order. Values are owned (cloned from source) because serde's
-/// `skip_serializing_if` predicates expect `fn(&FieldType) -> bool`, which
-/// the stdlib helpers like `Channel::is_default` and `std::ops::Not::not`
-/// only satisfy when the field is held by value.
-#[derive(Serialize)]
-struct UserView {
-    #[serde(skip_serializing_if = "Channel::is_default")]
-    channel: Channel,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    disabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    token: Option<Secret>,
+/// On-disk shape of `plugins/managed/state.toml`. Hoisted layout: each
+/// `[owner.repo]` header in the sidecar holds the [`SubscriptionState`]
+/// fields directly, with no redundant `.state` nesting (the whole file is
+/// state, so the extra segment would carry no information). Empty entries
+/// are skipped on save - the file only contains rows for subs that actually
+/// have cached/installed data.
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+struct StateFile {
+    entries: BTreeMap<String, BTreeMap<String, SubscriptionState>>,
 }
 
-/// Single-key wrapper that adds a literal `state` segment to the table path
-/// during the state-region serialize, so a `BTreeMap<owner, BTreeMap<repo,
-/// StateLeaf>>` renders as `[owner.repo.state]` headers.
-type StateLeaf<'a> = BTreeMap<&'static str, &'a SubscriptionState>;
+impl StateFile {
+    fn load_from(path: &Path) -> Result<Self> {
+        match fs::read_to_string(path) {
+            Ok(contents) => {
+                toml::from_str(&contents).with_context(|| format!("parsing {}", path.display()))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+
+    /// Write the sidecar via tmpfile + atomic rename, creating the
+    /// `plugins/managed/` directory if it doesn't exist yet. The state file
+    /// is always rewritten (even when empty); an empty file on disk means
+    /// "no managed state yet" and is the natural fresh-install marker.
+    fn save_to(&self, path: &Path) -> Result<()> {
+        let serialized = toml::to_string_pretty(self).context("serializing state sidecar")?;
+
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating directory {}", parent.display()))?;
+        let mut tmp = NamedTempFile::new_in(parent)
+            .with_context(|| format!("creating tmp file in {}", parent.display()))?;
+        tmp.write_all(serialized.as_bytes())
+            .with_context(|| format!("writing {}", tmp.path().display()))?;
+        tmp.as_file()
+            .sync_all()
+            .with_context(|| format!("fsync {}", tmp.path().display()))?;
+        tmp.persist(path)
+            .with_context(|| format!("renaming tmp -> {}", path.display()))?;
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    }
+}
 
 impl Config {
     /// Ensure a subscription for this plugin's own repo exists so the
@@ -303,18 +461,38 @@ impl Config {
         Self::load_from(config_path())
     }
 
+    /// Load both the user file at `path` and the state sidecar at
+    /// `state_path_for(path)`, zipping `[owner.repo]` state entries from the
+    /// sidecar into the matching in-memory [`Subscription`]. A missing user
+    /// file yields `Config::default()` (matches the "fresh install" case the
+    /// game can hit on first run); a missing sidecar yields no state but is
+    /// not an error. State rows referencing an `(owner, repo)` that the user
+    /// file doesn't list are silently dropped - they'd never serialize back
+    /// out anyway, so carrying them would just be dead weight.
     pub fn load_from(path: &Path) -> Result<Self> {
-        match fs::read_to_string(path) {
+        let mut cfg: Self = match fs::read_to_string(path) {
             Ok(contents) => {
-                let cfg: Self = toml::from_str(&contents)
-                    .with_context(|| format!("parsing {}", path.display()))?;
-                cfg.validate()
-                    .with_context(|| format!("validating {}", path.display()))?;
-                Ok(cfg)
+                toml::from_str(&contents).with_context(|| format!("parsing {}", path.display()))?
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Self::default(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        cfg.validate()
+            .with_context(|| format!("validating {}", path.display()))?;
+
+        let state_path = state_path_for(path);
+        let state = StateFile::load_from(&state_path)?;
+        for (owner, repos) in state.entries {
+            let Some(user_repos) = cfg.subscriptions.get_mut(&owner) else {
+                continue;
+            };
+            for (repo, st) in repos {
+                if let Some(sub) = user_repos.get_mut(&repo) {
+                    sub.state = st;
+                }
+            }
         }
+        Ok(cfg)
     }
 
     /// Atomically load + mutate + save the config at `path`. Acquires
@@ -337,52 +515,39 @@ impl Config {
         Ok(r)
     }
 
-    /// Serialize and write the config via a uniquely-named tmp file +
-    /// rename dance, then `fsync` the parent directory so the rename
-    /// itself is durable. The random suffix is what prevents two
-    /// ClassiCube instances sharing the same config from truncating and
-    /// writing into the same tmp file concurrently; the atomic rename
-    /// means concurrent readers always see either the old or the new
-    /// file - never a truncated mid-state. The crash-recovery breadcrumb
-    /// relies on writes surviving an immediately-following process death;
-    /// the tmp file is fsynced before the rename.
+    /// Persist the config in two files: the user-editable TOML at `path`,
+    /// and the machine-managed state sidecar at `state_path_for(path)`. The
+    /// `state` field on each [`Subscription`] is `#[serde(skip)]`, so the
+    /// user file naturally drops everything machine-owned; the sidecar
+    /// rebuilds a parallel `BTreeMap<owner, BTreeMap<repo, SubscriptionState>>`
+    /// from those skipped fields.
     ///
-    /// The output is split into two regions: every `[owner.repo]` table comes
-    /// first, then a single `STATE_DIVIDER` comment, then every
-    /// `[owner.repo.state]` table. Each region is produced by its own
-    /// `toml::to_string_pretty` call over a flat `BTreeMap` view of `self`,
-    /// so concatenation is the only string work this function does.
+    /// Each file uses its own [`NamedTempFile`] + atomic rename. The random
+    /// suffix prevents two ClassiCube instances sharing the same config
+    /// from truncating each other's tmp file, and the atomic rename means
+    /// concurrent readers always see either the old or the new file -
+    /// never a truncated mid-state.
+    ///
+    /// Write order: sidecar first, then user file. If we crash between the
+    /// two, the sidecar may reference an `(owner, repo)` the user file no
+    /// longer carries - which is harmless because `load_from` silently
+    /// drops sidecar rows without a matching user entry.
     pub fn save_to(&self, path: &Path) -> Result<()> {
-        let mut user_map: BTreeMap<&str, BTreeMap<&str, UserView>> = BTreeMap::new();
-        let mut state_map: BTreeMap<&str, BTreeMap<&str, StateLeaf<'_>>> = BTreeMap::new();
+        let mut state = StateFile::default();
         for (owner, repos) in &self.subscriptions {
             for (repo, sub) in repos {
-                user_map.entry(owner).or_default().insert(
-                    repo,
-                    UserView {
-                        channel: sub.channel.clone(),
-                        disabled: sub.disabled,
-                        token: sub.token.clone(),
-                    },
-                );
                 if !sub.state.is_empty() {
-                    let mut leaf = StateLeaf::new();
-                    leaf.insert("state", &sub.state);
-                    state_map.entry(owner).or_default().insert(repo, leaf);
+                    state
+                        .entries
+                        .entry(owner.clone())
+                        .or_default()
+                        .insert(repo.clone(), sub.state.clone());
                 }
             }
         }
+        state.save_to(&state_path_for(path))?;
 
-        let mut out = toml::to_string_pretty(&user_map).context("serializing user view")?;
-        if !state_map.is_empty() {
-            if !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push('\n');
-            out.push_str(STATE_DIVIDER);
-            out.push_str("\n\n");
-            out.push_str(&toml::to_string_pretty(&state_map).context("serializing state view")?);
-        }
+        let serialized = toml::to_string_pretty(self).context("serializing user view")?;
 
         let parent = match path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
@@ -390,7 +555,7 @@ impl Config {
         };
         let mut tmp = NamedTempFile::new_in(parent)
             .with_context(|| format!("creating tmp file in {}", parent.display()))?;
-        tmp.write_all(out.as_bytes())
+        tmp.write_all(serialized.as_bytes())
             .with_context(|| format!("writing {}", tmp.path().display()))?;
         tmp.as_file()
             .sync_all()

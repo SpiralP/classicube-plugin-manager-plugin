@@ -847,6 +847,48 @@ fn sweep_managed_orphans_handles_missing_dir() {
 }
 
 #[test]
+fn sweep_managed_orphans_skips_state_sidecar() {
+    // The state sidecar lives in plugins/managed/ but is not a plugin
+    // binary. Without an explicit skip the sweep would delete it on every
+    // startup because no subscription claims it.
+    let dir = tempdir().unwrap();
+    let managed = dir.path().join("managed");
+    fs::create_dir(&managed).unwrap();
+    touch(&managed, "state.toml");
+    touch(&managed, "stranger.so");
+
+    let cfg = config_with(vec![]);
+    let deleted = sweep_managed_orphans(&managed, &cfg);
+
+    assert_eq!(deleted, vec!["stranger.so"]);
+    assert!(managed.join("state.toml").exists());
+    assert!(!managed.join("stranger.so").exists());
+}
+
+#[test]
+fn reconcile_does_not_report_state_sidecar_as_orphan() {
+    // Same hazard from the reconcile/report side: state.toml sitting next
+    // to the binaries must not be classified as an orphan.
+    let dir = tempdir().unwrap();
+    let cfg_path = dir.path().join("c.toml");
+    let managed = dir.path().join("managed");
+    fs::create_dir(&managed).unwrap();
+    touch(&managed, "state.toml");
+
+    let cfg = config_with(vec![]);
+    write_config(&cfg_path, &cfg);
+
+    let report = rec(&cfg_path, &managed).unwrap();
+
+    assert!(
+        !report.orphans.iter().any(|o| o == "state.toml"),
+        "state.toml leaked into orphan list: {:?}",
+        report.orphans,
+    );
+    assert!(report.conflicts.is_empty());
+}
+
+#[test]
 fn sweep_managed_orphans_empty_config_clears_dir() {
     let dir = tempdir().unwrap();
     let managed = dir.path().join("managed");

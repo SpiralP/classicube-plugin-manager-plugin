@@ -12,7 +12,7 @@ use tracing::debug;
 
 use crate::{
     asset_match,
-    config::{self, Config},
+    config::{self, Config, MANAGED_STATE_BASENAME},
 };
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -131,7 +131,7 @@ pub fn reconcile(
 
     let mut managed_orphan_names: Vec<String> = managed_on_disk
         .iter()
-        .filter(|n| !claimed.contains(*n))
+        .filter(|n| n.as_str() != MANAGED_STATE_BASENAME && !claimed.contains(*n))
         .cloned()
         .collect();
     managed_orphan_names.sort();
@@ -266,6 +266,11 @@ pub fn sweep_managed_orphans(managed_dir: &Path, config: &Config) -> Vec<String>
     let mut victims: Vec<String> = on_disk
         .into_iter()
         .filter(|name| {
+            // The state sidecar lives in plugins/managed/ but is not a
+            // plugin binary; never sweep it.
+            if name == MANAGED_STATE_BASENAME {
+                return false;
+            }
             if name.ends_with(".new") {
                 return false;
             }

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use tempfile::{NamedTempFile, tempdir};
+use tempfile::tempdir;
 
 use super::*;
 use crate::config::{Channel, SubscriptionState};
@@ -67,17 +67,18 @@ fn pick<'a>(cfg: &'a Config, owner: &str, repo: &str) -> &'a Subscription {
 #[test]
 fn updates_targeted_subscription_only() {
     let cfg = config_with(&[("alice", "one", empty_sub()), ("bob", "two", empty_sub())]);
-    let f = NamedTempFile::new().unwrap();
-    cfg.save_to(f.path()).unwrap();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("plugin-manager.toml");
+    cfg.save_to(&path).unwrap();
 
     persist_cache_updates_to(
-        f.path(),
+        &path,
         12_345,
         vec![("alice".into(), "one".into(), "v9.9.9".into(), 9_000)],
     )
     .unwrap();
 
-    let loaded = Config::load_from(f.path()).unwrap();
+    let loaded = Config::load_from(&path).unwrap();
     let alice = pick(&loaded, "alice", "one");
     let bob = pick(&loaded, "bob", "two");
     assert_eq!(alice.state.cached_tag.as_deref(), Some("v9.9.9"));
@@ -91,17 +92,18 @@ fn updates_targeted_subscription_only() {
 #[test]
 fn unknown_owner_repo_silently_skipped() {
     let cfg = config_with(&[("alice", "one", empty_sub())]);
-    let f = NamedTempFile::new().unwrap();
-    cfg.save_to(f.path()).unwrap();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("plugin-manager.toml");
+    cfg.save_to(&path).unwrap();
 
     persist_cache_updates_to(
-        f.path(),
+        &path,
         42,
         vec![("ghost".into(), "missing".into(), "v0.0.1".into(), 10)],
     )
     .unwrap();
 
-    let loaded = Config::load_from(f.path()).unwrap();
+    let loaded = Config::load_from(&path).unwrap();
     let alice = pick(&loaded, "alice", "one");
     assert!(alice.state.cached_tag.is_none());
     assert!(alice.state.cached_at.is_none());
@@ -128,11 +130,12 @@ fn missing_config_file_writes_empty_default() {
 #[test]
 fn installed_version_writes_targeted_subscription() {
     let cfg = config_with(&[("alice", "one", empty_sub()), ("bob", "two", empty_sub())]);
-    let f = NamedTempFile::new().unwrap();
-    cfg.save_to(f.path()).unwrap();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("plugin-manager.toml");
+    cfg.save_to(&path).unwrap();
 
     persist_installed_versions_to(
-        f.path(),
+        &path,
         999,
         vec![(
             "alice".into(),
@@ -144,7 +147,7 @@ fn installed_version_writes_targeted_subscription() {
     )
     .unwrap();
 
-    let loaded = Config::load_from(f.path()).unwrap();
+    let loaded = Config::load_from(&path).unwrap();
     let alice = pick(&loaded, "alice", "one");
     let bob = pick(&loaded, "bob", "two");
     assert_eq!(alice.state.installed_version.as_deref(), Some("v1.0.0"));
@@ -162,11 +165,12 @@ fn installed_version_writes_targeted_subscription() {
 #[test]
 fn installed_version_unknown_owner_repo_skipped() {
     let cfg = config_with(&[("alice", "one", empty_sub())]);
-    let f = NamedTempFile::new().unwrap();
-    cfg.save_to(f.path()).unwrap();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("plugin-manager.toml");
+    cfg.save_to(&path).unwrap();
 
     persist_installed_versions_to(
-        f.path(),
+        &path,
         42,
         vec![(
             "ghost".into(),
@@ -178,7 +182,7 @@ fn installed_version_unknown_owner_repo_skipped() {
     )
     .unwrap();
 
-    let loaded = Config::load_from(f.path()).unwrap();
+    let loaded = Config::load_from(&path).unwrap();
     let alice = pick(&loaded, "alice", "one");
     assert!(alice.state.installed_version.is_none());
     assert!(alice.state.installed_asset.is_none());
@@ -200,17 +204,18 @@ fn persist_helpers_ignore_disabled_flag() {
             state: SubscriptionState::default(),
         },
     )]);
-    let f = NamedTempFile::new().unwrap();
-    cfg.save_to(f.path()).unwrap();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("plugin-manager.toml");
+    cfg.save_to(&path).unwrap();
 
     persist_cache_updates_to(
-        f.path(),
+        &path,
         77,
         vec![("alice".into(), "one".into(), "v2.0.0".into(), 200)],
     )
     .unwrap();
 
-    let loaded = Config::load_from(f.path()).unwrap();
+    let loaded = Config::load_from(&path).unwrap();
     let alice = pick(&loaded, "alice", "one");
     assert!(alice.disabled);
     assert_eq!(alice.state.cached_tag.as_deref(), Some("v2.0.0"));
