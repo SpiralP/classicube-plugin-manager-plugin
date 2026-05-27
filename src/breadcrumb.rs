@@ -46,8 +46,7 @@ mod tests;
 
 use std::{
     collections::HashMap,
-    fs,
-    io::{self, Write},
+    fs, io,
     path::{Path, PathBuf},
     process,
     sync::OnceLock,
@@ -55,8 +54,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
 use tracing::{debug, warn};
+
+use crate::atomic_write;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Entry {
@@ -74,7 +74,6 @@ struct Entry {
 /// breadcrumb, which is acceptable - we only claim to catch crashes, not
 /// hardware failures.
 pub fn write(dir: &Path, owner: &str, repo: &str, callback: &str) -> Result<()> {
-    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let target = breadcrumb_path(dir, current_ns_inode(), process::id());
     let entry = Entry {
         owner: owner.to_owned(),
@@ -82,13 +81,7 @@ pub fn write(dir: &Path, owner: &str, repo: &str, callback: &str) -> Result<()> 
         callback: callback.to_owned(),
     };
     let body = toml::to_string(&entry).context("serializing breadcrumb")?;
-    let mut tmp = NamedTempFile::new_in(dir)
-        .with_context(|| format!("creating tmp file in {}", dir.display()))?;
-    tmp.write_all(body.as_bytes())
-        .with_context(|| format!("writing {}", tmp.path().display()))?;
-    tmp.persist(&target)
-        .with_context(|| format!("renaming tmp -> {}", target.display()))?;
-    Ok(())
+    atomic_write::write_unsynced(&target, body.as_bytes())
 }
 
 /// Best-effort delete of this process's breadcrumb. `NotFound` is silent

@@ -3,8 +3,7 @@ mod tests;
 
 use std::{
     collections::BTreeMap,
-    fs,
-    io::{self, Write},
+    fs, io,
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Mutex, PoisonError},
@@ -12,9 +11,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
-use tempfile::NamedTempFile;
 
-use crate::secret::Secret;
+use crate::{atomic_write, secret::Secret};
 
 /// Process-wide lock around the load + mutate + save chain. Held for the
 /// entire body of [`Config::modify_at`] so the main thread and worker
@@ -419,26 +417,7 @@ impl StateFile {
     /// "no managed state yet" and is the natural fresh-install marker.
     fn save_to(&self, path: &Path) -> Result<()> {
         let serialized = toml::to_string_pretty(self).context("serializing state sidecar")?;
-
-        let parent = match path.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => Path::new("."),
-        };
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating directory {}", parent.display()))?;
-        let mut tmp = NamedTempFile::new_in(parent)
-            .with_context(|| format!("creating tmp file in {}", parent.display()))?;
-        tmp.write_all(serialized.as_bytes())
-            .with_context(|| format!("writing {}", tmp.path().display()))?;
-        tmp.as_file()
-            .sync_all()
-            .with_context(|| format!("fsync {}", tmp.path().display()))?;
-        tmp.persist(path)
-            .with_context(|| format!("renaming tmp -> {}", path.display()))?;
-        if let Ok(dir) = fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-        Ok(())
+        atomic_write::write_synced(path, serialized.as_bytes())
     }
 }
 
@@ -522,11 +501,12 @@ impl Config {
     /// rebuilds a parallel `BTreeMap<owner, BTreeMap<repo, SubscriptionState>>`
     /// from those skipped fields.
     ///
-    /// Each file uses its own [`NamedTempFile`] + atomic rename. The random
-    /// suffix prevents two ClassiCube instances sharing the same config
-    /// from truncating each other's tmp file, and the atomic rename means
-    /// concurrent readers always see either the old or the new file -
-    /// never a truncated mid-state.
+    /// Each file is written via [`atomic_write::write_synced`] (tmpfile +
+    /// atomic rename + fsync). The random suffix on the tmp file prevents
+    /// two ClassiCube instances sharing the same config from truncating
+    /// each other's tmp, and the atomic rename means concurrent readers
+    /// always see either the old or the new file - never a truncated
+    /// mid-state.
     ///
     /// Write order: sidecar first, then user file. If we crash between the
     /// two, the sidecar may reference an `(owner, repo)` the user file no
@@ -548,31 +528,7 @@ impl Config {
         state.save_to(&state_path_for(path))?;
 
         let serialized = toml::to_string_pretty(self).context("serializing user view")?;
-
-        let parent = match path.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => Path::new("."),
-        };
-        let mut tmp = NamedTempFile::new_in(parent)
-            .with_context(|| format!("creating tmp file in {}", parent.display()))?;
-        tmp.write_all(serialized.as_bytes())
-            .with_context(|| format!("writing {}", tmp.path().display()))?;
-        tmp.as_file()
-            .sync_all()
-            .with_context(|| format!("fsync {}", tmp.path().display()))?;
-        tmp.persist(path)
-            .with_context(|| format!("renaming tmp -> {}", path.display()))?;
-
-        // Best-effort parent-dir fsync so the rename itself survives power
-        // loss on filesystems that need it (ext4, xfs). The rename was
-        // already visible; failure here is non-fatal.
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-            && let Ok(dir) = fs::File::open(parent)
-        {
-            let _ = dir.sync_all();
-        }
-        Ok(())
+        atomic_write::write_synced(path, serialized.as_bytes())
     }
 
     /// Reject configs whose owner/repo keys would be ambiguous or unsafe.

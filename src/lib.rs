@@ -1,4 +1,5 @@
 mod asset_match;
+mod atomic_write;
 mod breadcrumb;
 mod chat;
 mod component;
