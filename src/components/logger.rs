@@ -18,13 +18,14 @@ impl Component for Logger {
         let level = if debug { "debug" } else { "info" };
         let my_crate_name = env!("CARGO_PKG_NAME").replace('-', "_");
 
-        let mut filter = EnvFilter::from_default_env();
-
-        if other_crates {
-            filter = filter.add_directive(level.parse().unwrap());
+        let default_directive = if other_crates {
+            level.parse().unwrap()
         } else {
-            filter = filter.add_directive(format!("{}={}", my_crate_name, level).parse().unwrap());
-        }
+            format!("{my_crate_name}={level}").parse().unwrap()
+        };
+        let filter = EnvFilter::builder()
+            .with_default_directive(default_directive)
+            .from_env_lossy();
 
         if let Err(e) = tracing_subscriber::fmt()
             .with_env_filter(filter)
