@@ -1121,7 +1121,9 @@ fn handle_update_one(spec: &str) {
         };
 
         if let Some((owner, repo, sub)) = find_subscription(&config, &candidates) {
-            if sub.disabled {
+            // self keeps the dormant-manager kill-switch: a disabled self is
+            // only re-enabled by an explicit /enable, never silently here.
+            if sub.disabled && config::is_self(&owner, &repo) {
                 print_async(format!(
                     "{}Subscription {}{owner}/{repo} {}is disabled; use {}enable {owner}/{repo}{} \
                      first",
@@ -1135,8 +1137,49 @@ fn handle_update_one(spec: &str) {
                 return;
             }
 
+            // Disabled self already returned above, so any remaining disabled
+            // sub is a managed plugin: re-enable it rather than refuse, since
+            // targeting it with /update reads as "I want this plugin on".
+            let auto_enable = sub.disabled;
             let token = sub.token.as_ref().map(|s| s.expose().to_owned());
-            run_update_task(owner, repo, sub.channel.clone(), token).await;
+            let channel = sub.channel.clone();
+            let mut sub_for_load = sub.clone();
+            drop(config);
+
+            if auto_enable {
+                let owner_s = owner.clone();
+                let repo_s = repo.clone();
+                if let Err(e) = Config::modify_at(config_path(), move |cfg| {
+                    if let Some(s) = cfg
+                        .subscriptions
+                        .get_mut(&owner_s)
+                        .and_then(|m| m.get_mut(&repo_s))
+                    {
+                        s.disabled = false;
+                    }
+                }) {
+                    print_save_error(&e).await;
+                    return;
+                }
+                sub_for_load.disabled = false;
+                print_async(format!(
+                    "{}Enabled {}{owner}/{repo}",
+                    color::PINK,
+                    color::LIME,
+                ))
+                .await;
+            }
+
+            run_update_task(owner.clone(), repo.clone(), channel, token).await;
+
+            // A freshly re-enabled sub whose binary is already current never
+            // hits the in-session reload inside run_update (it short-circuits
+            // with "nothing to do"), so load it explicitly. load_one is
+            // idempotent, so this is silent when the update path already
+            // (re)loaded a newly-downloaded binary.
+            if auto_enable {
+                run_load_followup(owner, repo, sub_for_load).await;
+            }
             return;
         }
         drop(config);
