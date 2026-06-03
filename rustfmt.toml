@@ -1,9 +1,19 @@
+# Parse source with the 2024 language edition.
 edition = "2024"
+# Format with the 2024 Rust Style Guide (RFC 3338 style evolution). Set
+# explicitly so a direct `rustfmt` / editor format-on-save run uses the 2024
+# style instead of defaulting to the 2015 style; `cargo fmt` infers it from
+# Cargo.toml, but standalone rustfmt does not. Supersedes the old `version`
+# option (`style_edition = "2024"` == `version = "Two"`).
+style_edition = "2024"
+
+# Imports: merge per crate and group as std / external / local blocks.
+imports_granularity = "Crate"
+group_imports = "StdExternalCrate"
+
 use_try_shorthand = true
 use_field_init_shorthand = true
-imports_granularity = "Crate"
 reorder_impl_items = true
 format_strings = true
 format_code_in_doc_comments = true
 condense_wildcard_suffixes = true
-group_imports = "StdExternalCrate"
