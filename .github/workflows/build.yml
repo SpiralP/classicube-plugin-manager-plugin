@@ -17,13 +17,11 @@ permissions:
 
 jobs:
   linux_nix:
-    # Skip when dispatched from release.yml's publish phase: that job runs on
-    # the only self-hosted runner and waits for this workflow to finish, so
-    # linux_nix (also self-hosted) would queue forever behind it.
+    # Skip when dispatched from release.yml's publish phase: the smoke
+    # `build` job already validated nix against this commit minutes earlier,
+    # and the nix output isn't attached to the GitHub release.
     if: ${{ github.event_name != 'workflow_dispatch' }}
     uses: SpiralP/github-reusable-workflows/.github/workflows/build.yml@af0fd7061daddfea981647f723aa3fc9bf8e1a84 # main
-    with:
-      runs-on: self-hosted
 
   linux:
     name: Build Linux ${{ matrix.config.arch }}
