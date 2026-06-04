@@ -443,8 +443,19 @@ async fn run_initial_pass() -> Result<()> {
     Ok(())
 }
 
+/// Ensure the self subscription exists and stamp its stored install state to
+/// the running binary, in a single `modify_at` so only one write is issued
+/// per startup. `current_lib_path` failure is non-fatal: we still record the
+/// baked-in version, just not the asset basename.
 async fn ensure_self_subscription() {
-    let added = match Config::modify_at(config_path(), Config::ensure_self) {
+    let want_version = config::self_installed_version();
+    let want_asset = current_lib_path()
+        .ok()
+        .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()));
+
+    let added = match Config::modify_at(config_path(), |cfg| {
+        cfg.ensure_self(&want_version, want_asset.as_deref())
+    }) {
         Ok(added) => added,
         Err(e) => {
             warn!("ensuring self subscription: {e:#}");
@@ -454,6 +465,10 @@ async fn ensure_self_subscription() {
     if added {
         debug!("auto-added self subscription to config");
     }
+    debug!(
+        "reconciled self installed_version to {} (asset: {:?})",
+        want_version, want_asset
+    );
 }
 
 async fn run_reconcile_and_warn() {

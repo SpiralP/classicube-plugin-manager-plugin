@@ -81,6 +81,15 @@ pub fn is_self(owner: &str, repo: &str) -> bool {
     owner == SELF_OWNER && repo == SELF_REPO
 }
 
+/// The version of the running manager binary, baked in at compile time.
+/// Ground truth for "what self code is loaded right now" - the stored
+/// `installed_version` can drift (half-applied self-update, hand-edited
+/// TOML), the compiled-in version cannot. Release tags carry a leading `v`,
+/// so we prefix one to match the tag-name string comparisons elsewhere.
+pub fn self_installed_version() -> String {
+    format!("v{}", env!("CARGO_PKG_VERSION"))
+}
+
 /// Whether the manager's own subscription is present and marked `disabled`.
 /// `/disable` on self acts as a kill-switch: when true, both `Loader::init`
 /// (host-Init managed-load) and the manager's deferred initial pass
@@ -423,17 +432,32 @@ impl StateFile {
 
 impl Config {
     /// Ensure a subscription for this plugin's own repo exists so the
-    /// self-update path picks it up automatically. Returns `true` if a
-    /// fresh entry was added; the caller is responsible for persisting.
-    /// An existing entry — even one the user has disabled or pinned — is
-    /// left alone.
-    pub fn ensure_self(&mut self) -> bool {
+    /// self-update path picks it up automatically, and stamp its stored
+    /// install state to the running binary. Returns `true` only when a fresh
+    /// entry was added; an existing entry's user-file fields - channel,
+    /// token, disabled - are left alone (even if disabled or pinned). The
+    /// caller is responsible for persisting.
+    ///
+    /// `installed_version` (and `installed_asset`, when `asset` is `Some`)
+    /// are (re)written every call: the running binary is ground truth for
+    /// what self code is loaded, and the stored values can drift
+    /// (half-applied self-update, hand-edited TOML). `installed_at` and the
+    /// `cached_*` fields are left untouched - `needs_install` compares
+    /// `installed_at` against the latest release's `published_at`, so
+    /// overwriting it here could suppress a genuinely-newer release.
+    ///
+    /// `version` / `asset` are passed in (the caller resolves them from
+    /// [`self_installed_version`] and the loaded library path) so this stays
+    /// a pure in-memory config op with no filesystem dependency.
+    pub fn ensure_self(&mut self, version: &str, asset: Option<&str>) -> bool {
         let owner_map = self.subscriptions.entry(SELF_OWNER.into()).or_default();
-        if owner_map.contains_key(SELF_REPO) {
-            return false;
+        let added = !owner_map.contains_key(SELF_REPO);
+        let sub = owner_map.entry(SELF_REPO.into()).or_default();
+        sub.state.installed_version = Some(version.to_owned());
+        if let Some(asset) = asset {
+            sub.state.installed_asset = Some(asset.to_owned());
         }
-        owner_map.insert(SELF_REPO.into(), Subscription::default());
-        true
+        added
     }
 
     pub fn load() -> Result<Self> {

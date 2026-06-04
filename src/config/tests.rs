@@ -455,7 +455,7 @@ fn is_self_disabled_ignores_other_disabled_subs() {
 #[test]
 fn ensure_self_adds_when_missing() {
     let mut cfg = Config::default();
-    assert!(cfg.ensure_self());
+    assert!(cfg.ensure_self("v1.0.0", Some("manager.so")));
     let added = cfg
         .subscriptions
         .get(SELF_OWNER)
@@ -463,28 +463,54 @@ fn ensure_self_adds_when_missing() {
         .expect("self subscription should exist after ensure_self");
     assert_eq!(added.channel, Channel::Stable);
     assert!(!added.disabled);
-    assert!(added.state.is_empty());
+    // Fresh entry: install state stamped to the running binary, installed_at
+    // left unset so needs_install still treats it as install-needed.
+    assert_eq!(added.state.installed_version.as_deref(), Some("v1.0.0"));
+    assert_eq!(added.state.installed_asset.as_deref(), Some("manager.so"));
+    assert!(added.state.installed_at.is_none());
 }
 
 #[test]
-fn ensure_self_is_noop_when_present() {
+fn ensure_self_keeps_user_fields_but_restamps_state_when_present() {
     let prepared = Subscription {
         channel: Channel::Prerelease,
         disabled: true,
         token: None,
         state: SubscriptionState {
             installed_version: Some("v9.9.9".into()),
+            installed_asset: Some("old.so".into()),
+            installed_at: Some(42),
             ..SubscriptionState::default()
         },
     };
-    let mut cfg = one_sub_config(SELF_OWNER, SELF_REPO, prepared.clone());
-    assert!(!cfg.ensure_self());
-    let kept = cfg
-        .subscriptions
-        .get(SELF_OWNER)
-        .and_then(|m| m.get(SELF_REPO))
-        .unwrap();
-    assert_eq!(kept, &prepared);
+    let mut cfg = one_sub_config(SELF_OWNER, SELF_REPO, prepared);
+    // Record already exists, so nothing was "added".
+    assert!(!cfg.ensure_self("v1.0.0", Some("new.so")));
+    let kept = &cfg.subscriptions[SELF_OWNER][SELF_REPO];
+    // User-file fields preserved (a disabled / pinned self is left alone)...
+    assert_eq!(kept.channel, Channel::Prerelease);
+    assert!(kept.disabled);
+    // ...but install state is re-stamped to the running binary.
+    assert_eq!(kept.state.installed_version.as_deref(), Some("v1.0.0"));
+    assert_eq!(kept.state.installed_asset.as_deref(), Some("new.so"));
+    // installed_at must not be touched - needs_install depends on it.
+    assert_eq!(kept.state.installed_at, Some(42));
+}
+
+#[test]
+fn ensure_self_none_asset_leaves_installed_asset_alone() {
+    let prepared = Subscription {
+        state: SubscriptionState {
+            installed_asset: Some("kept.so".into()),
+            ..SubscriptionState::default()
+        },
+        ..sub()
+    };
+    let mut cfg = one_sub_config(SELF_OWNER, SELF_REPO, prepared);
+    assert!(!cfg.ensure_self("v1.0.0", None));
+    let kept = &cfg.subscriptions[SELF_OWNER][SELF_REPO].state;
+    assert_eq!(kept.installed_version.as_deref(), Some("v1.0.0"));
+    assert_eq!(kept.installed_asset.as_deref(), Some("kept.so"));
 }
 
 #[test]
@@ -498,7 +524,7 @@ fn ensure_self_does_not_disturb_other_subscriptions() {
         ..sub()
     };
     let mut cfg = one_sub_config("octocat", "hello-world", other.clone());
-    assert!(cfg.ensure_self());
+    assert!(cfg.ensure_self("v1.0.0", Some("manager.so")));
     // Both entries are present; BTreeMap order is alphabetical.
     assert_eq!(
         cfg.subscriptions
@@ -506,12 +532,10 @@ fn ensure_self_does_not_disturb_other_subscriptions() {
             .and_then(|m| m.get("hello-world")),
         Some(&other),
     );
-    assert!(
-        cfg.subscriptions
-            .get(SELF_OWNER)
-            .and_then(|m| m.get(SELF_REPO))
-            .is_some()
-    );
+    // Self was added and stamped to the running binary in the same call.
+    let self_state = &cfg.subscriptions[SELF_OWNER][SELF_REPO].state;
+    assert_eq!(self_state.installed_version.as_deref(), Some("v1.0.0"));
+    assert_eq!(self_state.installed_asset.as_deref(), Some("manager.so"));
 }
 
 #[test]
@@ -1216,4 +1240,11 @@ fn modify_at_serializes_concurrent_writers() {
         s.state.cached_tag.as_deref(),
         Some(format!("v0.0.{}", iters - 1)).as_deref()
     );
+}
+
+#[test]
+fn self_installed_version_matches_cargo_pkg_version() {
+    let v = self_installed_version();
+    assert!(v.starts_with('v'), "expected leading v, got {v}");
+    assert_eq!(v, format!("v{}", env!("CARGO_PKG_VERSION")));
 }
