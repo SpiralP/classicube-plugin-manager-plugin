@@ -160,6 +160,7 @@ const USAGE_LINES: &[&str] = &[
     "&a/client Manager update [<owner>/<repo>]",
     "&a/client Manager load <owner>/<repo>",
     "&a/client Manager unload <owner>/<repo>",
+    "&a/client Manager reload <owner>/<repo>",
     "&a/client Manager discover [<search>]",
 ];
 
@@ -1723,6 +1724,7 @@ extern "C" fn c_callback(args: *const cc_string, args_count: c_int) {
         ["update", spec] => handle_update_one(spec),
         ["load", spec] => handle_load(spec),
         ["unload", spec] => handle_unload(spec),
+        ["reload", spec] => handle_reload(spec),
         ["discover"] => handle_discover(None),
         ["discover", term] => handle_discover(Some(term)),
         _ => print_usage(),
@@ -1758,80 +1760,85 @@ fn handle_load(spec: &str) {
             // Startup set so the dlopen actually happens.
             loader::clear_carryover_skip(&owner, &repo);
             let outcome = loader::load_one(&owner, &repo, &sub, LifecyclePhase::Catchup);
-            match outcome {
-                LoadOutcome::Loaded => {}
-                LoadOutcome::Disabled => print_wrapped(format!(
-                    "{}{id} {}is disabled; use {}/client Manager enable {id}{} first",
-                    color::LIME,
-                    color::YELLOW,
-                    color::LIME,
-                    color::YELLOW,
-                )),
-                LoadOutcome::IsSelf => print_wrapped(format!(
-                    "{}Refusing to load {}{id}{}: this is the manager plugin itself.",
-                    color::YELLOW,
-                    color::LIME,
-                    color::YELLOW,
-                )),
-                // Reachable only if the disk breadcrumb was set AFTER we
-                // cleared the skip set above (e.g. another callback wrote
-                // it mid-flight); in practice load_one's classify_carryover
-                // only reads disk under Startup, so this arm is effectively
-                // dead from /load. Keep it for completeness.
-                LoadOutcome::CrashCarryover { previous } => print_wrapped(format!(
-                    "{}{id} crashed inside {}{previous}{} last session; cleared the breadcrumb. \
-                     Try again.",
-                    color::YELLOW,
-                    color::LIME,
-                    color::YELLOW,
-                )),
-                // /load cleared the skip set above, so this should not fire.
-                LoadOutcome::SkippedFromCarryover => {}
-                LoadOutcome::NotInstalled => print_wrapped(format!(
-                    "{}{id} {}has no installed binary; use {}/client Manager update {id}{} first",
-                    color::LIME,
-                    color::YELLOW,
-                    color::LIME,
-                    color::YELLOW,
-                )),
-                LoadOutcome::AlreadyLoaded => print_wrapped(format!(
-                    "{}{id} {}is already loaded",
-                    color::LIME,
-                    color::YELLOW,
-                )),
-                LoadOutcome::PluginsDirConflict { path } => print_wrapped(format!(
-                    "{}Refusing to load {}{id}{}: {}{}{} would load as a duplicate; delete one",
-                    color::YELLOW,
-                    color::LIME,
-                    color::YELLOW,
-                    color::LIME,
-                    path.display(),
-                    color::YELLOW,
-                )),
-                LoadOutcome::LoadError(e) => print_wrapped(format!(
-                    "{}Failed to load {}{id}{}: {}{e}",
-                    color::RED,
-                    color::LIME,
-                    color::RED,
-                    color::WHITE,
-                )),
-                LoadOutcome::PluginOutdated { plugin, host } => print_wrapped(format!(
-                    "{}{id}{} plugin is outdated (api {plugin}, host expects {host}); update the \
-                     plugin",
-                    color::LIME,
-                    color::RED,
-                )),
-                LoadOutcome::HostOutdated { plugin, host } => print_wrapped(format!(
-                    "{}Game is too outdated for {}{id}{} (api {plugin}, host expects {host}); \
-                     update the game",
-                    color::RED,
-                    color::LIME,
-                    color::RED,
-                )),
-            }
+            chat_load_outcome(&id, &outcome);
         })
         .await;
     });
+}
+
+/// Chat the result of an explicit user-driven load (`/load`, `/reload`). Richer
+/// than `chat_post_update_load_outcome` (the softer post-`/update` set).
+/// Must be called on the main thread (calls `print_wrapped`).
+fn chat_load_outcome(id: &str, outcome: &LoadOutcome) {
+    match outcome {
+        LoadOutcome::Loaded => {}
+        LoadOutcome::Disabled => print_wrapped(format!(
+            "{}{id} {}is disabled; use {}/client Manager enable {id}{} first",
+            color::LIME,
+            color::YELLOW,
+            color::LIME,
+            color::YELLOW,
+        )),
+        LoadOutcome::IsSelf => print_wrapped(format!(
+            "{}Refusing to load {}{id}{}: this is the manager plugin itself.",
+            color::YELLOW,
+            color::LIME,
+            color::YELLOW,
+        )),
+        // Reachable only if the disk breadcrumb was set AFTER we cleared the
+        // skip set above (e.g. another callback wrote it mid-flight); in
+        // practice load_one's classify_carryover only reads disk under
+        // Startup, so this arm is effectively dead from /load. Keep it for
+        // completeness.
+        LoadOutcome::CrashCarryover { previous } => print_wrapped(format!(
+            "{}{id} crashed inside {}{previous}{} last session; cleared the breadcrumb. Try again.",
+            color::YELLOW,
+            color::LIME,
+            color::YELLOW,
+        )),
+        // /load cleared the skip set above, so this should not fire.
+        LoadOutcome::SkippedFromCarryover => {}
+        LoadOutcome::NotInstalled => print_wrapped(format!(
+            "{}{id} {}has no installed binary; use {}/client Manager update {id}{} first",
+            color::LIME,
+            color::YELLOW,
+            color::LIME,
+            color::YELLOW,
+        )),
+        LoadOutcome::AlreadyLoaded => print_wrapped(format!(
+            "{}{id} {}is already loaded",
+            color::LIME,
+            color::YELLOW,
+        )),
+        LoadOutcome::PluginsDirConflict { path } => print_wrapped(format!(
+            "{}Refusing to load {}{id}{}: {}{}{} would load as a duplicate; delete one",
+            color::YELLOW,
+            color::LIME,
+            color::YELLOW,
+            color::LIME,
+            path.display(),
+            color::YELLOW,
+        )),
+        LoadOutcome::LoadError(e) => print_wrapped(format!(
+            "{}Failed to load {}{id}{}: {}{e}",
+            color::RED,
+            color::LIME,
+            color::RED,
+            color::WHITE,
+        )),
+        LoadOutcome::PluginOutdated { plugin, host } => print_wrapped(format!(
+            "{}{id}{} plugin is outdated (api {plugin}, host expects {host}); update the plugin",
+            color::LIME,
+            color::RED,
+        )),
+        LoadOutcome::HostOutdated { plugin, host } => print_wrapped(format!(
+            "{}Game is too outdated for {}{id}{} (api {plugin}, host expects {host}); update the \
+             game",
+            color::RED,
+            color::LIME,
+            color::RED,
+        )),
+    }
 }
 
 fn handle_unload(spec: &str) {
@@ -1871,6 +1878,49 @@ fn handle_unload(spec: &str) {
                     color::YELLOW,
                 )),
             }
+        })
+        .await;
+    });
+}
+
+fn handle_reload(spec: &str) {
+    let Some(candidates) = expand_candidates(spec) else {
+        print_wrapped(format!("{}Expected owner/repo, got: {spec}", color::RED));
+        return;
+    };
+    let spec = spec.to_string();
+
+    async_manager::spawn(async move {
+        let config = match Config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                print_load_error(&e).await;
+                return;
+            }
+        };
+
+        let Some((owner, repo, sub)) =
+            find_subscription(&config, &candidates).map(|(o, r, s)| (o, r, s.clone()))
+        else {
+            print_not_added(&spec).await;
+            return;
+        };
+
+        async_manager::run_on_main_thread(async move {
+            let id = format!("{}/{}", owner, repo);
+            // Unload first if currently loaded, mirroring the /update
+            // in-session swap. unload_one chats "Unloading X" and runs
+            // the plugin's Free; load_one chats "Loading X" and re-runs
+            // Init (+ OnNewMap/OnNewMapLoaded under Catchup). The library
+            // is never dlclose'd, so this re-inits the same mapped binary.
+            if loader::is_loaded(&owner, &repo) {
+                loader::unload_one(&owner, &repo);
+            }
+            // Explicit user action: clear any Startup crash-skip flag so
+            // the dlopen actually happens (same as /load and /update swap).
+            loader::clear_carryover_skip(&owner, &repo);
+            let outcome = loader::load_one(&owner, &repo, &sub, LifecyclePhase::Catchup);
+            chat_load_outcome(&id, &outcome);
         })
         .await;
     });
