@@ -150,6 +150,7 @@ fn find_stored_keys(config: &Config, candidates: &[(String, String)]) -> Option<
 
 const USAGE_LINES: &[&str] = &[
     "&a/client Manager add <owner>/<repo> [stable|prerelease|tag <ref>] [token <token>]",
+    "&a/client Manager token <owner>/<repo> <token>|remove",
     "&a/client Manager remove <owner>/<repo>",
     "&a/client Manager channel <owner>/<repo> stable|prerelease|tag <ref>",
     "&a/client Manager disable <owner>/<repo>",
@@ -236,14 +237,37 @@ enum AddUpdateDecision {
     },
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TokenChange {
+    NoChange,
+    Changed,
+}
+
+/// Set or clear a subscription's PAT in place. `new == Some(v)` sets/replaces
+/// it; `new == None` clears it. Returns whether the field actually changed, so
+/// callers can distinguish a real mutation from a no-op without a separate
+/// before/after comparison.
+fn apply_token_change(sub: &mut Subscription, new: Option<String>) -> TokenChange {
+    let changed = match (&new, &sub.token) {
+        (Some(n), Some(existing)) => n != existing.expose(),
+        (Some(_), None) | (None, Some(_)) => true,
+        (None, None) => false,
+    };
+    if !changed {
+        return TokenChange::NoChange;
+    }
+    sub.token = new.map(Secret::new);
+    TokenChange::Changed
+}
+
 /// Apply a re-run of `/add` to an existing subscription. Mutates `sub` in
 /// place to absorb a new channel and/or token, reusing `apply_channel_switch`
 /// to invalidate cached release fields when the channel actually changes.
 /// Returns `NoChanges` when the requested values match what's already stored,
 /// so the caller can print a friendly no-op instead of a misleading "Updated".
 /// `new_token == None` is "user didn't pass a token" - never interpreted as
-/// "clear the existing token"; removing a token still requires hand-editing
-/// the TOML.
+/// "clear the existing token"; use `/client Manager token <repo> remove` or
+/// `/client Manager token <repo> <value>` for direct token management.
 fn apply_add_update(
     sub: &mut Subscription,
     new_channel: Channel,
@@ -915,6 +939,43 @@ fn set_disabled(spec: &str, disabled: bool) {
                 } else {
                     auto_add_and_install(&spec, candidates, Channel::Stable).await;
                 }
+            }
+        }
+    });
+}
+
+/// Handler for `/client Manager token <owner>/<repo> <value>` (set) and
+/// `/client Manager token <owner>/<repo> remove` (clear). Passes `Some(value)`
+/// to set or `None` to clear; both paths go through `apply_token_change` so
+/// no-ops produce a distinct message rather than a misleading success.
+fn mutate_token(spec: &str, new_token: Option<String>) {
+    let Some(candidates) = expand_candidates(spec) else {
+        print_wrapped(format!("{}Expected owner/repo, got: {spec}", color::RED));
+        return;
+    };
+    let spec = spec.to_string();
+    let setting = new_token.is_some();
+
+    async_manager::spawn(async move {
+        // `None` => no such subscription; `Some((owner, repo, change))` => found
+        // it, with `change` reporting whether the token field actually moved.
+        let outcome = Config::modify_at(config_path(), |config| {
+            let (owner, repo, sub) = find_subscription_mut(config, &candidates)?;
+            Some((owner, repo, apply_token_change(sub, new_token)))
+        });
+        match outcome {
+            Err(e) => print_save_error(&e).await,
+            Ok(None) => print_not_added(&spec).await,
+            Ok(Some((owner, repo, change))) => {
+                let changed = matches!(change, TokenChange::Changed);
+                let msg = match (changed, setting) {
+                    (true, true) => "Set token",
+                    (true, false) => "Removed token",
+                    (false, true) => "Token unchanged",
+                    (false, false) => "No token to remove",
+                };
+                let header = if changed { color::PINK } else { color::YELLOW };
+                print_async(format!("{header}{msg} for {}{owner}/{repo}", color::LIME)).await;
             }
         }
     });
@@ -1704,6 +1765,10 @@ extern "C" fn c_callback(args: *const cc_string, args_count: c_int) {
             Ok((c, t)) => handle_add(spec, c, t),
             Err(e) => print_wrapped(format!("{}{e}", color::RED)),
         },
+        // The literal-`remove` arm must precede the catch-all `value` arm, or
+        // `token <repo> remove` would store "remove" as the token value.
+        ["token", spec, "remove"] => mutate_token(spec, None),
+        ["token", spec, value] => mutate_token(spec, Some((*value).to_string())),
         ["remove", spec] => handle_remove(spec),
         ["channel", spec, channel_args @ ..] => {
             if channel_args.is_empty() {

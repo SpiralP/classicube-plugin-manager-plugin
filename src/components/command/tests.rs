@@ -383,7 +383,7 @@ fn apply_add_update_matching_token_is_no_op() {
 #[test]
 fn apply_add_update_no_token_arg_preserves_existing_token() {
     // Re-running `/add foo/bar prerelease` on a tokened sub must not strip
-    // the token. Removing a token still requires hand-editing the TOML.
+    // the token. Use `/client Manager token foo/bar remove` to clear it.
     let mut s = Subscription {
         channel: Channel::Stable,
         token: Some(Secret::new("ghp_keep".into())),
@@ -452,6 +452,61 @@ fn apply_add_update_channel_and_token_change_together() {
     assert_eq!(s.token.as_ref().map(|t| t.expose()), Some("ghp_new"));
     assert!(s.state.cached_tag.is_none());
     assert!(s.state.cached_at.is_none());
+}
+
+// --- apply_token_change ---
+
+#[test]
+fn apply_token_change_clear_on_tokened_sub() {
+    let mut s = Subscription {
+        token: Some(Secret::new("ghp_abc".into())),
+        ..empty_sub()
+    };
+    assert_eq!(apply_token_change(&mut s, None), TokenChange::Changed);
+    assert!(s.token.is_none());
+}
+
+#[test]
+fn apply_token_change_clear_on_tokenless_sub_is_no_op() {
+    let mut s = empty_sub();
+    assert_eq!(apply_token_change(&mut s, None), TokenChange::NoChange);
+    assert!(s.token.is_none());
+}
+
+#[test]
+fn apply_token_change_set_on_tokenless_sub() {
+    let mut s = empty_sub();
+    assert_eq!(
+        apply_token_change(&mut s, Some("ghp_new".into())),
+        TokenChange::Changed,
+    );
+    assert_eq!(s.token.as_ref().map(|t| t.expose()), Some("ghp_new"));
+}
+
+#[test]
+fn apply_token_change_set_replaces_different_token() {
+    let mut s = Subscription {
+        token: Some(Secret::new("ghp_old".into())),
+        ..empty_sub()
+    };
+    assert_eq!(
+        apply_token_change(&mut s, Some("ghp_new".into())),
+        TokenChange::Changed,
+    );
+    assert_eq!(s.token.as_ref().map(|t| t.expose()), Some("ghp_new"));
+}
+
+#[test]
+fn apply_token_change_set_same_token_is_no_op() {
+    let mut s = Subscription {
+        token: Some(Secret::new("ghp_abc".into())),
+        ..empty_sub()
+    };
+    assert_eq!(
+        apply_token_change(&mut s, Some("ghp_abc".into())),
+        TokenChange::NoChange,
+    );
+    assert_eq!(s.token.as_ref().map(|t| t.expose()), Some("ghp_abc"));
 }
 
 #[test]
