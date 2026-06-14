@@ -178,7 +178,7 @@ async fn run_initial_pass() -> Result<()> {
             // For self, skip auto-update entirely if the loaded binary
             // looks like a dev/manual build (cargo-build output or
             // hand-placed canonical name). Done before the release fetch
-            // and the user-facing "Installing..." message so a dev iterating
+            // and the user-facing "Downloading..." message so a dev iterating
             // on the manager doesn't see noise about an update that would
             // overwrite their own build. Released assets carry
             // `_<os>_<arch>` tokens and don't normalize to SELF_REPO.
@@ -310,7 +310,7 @@ async fn run_initial_pass() -> Result<()> {
             };
 
             print_async(format!(
-                "{}Installing {}{} {}for {}{owner}/{repo} {}({}{}{})",
+                "{}Downloading {}{} {}for {}{owner}/{repo} {}({}{}{})",
                 color::PINK,
                 color::GREEN,
                 release.tag_name,
@@ -403,7 +403,7 @@ async fn run_initial_pass() -> Result<()> {
                         .await;
                     } else {
                         print_async(format!(
-                            "{}Installed {}{} {}-> {}{}",
+                            "{}Downloaded {}{} {}-> {}{}",
                             color::PINK,
                             color::GREEN,
                             release.tag_name,
@@ -417,7 +417,7 @@ async fn run_initial_pass() -> Result<()> {
                 Err(e) => {
                     error!("installing {owner}/{repo}: {e:#}");
                     print_async(format!(
-                        "{}Install failed for {}{owner}/{repo}{}: {}{e}",
+                        "{}Download failed for {}{owner}/{repo}{}: {}{e}",
                         color::RED,
                         color::LIME,
                         color::RED,

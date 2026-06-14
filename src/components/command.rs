@@ -456,7 +456,7 @@ fn handle_add(spec: &str, channel: Channel, token: Option<String>) {
             return;
         };
         print_async(format!(
-            "{}Added {}{owner}/{repo}{}{}, installing...",
+            "{}Added {}{owner}/{repo}{}{}, downloading...",
             color::PINK,
             color::LIME,
             channel_suffix(&channel),
@@ -533,7 +533,7 @@ async fn update_existing_subscription(
             token_for_install,
         }) => {
             print_async(format!(
-                "{}Updated {}{owner}/{repo}{}{}, installing...",
+                "{}Updated {}{owner}/{repo}{}{}, downloading...",
                 color::PINK,
                 color::LIME,
                 channel_suffix(&channel),
@@ -660,7 +660,7 @@ async fn probe_release(
 
 /// Implicit-add path for commands whose user intent reads as "I want
 /// this plugin on" (`/update`, `/enable`, `/channel`). Wraps
-/// `add_subscription` with an "(auto), installing..." chat message and
+/// `add_subscription` with an "(auto), downloading..." chat message and
 /// hands off to the existing install path. Caller has already checked
 /// that no subscription exists for `candidates`.
 async fn auto_add_and_install(spec: &str, candidates: Vec<(String, String)>, channel: Channel) {
@@ -669,7 +669,7 @@ async fn auto_add_and_install(spec: &str, candidates: Vec<(String, String)>, cha
         return;
     };
     print_async(format!(
-        "{}Added {}{owner}/{repo}{} {}(auto), installing...",
+        "{}Added {}{owner}/{repo}{} {}(auto), downloading...",
         color::PINK,
         color::LIME,
         channel_suffix(&channel),
@@ -1608,7 +1608,7 @@ async fn run_update_with_release(
     );
 
     print_async(format!(
-        "{}Installed {}{} {}for {}{}/{} {}-> {}{}",
+        "{}Downloaded {}{} {}for {}{}/{} {}-> {}{}",
         color::PINK,
         color::GREEN,
         release.tag_name,
@@ -1681,14 +1681,14 @@ fn chat_post_update_load_outcome(id: &str, outcome: &LoadOutcome) {
             color::YELLOW,
         )),
         LoadOutcome::PluginsDirConflict { path } => print_wrapped(format!(
-            "{}Installed but not loaded: {}{}{} would load as a duplicate; delete one",
+            "{}Downloaded but not loaded: {}{}{} would load as a duplicate; delete one",
             color::YELLOW,
             color::LIME,
             path.display(),
             color::YELLOW,
         )),
         LoadOutcome::LoadError(e) => print_wrapped(format!(
-            "{}Installed but failed to load {}{id}{}: {}{e}",
+            "{}Downloaded but failed to load {}{id}{}: {}{e}",
             color::RED,
             color::LIME,
             color::RED,
