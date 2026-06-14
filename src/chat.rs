@@ -3,11 +3,26 @@ mod tests;
 
 use std::mem;
 
-use classicube_helpers::{async_manager, chat, tab_list::remove_color};
+use classicube_helpers::{async_manager, chat, color, tab_list::remove_color};
 use tracing::info;
 
 const WRAP_WIDTH: usize = 80;
 const CONTINUATION_PREFIX: &str = "> ";
+
+/// Render an update's version target for an in-progress announce line.
+/// When a distinct previous version is known, shows "prev -> new" with the
+/// arrow in the info color; otherwise just the new version.
+pub fn version_arrow(prev: Option<&str>, new: &str, version_color: &str) -> String {
+    match prev {
+        Some(prev) if prev != new => {
+            format!(
+                "{version_color}{prev} {}-> {version_color}{new}",
+                color::PINK
+            )
+        }
+        _ => format!("{version_color}{new}"),
+    }
+}
 
 pub fn print_wrapped<S: AsRef<str>>(s: S) {
     for line in wrap_chat(s.as_ref()) {

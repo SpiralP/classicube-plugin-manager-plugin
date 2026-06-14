@@ -18,7 +18,7 @@ use tracing::{debug, error, warn};
 
 use crate::{
     asset_match::{self, pick_asset},
-    chat::{print_async, print_wrapped},
+    chat::{print_async, print_wrapped, version_arrow},
     component::Component,
     components::manager::{
         persist_cache_updates, persist_installed_versions, resolve_latest_release,
@@ -1526,11 +1526,11 @@ async fn run_update_with_release(
         );
     }
 
+    let version = version_arrow(prev_version.as_deref(), &release.tag_name, color::YELLOW);
     print_async(format!(
-        "{}Downloading {}{} {}({}{}{}) ...",
+        "{}Downloading {} {}({}{}{}) ...",
         color::PINK,
-        color::YELLOW,
-        release.tag_name,
+        version,
         color::PINK,
         color::LIME,
         asset.name,

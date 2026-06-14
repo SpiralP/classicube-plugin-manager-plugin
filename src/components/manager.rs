@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     asset_match::{self, pick_asset},
-    chat::print_async,
+    chat::{print_async, version_arrow},
     component::Component,
     config::{self, Config, Subscription, config_path},
     github_release::{GitHubRelease, get_release_for_channel, resolve_expected_digest},
@@ -309,11 +309,15 @@ async fn run_initial_pass() -> Result<()> {
                 }
             };
 
-            print_async(format!(
-                "{}Downloading {}{} {}for {}{owner}/{repo} {}({}{}{})",
-                color::PINK,
+            let version = version_arrow(
+                sub.state.installed_version.as_deref(),
+                &release.tag_name,
                 color::GREEN,
-                release.tag_name,
+            );
+            print_async(format!(
+                "{}Downloading {} {}for {}{owner}/{repo} {}({}{}{})",
+                color::PINK,
+                version,
                 color::PINK,
                 color::LIME,
                 color::PINK,
