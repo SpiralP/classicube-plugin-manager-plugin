@@ -18,7 +18,7 @@ use tracing::{debug, error, warn};
 
 use crate::{
     asset_match::{self, pick_asset},
-    chat::{print_async, print_wrapped, version_arrow},
+    chat::{print_async, print_wrapped},
     component::Component,
     components::manager::{
         persist_cache_updates, persist_installed_versions, resolve_latest_release,
@@ -1526,17 +1526,6 @@ async fn run_update_with_release(
         );
     }
 
-    let version = version_arrow(prev_version.as_deref(), &release.tag_name, color::YELLOW);
-    print_async(format!(
-        "{}Downloading {} {}({}{}{}) ...",
-        color::PINK,
-        version,
-        color::PINK,
-        color::LIME,
-        asset.name,
-        color::PINK,
-    ))
-    .await;
 
     let expected_digest = resolve_expected_digest(asset)?;
     let path = if is_self {
@@ -1584,11 +1573,11 @@ async fn run_update_with_release(
 
     if is_self {
         print_async(format!(
-            "{}Plugin manager updated to {}{}{} - restart ClassiCube to use the new version",
-            color::PINK,
+            "{}Updated {}{owner}/{repo} {}{}",
+            color::LIME,
             color::GREEN,
+            color::WHITE,
             release.tag_name,
-            color::PINK,
         ))
         .await;
         return Ok(());
@@ -1608,17 +1597,11 @@ async fn run_update_with_release(
     );
 
     print_async(format!(
-        "{}Downloaded {}{} {}for {}{}/{} {}-> {}{}",
-        color::PINK,
-        color::GREEN,
-        release.tag_name,
-        color::PINK,
+        "{}Updated {}{owner}/{repo} {}{}",
         color::LIME,
-        owner,
-        repo,
-        color::PINK,
-        color::YELLOW,
-        path.display(),
+        color::GREEN,
+        color::WHITE,
+        release.tag_name,
     ))
     .await;
 

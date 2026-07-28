@@ -114,34 +114,6 @@ fn leading_whitespace_kept_on_first_line() {
     assert_eq!(lines, vec!["  &alime/lime".to_string()]);
 }
 
-#[test]
-fn version_arrow_no_prev() {
-    assert_eq!(
-        version_arrow(None, "v1.1.0", color::YELLOW),
-        format!("{}v1.1.0", color::YELLOW),
-    );
-}
-
-#[test]
-fn version_arrow_same_version() {
-    assert_eq!(
-        version_arrow(Some("v1.1.0"), "v1.1.0", color::YELLOW),
-        format!("{}v1.1.0", color::YELLOW),
-    );
-}
-
-#[test]
-fn version_arrow_distinct_prev() {
-    assert_eq!(
-        version_arrow(Some("v1.0.0"), "v1.1.0", color::YELLOW),
-        format!(
-            "{}v1.0.0 {}-> {}v1.1.0",
-            color::YELLOW,
-            color::PINK,
-            color::YELLOW
-        ),
-    );
-}
 
 #[test]
 fn realistic_error_message_wraps() {

@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     asset_match::{self, pick_asset},
-    chat::{print_async, version_arrow},
+    chat::print_async,
     component::Component,
     config::{self, Config, Subscription, config_path},
     github_release::{GitHubRelease, get_release_for_channel, resolve_expected_digest},
@@ -309,23 +309,6 @@ async fn run_initial_pass() -> Result<()> {
                 }
             };
 
-            let version = version_arrow(
-                sub.state.installed_version.as_deref(),
-                &release.tag_name,
-                color::GREEN,
-            );
-            print_async(format!(
-                "{}Downloading {} {}for {}{owner}/{repo} {}({}{}{})",
-                color::PINK,
-                version,
-                color::PINK,
-                color::LIME,
-                color::PINK,
-                color::LIME,
-                asset.name,
-                color::PINK,
-            ))
-            .await;
 
             let expected_digest = match resolve_expected_digest(asset) {
                 Ok(d) => d,
@@ -395,28 +378,14 @@ async fn run_initial_pass() -> Result<()> {
                         installed_basename,
                         release.published_at,
                     ));
-                    if is_self {
-                        print_async(format!(
-                            "{}Plugin manager updated to {}{}{} - restart ClassiCube to use the \
-                             new version",
-                            color::PINK,
-                            color::GREEN,
-                            release.tag_name,
-                            color::PINK,
-                        ))
-                        .await;
-                    } else {
-                        print_async(format!(
-                            "{}Downloaded {}{} {}-> {}{}",
-                            color::PINK,
-                            color::GREEN,
-                            release.tag_name,
-                            color::PINK,
-                            color::YELLOW,
-                            path.display(),
-                        ))
-                        .await;
-                    }
+                    print_async(format!(
+                        "{}Updated {}{owner}/{repo} {}{}",
+                        color::LIME,
+                        color::GREEN,
+                        color::WHITE,
+                        release.tag_name,
+                    ))
+                    .await;
                 }
                 Err(e) => {
                     error!("installing {owner}/{repo}: {e:#}");
